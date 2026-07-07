@@ -1,0 +1,12 @@
+.env
+.env.*
+!/.env.example
+.DS_Store
+
+/tg-radar
+.fly-build/
+
+data/*.db
+data/*.db-*
+data/*.session
+*.session
