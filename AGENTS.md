@@ -9,9 +9,12 @@ scripts/deploy-fast.sh
 ```
 
 Do not run bare `fly deploy --local-only` by hand for the fast path: it can pick
-the regular `fly.toml`/`Dockerfile` path. The script builds the Linux/amd64 Go
-binary locally, packs it with UPX, and deploys with `fly.fast.toml` and
-`Dockerfile.fast`.
+the regular `fly.toml`/`Dockerfile` path and requires a Docker-compatible
+daemon. The script builds the image with Apple `container`, exports its OCI
+layout, uploads it with `regctl`, and deploys with `fly.fast.toml` and
+`Dockerfile.fast`. Fly Machines currently run on x86_64, so production defaults
+to `linux/amd64`; local ARM64 smoke images are supported through `TARGET_GOARCH`
+and `PLATFORM`.
 
 Use regular `fly deploy` after changing Fly infrastructure, mounts, services,
 base images, or the normal Dockerfile.

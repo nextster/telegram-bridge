@@ -3,6 +3,7 @@ set -euo pipefail
 
 APP="${APP:-tg-radar}"
 MODE="${MODE:-local}"
+BUILDER="${BUILDER:-container}"
 RUN_TESTS="${RUN_TESTS:-0}"
 WAIT_HEALTH="${WAIT_HEALTH:-0}"
 PACK="${PACK:-1}"
@@ -10,7 +11,7 @@ UPX_LEVEL="${UPX_LEVEL:-1}"
 PUBLIC_URL="${PUBLIC_URL:-https://${APP}.fly.dev}"
 TARGET_GOOS="${TARGET_GOOS:-linux}"
 TARGET_GOARCH="${TARGET_GOARCH:-amd64}"
-PLATFORM="${PLATFORM:-linux/amd64}"
+PLATFORM="${PLATFORM:-${TARGET_GOOS}/${TARGET_GOARCH}}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE_TAG="${IMAGE_TAG:-fast-$(date -u +%Y%m%d%H%M%S)}"
 IMAGE="${IMAGE:-registry.fly.io/${APP}:${IMAGE_TAG}}"
@@ -30,6 +31,66 @@ end_step() {
 
 first_machine_id() {
   fly machine list --app "$APP" --json | jq -r '[.[] | select(.state != "destroyed")][0].id'
+}
+
+registry_login() {
+  case "$BUILDER" in
+    container)
+      if ! command -v regctl >/dev/null 2>&1; then
+        printf 'regctl not found; install it with: brew install regclient\n' >&2
+        return 1
+      fi
+      fly auth token -q \
+        | regctl registry login registry.fly.io --user x --pass-stdin >/dev/null
+      ;;
+    docker)
+      fly auth docker >/dev/null
+      ;;
+    *)
+      printf 'unknown BUILDER=%s, expected container or docker\n' "$BUILDER" >&2
+      return 1
+      ;;
+  esac
+}
+
+build_image() {
+  case "$BUILDER" in
+    container)
+      container build \
+        --platform "$PLATFORM" \
+        --file Dockerfile.fast \
+        --tag "$IMAGE" \
+        .
+      ;;
+    docker)
+      docker buildx build \
+        --platform "$PLATFORM" \
+        --file Dockerfile.fast \
+        --tag "$IMAGE" \
+        --load \
+        --provenance=false \
+        .
+      ;;
+  esac
+}
+
+push_image() {
+  case "$BUILDER" in
+    container)
+      local archive=".fly-build/image-${TARGET_GOARCH}.oci.tar"
+      local layout=".fly-build/image-${TARGET_GOARCH}-oci"
+      local digest
+
+      mkdir -p "$layout"
+      container image save --platform "$PLATFORM" --output "$archive" "$IMAGE"
+      tar -xf "$archive" -C "$layout"
+      digest="$(jq -r '.manifests[0].digest' "$layout/index.json")"
+      regctl image copy --platform "$PLATFORM" "ocidir://${layout}@${digest}" "$IMAGE"
+      ;;
+    docker)
+      docker push "$IMAGE"
+      ;;
+  esac
 }
 
 wait_for_machine() {
@@ -98,35 +159,19 @@ else
 fi
 
 case "$MODE" in
-  local)
-    start_step "local fly deploy"
-    fly deploy \
-      --config fly.fast.toml \
-      --local-only \
-      --strategy immediate \
-      --detach \
-      --dns-checks=false \
-      --smoke-checks=false \
-      --ha=false \
-      --compression zstd \
-      --compression-level 1 \
-      --yes \
-      --wait-timeout=30s
+  build)
+    start_step "build ${IMAGE} with ${BUILDER} (${PLATFORM})"
+    build_image
     end_step
     ;;
   machine)
     start_step "auth registry.fly.io"
-    fly auth docker >/dev/null
+    registry_login
     end_step
 
-    start_step "build and push ${IMAGE}"
-    docker buildx build \
-      --platform "$PLATFORM" \
-      --file Dockerfile.fast \
-      --tag "$IMAGE" \
-      --push \
-      --provenance=false \
-      .
+    start_step "build and push ${IMAGE} with ${BUILDER} (${PLATFORM})"
+    build_image
+    push_image
     end_step
 
     MACHINE_ID="${MACHINE_ID:-$(first_machine_id)}"
@@ -143,24 +188,20 @@ case "$MODE" in
       --yes
     end_step
     ;;
-  deploy)
+  local|deploy)
     start_step "auth registry.fly.io"
-    fly auth docker >/dev/null
+    registry_login
     end_step
 
-    start_step "build and push ${IMAGE}"
-    docker buildx build \
-      --platform "$PLATFORM" \
-      --file Dockerfile.fast \
-      --tag "$IMAGE" \
-      --push \
-      --provenance=false \
-      .
+    start_step "build and push ${IMAGE} with ${BUILDER} (${PLATFORM})"
+    build_image
+    push_image
     end_step
 
     start_step "deploy image"
     fly deploy \
       --app "$APP" \
+      --config fly.fast.toml \
       --image "$IMAGE" \
       --strategy immediate \
       --detach \
@@ -172,23 +213,21 @@ case "$MODE" in
     end_step
     ;;
   *)
-    printf 'unknown MODE=%s, expected local, machine, or deploy\n' "$MODE" >&2
+    printf 'unknown MODE=%s, expected build, local, machine, or deploy\n' "$MODE" >&2
     exit 1
     ;;
 esac
 
-if [[ "$WAIT_HEALTH" == "1" ]]; then
+if [[ "$WAIT_HEALTH" == "1" && "$MODE" != "build" ]]; then
   start_step "wait for health"
-  if [[ "$MODE" == "local" ]]; then
-    wait_for_public_health
-  else
+  if [[ "$MODE" == "machine" ]]; then
     wait_for_machine "${MACHINE_ID:-$(first_machine_id)}"
+  else
+    wait_for_public_health
   fi
   end_step
 fi
 
 total_finished_at="$(date +%s)"
-if [[ "$MODE" != "local" ]]; then
-  printf 'image=%s\n' "$IMAGE"
-fi
+printf 'image=%s\n' "$IMAGE"
 printf 'total=%ss\n' "$((total_finished_at - total_started_at))"

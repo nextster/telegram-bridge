@@ -14,6 +14,7 @@ import (
 
 	"github.com/nextster/tg-radar/internal/config"
 	"github.com/nextster/tg-radar/internal/db"
+	"github.com/nextster/tg-radar/internal/mcpserver"
 	"github.com/nextster/tg-radar/internal/monitor"
 	"github.com/nextster/tg-radar/internal/notify"
 )
@@ -64,6 +65,7 @@ func New(cfg config.Config, store *db.Store, monitorService *monitor.Service, no
 			}
 			return string(runes[:limit]) + "..."
 		},
+		"join": strings.Join,
 	}).Parse(dashboardTemplate)
 	if err != nil {
 		return nil, fmt.Errorf("parse dashboard template: %w", err)
@@ -84,21 +86,9 @@ func New(cfg config.Config, store *db.Store, monitorService *monitor.Service, no
 }
 
 func (s *Server) Run(ctx context.Context) error {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /", s.dashboard)
-	mux.HandleFunc("POST /keywords/add", s.addKeyword)
-	mux.HandleFunc("POST /keywords/delete", s.deleteKeyword)
-	mux.HandleFunc("POST /sources/sync", s.syncSources)
-	mux.HandleFunc("POST /sources/toggle", s.toggleSource)
-	mux.HandleFunc("POST /history/backfill", s.backfillHistory)
-	mux.HandleFunc("GET /login", s.loginPage)
-	mux.HandleFunc("POST /login", s.loginSubmit)
-	mux.HandleFunc("POST /login/restart", s.loginRestart)
-	mux.HandleFunc("GET /healthz", s.healthz)
-
 	server := &http.Server{
 		Addr:         s.cfg.Addr,
-		Handler:      mux,
+		Handler:      s.routes(),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Minute,
 		IdleTimeout:  60 * time.Second,
@@ -119,6 +109,26 @@ func (s *Server) Run(ctx context.Context) error {
 		return nil
 	}
 	return err
+}
+
+func (s *Server) routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", s.dashboard)
+	mux.HandleFunc("POST /keywords/add", s.addKeyword)
+	mux.HandleFunc("POST /rules/add", s.addWatchRule)
+	mux.HandleFunc("POST /keywords/delete", s.deleteKeyword)
+	mux.HandleFunc("POST /sources/sync", s.syncSources)
+	mux.HandleFunc("POST /sources/toggle", s.toggleSource)
+	mux.HandleFunc("POST /history/backfill", s.backfillHistory)
+	mux.HandleFunc("GET /login", s.loginPage)
+	mux.HandleFunc("POST /login", s.loginSubmit)
+	mux.HandleFunc("POST /login/restart", s.loginRestart)
+	mux.HandleFunc("GET /healthz", s.healthz)
+	if s.cfg.HasMCP() && s.monitor != nil {
+		mux.Handle("/mcp", mcpserver.New(s.monitor, s.cfg.MCPToken))
+		log.Print("MCP endpoint enabled at /mcp")
+	}
+	return mux
 }
 
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
@@ -177,6 +187,64 @@ func (s *Server) addKeyword(w http.ResponseWriter, r *http.Request) {
 	}
 	s.notifySystem(fmt.Sprintf("Keyword added: #%d %s", keyword.ID, keyword.Phrase))
 	redirectNotice(w, r, fmt.Sprintf("added keyword #%d", keyword.ID))
+}
+
+func (s *Server) addWatchRule(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		redirectError(w, r, "invalid form")
+		return
+	}
+	sources := make([]db.RuleSource, 0, len(r.Form["sources"]))
+	for _, raw := range r.Form["sources"] {
+		peerType, rawID, ok := strings.Cut(strings.TrimSpace(raw), ":")
+		if !ok {
+			continue
+		}
+		peerID, err := strconv.ParseInt(rawID, 10, 64)
+		if err == nil && peerID > 0 {
+			sources = append(sources, db.RuleSource{PeerType: peerType, PeerID: peerID})
+		}
+	}
+	rule, err := s.store.UpsertWatchRule(r.Context(), db.Keyword{
+		Phrase:              r.FormValue("name"),
+		AnyTerms:            splitTerms(r.FormValue("any")),
+		AllTerms:            splitTerms(r.FormValue("all")),
+		RequiredAnyGroups:   splitTermGroups(r.FormValue("required_any")),
+		PreferredTerms:      splitTerms(r.FormValue("prefer")),
+		ExcludeTerms:        splitTerms(r.FormValue("exclude")),
+		Note:                r.FormValue("note"),
+		ExcludeCompleteBike: r.FormValue("exclude_complete_bike") == "1",
+		Sources:             sources,
+		Enabled:             true,
+	})
+	if err != nil {
+		redirectError(w, r, err.Error())
+		return
+	}
+	s.notifySystem(fmt.Sprintf("Watch rule added: #%d %s", rule.ID, rule.Phrase))
+	redirectNotice(w, r, fmt.Sprintf("watching %s", rule.Phrase))
+}
+
+func splitTerms(value string) []string {
+	parts := strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == '\n' })
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func splitTermGroups(value string) [][]string {
+	lines := strings.Split(strings.ReplaceAll(value, "\r\n", "\n"), "\n")
+	out := make([][]string, 0, len(lines))
+	for _, line := range lines {
+		if terms := splitTerms(line); len(terms) > 0 {
+			out = append(out, terms)
+		}
+	}
+	return out
 }
 
 func (s *Server) deleteKeyword(w http.ResponseWriter, r *http.Request) {
@@ -403,7 +471,7 @@ const dashboardTemplate = `<!doctype html>
       display: flex;
       gap: 8px;
     }
-    input {
+    input, textarea {
       width: 100%;
       min-height: 40px;
       border: 1px solid var(--line);
@@ -411,6 +479,11 @@ const dashboardTemplate = `<!doctype html>
       padding: 0 10px;
       font: inherit;
       background: #fff;
+    }
+    textarea {
+      min-height: 72px;
+      padding: 9px 10px;
+      resize: vertical;
     }
     button {
       min-height: 40px;
@@ -442,6 +515,13 @@ const dashboardTemplate = `<!doctype html>
     .keyword code, .source-main {
       overflow-wrap: anywhere;
     }
+    .rule-form { display: grid; gap: 10px; margin-bottom: 16px; }
+    .rule-form label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
+    .source-picker { display: flex; flex-wrap: wrap; gap: 7px 12px; }
+    .source-picker label { display: flex; align-items: center; gap: 5px; color: var(--text); }
+    .source-picker input { width: auto; min-height: 0; }
+    .rule-copy { display: grid; gap: 3px; min-width: 0; }
+    .rule-copy small { color: var(--muted); overflow-wrap: anywhere; }
     .source-actions {
       display: flex;
       gap: 8px;
@@ -520,7 +600,7 @@ const dashboardTemplate = `<!doctype html>
 
     <section class="stats">
       <div class="stat"><strong>{{.Stats.Subscribers}}</strong><span>Subscribers</span></div>
-      <div class="stat"><strong>{{.Stats.Keywords}}</strong><span>Keywords</span></div>
+      <div class="stat"><strong>{{.Stats.Keywords}}</strong><span>Watch rules</span></div>
       <div class="stat"><strong>{{.Stats.EnabledPeers}}</strong><span>Monitored Sources</span></div>
       <div class="stat"><strong>{{.Stats.Events}}</strong><span>Matches</span></div>
     </section>
@@ -568,21 +648,44 @@ const dashboardTemplate = `<!doctype html>
       </div>
 
       <div class="panel">
-        <h2>Keywords</h2>
-        <form method="post" action="/keywords/add" class="form-row">
-          <input name="phrase" placeholder="Phrase to monitor" required>
-          <button type="submit">Add</button>
+        <h2>Watch rules</h2>
+        <form method="post" action="/rules/add" class="rule-form">
+          <label>Name<input name="name" placeholder="repair stand" required></label>
+          <label>Match any (comma or newline separated)<textarea name="any" placeholder="ремонтная стойка, workstand, prepstand"></textarea></label>
+          <label>Require all<input name="all" placeholder="optional required terms"></label>
+          <label>Require one from each line<textarea name="required_any" placeholder="USB-C, Type-C&#10;num&gt;=1000:lm|lumen|люмен|лм"></textarea></label>
+          <label>Prefer (adds evidence, does not block)<textarea name="prefer" placeholder="daytime flash, Garmin mount"></textarea></label>
+          <label>Exclude<input name="exclude" placeholder="продано, sold, куплю"></label>
+          <label>Rule note<textarea name="note" placeholder="Useful specs or checks"></textarea></label>
+          <label><input type="checkbox" name="exclude_complete_bike" value="1"> Ignore complete-bike listings</label>
+          <div class="source-picker">
+            {{range .Peers}}{{if .Enabled}}
+              <label><input type="checkbox" name="sources" value="{{.PeerType}}:{{.PeerID}}">{{if .Title}}{{.Title}}{{else}}{{.PeerType}}:{{.PeerID}}{{end}}</label>
+            {{end}}{{end}}
+          </div>
+          <small class="muted">No source selected means every enabled source.</small>
+          <button type="submit">Start watching</button>
         </form>
         {{range .Keywords}}
           <div class="keyword">
-            <code>#{{.ID}} {{.Phrase}}</code>
+            <div class="rule-copy">
+              <code>#{{.ID}} {{.Phrase}}</code>
+              {{if .AnyTerms}}<small>any: {{join .AnyTerms ", "}}</small>{{end}}
+              {{if .AllTerms}}<small>all: {{join .AllTerms ", "}}</small>{{end}}
+              {{range .RequiredAnyGroups}}<small>one of: {{join . ", "}}</small>{{end}}
+              {{if .PreferredTerms}}<small>prefer: {{join .PreferredTerms ", "}}</small>{{end}}
+              {{if .ExcludeTerms}}<small>exclude: {{join .ExcludeTerms ", "}}</small>{{end}}
+              {{if .Note}}<small>note: {{.Note}}</small>{{end}}
+              {{if .ExcludeCompleteBike}}<small>ignores complete-bike listings</small>{{end}}
+              {{if .Sources}}<small>scoped to {{len .Sources}} source(s)</small>{{end}}
+            </div>
             <form method="post" action="/keywords/delete">
               <input type="hidden" name="id" value="{{.ID}}">
               <button class="delete" type="submit">Delete</button>
             </form>
           </div>
         {{else}}
-          <p class="muted">No keywords yet.</p>
+          <p class="muted">No watch rules yet.</p>
         {{end}}
       </div>
     </section>
@@ -594,7 +697,7 @@ const dashboardTemplate = `<!doctype html>
           <input type="number" name="days" min="1" max="365" value="7" required>
           <button type="submit">Scan enabled sources</button>
         </form>
-        <p class="muted">Scans previous messages for current keywords. Old matches are stored, not sent as Telegram alerts.</p>
+        <p class="muted">Scans previous messages with current watch rules. Old matches are stored, not sent as Telegram alerts.</p>
       </div>
 
       <div class="panel">
@@ -607,6 +710,7 @@ const dashboardTemplate = `<!doctype html>
               <span class="muted">{{time .CreatedAt}}</span>
             </div>
             <div class="muted">{{.SourcePeerType}}:{{.SourcePeerID}} message {{.MessageID}}</div>
+            {{if .MatchReason}}<div class="muted">{{.MatchReason}} · score {{.MatchScore}}</div>{{end}}
             <pre>{{short .Text 700}}</pre>
           </article>
         {{else}}

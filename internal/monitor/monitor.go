@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gotd/td/telegram"
@@ -26,8 +27,11 @@ import (
 )
 
 type Handler struct {
-	store    *db.Store
-	notifier notify.Notifier
+	store            *db.Store
+	notifier         notify.Notifier
+	deletionNotifier notify.DeletionNotifier
+	selfUserID       atomic.Int64
+	deletionMu       sync.Mutex
 }
 
 type Service struct {
@@ -104,7 +108,15 @@ func NewHandler(store *db.Store, notifier notify.Notifier) *Handler {
 	if notifier == nil {
 		notifier = notify.Nop{}
 	}
-	return &Handler{store: store, notifier: notifier}
+	deletionNotifier, ok := notifier.(notify.DeletionNotifier)
+	if !ok {
+		deletionNotifier = nil
+	}
+	switch notifier.(type) {
+	case notify.Nop, *notify.Nop:
+		deletionNotifier = nil
+	}
+	return &Handler{store: store, notifier: notifier, deletionNotifier: deletionNotifier}
 }
 
 func NewService(cfg config.Config, store *db.Store, notifier notify.Notifier) *Service {
@@ -171,14 +183,21 @@ func (s *Service) runOnce(ctx context.Context) error {
 		}
 
 		s.setState(client.API(), status.User.ID, true, "")
-		if count, err := s.SyncDialogs(ctx); err != nil {
-			log.Printf("telegram dialogs sync failed: %v", err)
-		} else {
-			log.Printf("telegram dialogs synced: %d sources", count)
-		}
-
+		s.handler.SetSelfUserID(status.User.ID)
 		log.Printf("telegram user monitoring started as user_id=%d", status.User.ID)
-		err = manager.Run(ctx, client.API(), status.User.ID, updates.AuthOptions{})
+		err = manager.Run(ctx, client.API(), status.User.ID, updates.AuthOptions{
+			OnStart: func(managerCtx context.Context) {
+				go s.handler.runPrivateDeletionOutbox(managerCtx)
+				go func() {
+					if count, syncErr := s.SyncDialogs(managerCtx); syncErr != nil {
+						log.Printf("telegram dialogs sync failed: %v", syncErr)
+					} else {
+						log.Printf("telegram dialogs synced: %d sources", count)
+					}
+					s.runPrivateArchive(managerCtx)
+				}()
+			},
+		})
 		if errors.Is(err, context.Canceled) {
 			return nil
 		}
@@ -221,8 +240,9 @@ func (s *Service) SyncDialogs(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("get dialogs: %w", err)
 	}
 
+	dialogs, chats, users := dialogParts(result)
 	count := 0
-	for _, chat := range chatsFromDialogs(result) {
+	for _, chat := range chats {
 		peer, ok := monitorPeerFromChat(chat)
 		if !ok {
 			continue
@@ -236,6 +256,9 @@ func (s *Service) SyncDialogs(ctx context.Context) (int, error) {
 			}
 		}
 		count++
+	}
+	if err := s.rememberPrivateDialogs(ctx, userID, dialogs, users); err != nil {
+		return count, err
 	}
 	return count, nil
 }
@@ -565,26 +588,30 @@ func Login(ctx context.Context, cfg config.Config, in io.Reader, out io.Writer) 
 func (h *Handler) Handle(ctx context.Context, update tg.UpdatesClass) error {
 	switch typed := update.(type) {
 	case *tg.Updates:
+		privateDialogs := privateDialogDirectory(h.selfUserID.Load(), typed.Users)
 		for _, item := range typed.Updates {
-			if err := h.handleUpdate(ctx, item); err != nil {
+			if err := h.handleUpdate(ctx, item, privateDialogs); err != nil {
 				return err
 			}
 		}
 	case *tg.UpdatesCombined:
+		privateDialogs := privateDialogDirectory(h.selfUserID.Load(), typed.Users)
 		for _, item := range typed.Updates {
-			if err := h.handleUpdate(ctx, item); err != nil {
+			if err := h.handleUpdate(ctx, item, privateDialogs); err != nil {
 				return err
 			}
 		}
 	case *tg.UpdateShort:
-		return h.handleUpdate(ctx, typed.Update)
+		return h.handleUpdate(ctx, typed.Update, nil)
 	case *tg.UpdateShortMessage:
 		return h.handleText(ctx, observedMessage{
 			SourcePeerType: "user",
 			SourcePeerID:   typed.UserID,
+			SenderPeerID:   h.shortMessageSenderID(typed.UserID, typed.Out),
 			MessageID:      typed.ID,
 			MessageDate:    unixTime(typed.Date),
 			Text:           typed.Message,
+			Outgoing:       typed.Out,
 		})
 	case *tg.UpdateShortChatMessage:
 		return h.handleText(ctx, observedMessage{
@@ -598,32 +625,40 @@ func (h *Handler) Handle(ctx context.Context, update tg.UpdatesClass) error {
 	return nil
 }
 
-func (h *Handler) handleUpdate(ctx context.Context, update tg.UpdateClass) error {
+func (h *Handler) handleUpdate(ctx context.Context, update tg.UpdateClass, privateDialogs map[int64]db.PrivateDialog) error {
 	switch typed := update.(type) {
 	case *tg.UpdateNewMessage:
-		return h.handleMessageClass(ctx, typed.Message)
+		return h.handleMessageClass(ctx, typed.Message, privateDialogs)
 	case *tg.UpdateNewChannelMessage:
-		return h.handleMessageClass(ctx, typed.Message)
+		return h.handleMessageClass(ctx, typed.Message, privateDialogs)
 	case *tg.UpdateEditMessage:
-		return h.handleMessageClass(ctx, typed.Message)
+		return h.handleMessageClass(ctx, typed.Message, privateDialogs)
 	case *tg.UpdateEditChannelMessage:
-		return h.handleMessageClass(ctx, typed.Message)
+		return h.handleMessageClass(ctx, typed.Message, privateDialogs)
+	case *tg.UpdateDeleteMessages:
+		return h.handleDeletedPrivateMessages(ctx, typed.Messages)
 	}
 	return nil
 }
 
-func (h *Handler) handleMessageClass(ctx context.Context, message tg.MessageClass) error {
+func (h *Handler) handleMessageClass(ctx context.Context, message tg.MessageClass, privateDialogs map[int64]db.PrivateDialog) error {
 	msg, ok := message.(*tg.Message)
 	if !ok {
 		return nil
 	}
 	peerType, peerID := peerInfo(msg.PeerID)
+	_, senderID := peerInfo(msg.FromID)
 	return h.handleText(ctx, observedMessage{
 		SourcePeerType: peerType,
 		SourcePeerID:   peerID,
+		SenderPeerID:   senderID,
 		MessageID:      msg.ID,
 		MessageDate:    unixTime(msg.Date),
+		EditDate:       optionalUnixTime(msg.EditDate),
 		Text:           msg.Message,
+		MediaType:      telegramMediaType(msg.Media),
+		Outgoing:       msg.Out,
+		PrivateDialog:  privateDialogs[peerID],
 	})
 }
 
@@ -633,6 +668,9 @@ func (h *Handler) handleText(ctx context.Context, observed observedMessage) erro
 }
 
 func (h *Handler) processObserved(ctx context.Context, observed observedMessage, notifyOnInsert bool) (ProcessResult, error) {
+	if err := h.archivePrivateMessage(ctx, observed); err != nil {
+		return ProcessResult{}, err
+	}
 	observed.Text = strings.TrimSpace(observed.Text)
 	if observed.Text == "" {
 		return ProcessResult{}, nil
@@ -649,7 +687,8 @@ func (h *Handler) processObserved(ctx context.Context, observed observedMessage,
 		return ProcessResult{}, err
 	}
 	var result ProcessResult
-	for _, keyword := range match.Find(observed.Text, keywords) {
+	for _, matched := range match.Evaluate(observed.Text, observed.SourcePeerType, observed.SourcePeerID, keywords) {
+		keyword := matched.Keyword
 		event, inserted, err := h.store.RecordEvent(ctx, db.Event{
 			SourcePeerType: observed.SourcePeerType,
 			SourcePeerID:   observed.SourcePeerID,
@@ -657,6 +696,10 @@ func (h *Handler) processObserved(ctx context.Context, observed observedMessage,
 			MessageDate:    observed.MessageDate,
 			Text:           observed.Text,
 			Keyword:        keyword.Phrase,
+			RuleID:         keyword.ID,
+			MatchReason:    matched.Reason,
+			MatchScore:     matched.Score,
+			RuleNote:       keyword.Note,
 		})
 		if err != nil {
 			return result, err
@@ -677,9 +720,14 @@ func (h *Handler) processObserved(ctx context.Context, observed observedMessage,
 type observedMessage struct {
 	SourcePeerType string
 	SourcePeerID   int64
+	SenderPeerID   int64
 	MessageID      int
 	MessageDate    time.Time
+	EditDate       time.Time
 	Text           string
+	MediaType      string
+	Outgoing       bool
+	PrivateDialog  db.PrivateDialog
 }
 
 func peerInfo(peer tg.PeerClass) (string, int64) {
@@ -698,6 +746,13 @@ func peerInfo(peer tg.PeerClass) (string, int64) {
 func unixTime(seconds int) time.Time {
 	if seconds <= 0 {
 		return time.Now().UTC()
+	}
+	return time.Unix(int64(seconds), 0).UTC()
+}
+
+func optionalUnixTime(seconds int) time.Time {
+	if seconds <= 0 {
+		return time.Time{}
 	}
 	return time.Unix(int64(seconds), 0).UTC()
 }

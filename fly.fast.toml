@@ -3,6 +3,8 @@ primary_region = "fra"
 
 [build]
   dockerfile = "Dockerfile.fast"
+  # The fast image is built and pushed by scripts/deploy-fast.sh. Fly Machines
+  # currently run on x86_64, while local smoke images may target arm64.
 
 [env]
   PORT = "8080"

@@ -13,6 +13,7 @@ type Config struct {
 	DBPath        string
 	SessionPath   string
 	PublicBaseURL string
+	MCPToken      string
 
 	BotToken        string
 	BotAdminChatIDs []int64
@@ -31,6 +32,7 @@ func Load() (Config, error) {
 		DBPath:        envFirstDefault("TG_RADAR_DB", "/data/tg-radar.db", "DB_PATH", "data/tg-radar.db"),
 		SessionPath:   envFirstDefault("TG_RADAR_SESSION", "/data/telegram.session", "TG_SESSION_PATH", "data/telegram.session"),
 		PublicBaseURL: strings.TrimRight(envFirst("TG_RADAR_PUBLIC_URL", "PUBLIC_BASE_URL"), "/"),
+		MCPToken:      envFirst("TG_RADAR_MCP_TOKEN", "MCP_TOKEN"),
 		BotToken:      envFirst("TELEGRAM_BOT_TOKEN", "BOT_TOKEN"),
 		TelegramAPIHash: envFirst(
 			"TELEGRAM_API_HASH",
@@ -105,6 +107,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.DBPath, "db", c.DBPath, "SQLite database path")
 	fs.StringVar(&c.SessionPath, "session", c.SessionPath, "gotd Telegram session file path")
 	fs.StringVar(&c.PublicBaseURL, "public-url", c.PublicBaseURL, "public HTTPS base URL for Telegram Mini App")
+	fs.StringVar(&c.MCPToken, "mcp-token", c.MCPToken, "bearer token protecting the MCP endpoint")
 	fs.StringVar(&c.BotToken, "bot-token", c.BotToken, "Telegram bot token")
 	fs.Func("admin-chat-ids", "comma-separated Telegram chat ids allowed to run bot admin commands", func(value string) error {
 		ids, err := parseInt64List(value)
@@ -135,6 +138,10 @@ func (c Config) IsConfiguredBotAdmin(chatID int64) bool {
 
 func (c Config) HasTelegramUserAPI() bool {
 	return c.TelegramAPIID != 0 && strings.TrimSpace(c.TelegramAPIHash) != ""
+}
+
+func (c Config) HasMCP() bool {
+	return strings.TrimSpace(c.MCPToken) != ""
 }
 
 func (c Config) ValidateLogin() error {

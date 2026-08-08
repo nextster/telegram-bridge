@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf16"
 
 	"github.com/mymmrac/telego"
 	tu "github.com/mymmrac/telego/telegoutil"
@@ -92,6 +93,46 @@ func (s *Service) NotifyEvent(ctx context.Context, event db.Event) error {
 	return nil
 }
 
+func (s *Service) NotifyDeletedMessages(ctx context.Context, deletion db.PrivateMessageDeletion) error {
+	chatID, ok, err := s.privateAlertChatID(ctx, deletion.Dialog.OwnerUserID)
+	if err != nil {
+		return err
+	}
+	if len(deletion.Messages) == 0 {
+		return nil
+	}
+	if !ok {
+		return fmt.Errorf("private deletion alert owner %d has not subscribed to the bot", deletion.Dialog.OwnerUserID)
+	}
+
+	_, err = s.bot.SendMessage(ctx, &telego.SendMessageParams{
+		ChatID: telego.ChatID{ID: chatID},
+		Text:   formatDeletedMessages(deletion),
+	})
+	if err != nil {
+		return fmt.Errorf("send deletion alert to owner chat %d: %w", chatID, err)
+	}
+	return nil
+}
+
+func (s *Service) privateAlertChatID(ctx context.Context, ownerUserID int64) (int64, bool, error) {
+	if ownerUserID <= 0 {
+		return 0, false, nil
+	}
+	subscribers, err := s.store.ListSubscribers(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+	for _, subscriber := range subscribers {
+		// In a private Bot API chat, chat_id is the user's Telegram ID. Never
+		// route archived personal text to another subscriber or to a group.
+		if subscriber.ChatID == ownerUserID {
+			return ownerUserID, true, nil
+		}
+	}
+	return 0, false, nil
+}
+
 func (s *Service) NotifySystem(ctx context.Context, text string) error {
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -119,6 +160,7 @@ func (s *Service) setCommands(ctx context.Context) error {
 			{Command: "start", Description: "subscribe to alerts"},
 			{Command: "stop", Description: "unsubscribe from alerts"},
 			{Command: "add", Description: "add keyword"},
+			{Command: "watch", Description: "add flexible watch rule"},
 			{Command: "del", Description: "delete keyword by id or text"},
 			{Command: "keywords", Description: "list keywords"},
 			{Command: "recent", Description: "show recent matches"},
@@ -157,6 +199,8 @@ func (s *Service) handleUpdate(ctx context.Context, update telego.Update) error 
 		return s.handleStop(ctx, message)
 	case "add":
 		return s.handleAddKeyword(ctx, message, payload)
+	case "watch":
+		return s.handleAddWatchRule(ctx, message, payload)
 	case "del", "delete":
 		return s.handleDeleteKeyword(ctx, message, payload)
 	case "keywords":
@@ -202,7 +246,11 @@ func (s *Service) handleStopKeywordCallback(ctx context.Context, query *telego.C
 		return s.answerCallback(ctx, query.ID, "This match is no longer available.")
 	}
 
-	rows, err := s.store.DeleteKeyword(ctx, event.Keyword)
+	deleteValue := event.Keyword
+	if event.RuleID > 0 {
+		deleteValue = strconv.FormatInt(event.RuleID, 10)
+	}
+	rows, err := s.store.DeleteKeyword(ctx, deleteValue)
 	if err != nil {
 		_ = s.answerCallback(ctx, query.ID, "Could not stop keyword.")
 		return err
@@ -300,6 +348,42 @@ func (s *Service) handleAddKeyword(ctx context.Context, message *telego.Message,
 	return s.reply(ctx, message.Chat.ID, fmt.Sprintf("Added keyword #%d: %s", keyword.ID, keyword.Phrase), nil)
 }
 
+func (s *Service) handleAddWatchRule(ctx context.Context, message *telego.Message, payload string) error {
+	parts := strings.Split(payload, "::")
+	if len(parts) < 2 {
+		return s.reply(ctx, message.Chat.ID, "Usage: /watch name :: any term, synonym :: required terms :: excluded terms", nil)
+	}
+	rule, err := s.store.UpsertWatchRule(ctx, db.Keyword{
+		Phrase:       strings.TrimSpace(parts[0]),
+		AnyTerms:     splitRuleTerms(parts[1]),
+		AllTerms:     splitRulePart(parts, 2),
+		ExcludeTerms: splitRulePart(parts, 3),
+		Enabled:      true,
+	})
+	if err != nil {
+		return s.reply(ctx, message.Chat.ID, "Could not add watch rule: "+err.Error(), nil)
+	}
+	return s.reply(ctx, message.Chat.ID, fmt.Sprintf("Watching #%d %s\nany: %s", rule.ID, rule.Phrase, strings.Join(rule.AnyTerms, ", ")), nil)
+}
+
+func splitRulePart(parts []string, index int) []string {
+	if index >= len(parts) {
+		return nil
+	}
+	return splitRuleTerms(parts[index])
+}
+
+func splitRuleTerms(value string) []string {
+	parts := strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == '\n' })
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
 func (s *Service) handleDeleteKeyword(ctx context.Context, message *telego.Message, payload string) error {
 	rows, err := s.store.DeleteKeyword(ctx, payload)
 	if err != nil || rows == 0 {
@@ -318,11 +402,35 @@ func (s *Service) handleKeywords(ctx context.Context, message *telego.Message) e
 	}
 
 	var b strings.Builder
-	b.WriteString("Keywords:\n")
+	b.WriteString("Watch rules:\n")
 	for _, keyword := range keywords {
-		fmt.Fprintf(&b, "#%d %s\n", keyword.ID, keyword.Phrase)
+		fmt.Fprintf(&b, "#%d %s", keyword.ID, keyword.Phrase)
+		if len(keyword.AnyTerms) > 0 {
+			fmt.Fprintf(&b, "\n  any: %s", formatRuleTerms(keyword.AnyTerms, 3))
+		}
+		if len(keyword.AllTerms) > 0 {
+			fmt.Fprintf(&b, "\n  all: %s", formatRuleTerms(keyword.AllTerms, 3))
+		}
+		if len(keyword.RequiredAnyGroups)+len(keyword.PreferredTerms)+len(keyword.ExcludeTerms) > 0 {
+			fmt.Fprintf(&b, "\n  %d required group(s) · %d preferred · %d excluded",
+				len(keyword.RequiredAnyGroups), len(keyword.PreferredTerms), len(keyword.ExcludeTerms))
+		}
+		if keyword.Note != "" {
+			fmt.Fprintf(&b, "\n  note: %s", truncate(keyword.Note, 100))
+		}
+		if keyword.ExcludeCompleteBike {
+			b.WriteString("\n  ignores complete-bike listings")
+		}
+		b.WriteByte('\n')
 	}
 	return s.reply(ctx, message.Chat.ID, strings.TrimSpace(b.String()), s.webAppMarkup())
+}
+
+func formatRuleTerms(terms []string, limit int) string {
+	if limit <= 0 || len(terms) <= limit {
+		return strings.Join(terms, ", ")
+	}
+	return fmt.Sprintf("%s (+%d)", strings.Join(terms[:limit], ", "), len(terms)-limit)
 }
 
 func (s *Service) handleRecent(ctx context.Context, message *telego.Message) error {
@@ -457,11 +565,89 @@ func formatEvent(event db.Event) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "tg-radar match: %s\n", event.Keyword)
 	fmt.Fprintf(&b, "Source: %s:%d message %d\n", event.SourcePeerType, event.SourcePeerID, event.MessageID)
+	if event.MatchReason != "" {
+		fmt.Fprintf(&b, "Why: %s (score %d)\n", event.MatchReason, event.MatchScore)
+	}
+	if event.RuleNote != "" {
+		fmt.Fprintf(&b, "Specs: %s\n", event.RuleNote)
+	}
 	if !event.MessageDate.IsZero() {
 		fmt.Fprintf(&b, "Time: %s\n", event.MessageDate.Format(time.RFC3339))
 	}
 	fmt.Fprintf(&b, "\n%s", truncate(event.Text, 2600))
 	return b.String()
+}
+
+func formatDeletedMessages(deletion db.PrivateMessageDeletion) string {
+	count := len(deletion.Messages)
+	label := privateDialogLabel(deletion.Dialog)
+	var b strings.Builder
+	if count == 1 {
+		fmt.Fprintf(&b, "🫥 В личном чате %s исчезло сообщение.\n", label)
+	} else {
+		fmt.Fprintf(&b, "🧹 В личном чате %s исчезли %d сообщений.\n", label, count)
+		b.WriteString("Это может быть очистка истории, но Telegram не даёт отдельного признака «удалён весь чат».\n")
+	}
+	b.WriteString("Telegram не сообщает причину и автора удаления: это мог быть собеседник, другая твоя сессия или автоудаление.\n")
+
+	shown := 0
+	for _, message := range deletion.Messages {
+		if shown == 6 {
+			break
+		}
+		direction := "входящее"
+		if message.Outgoing {
+			direction = "исходящее"
+		}
+		content := strings.TrimSpace(message.Text)
+		if content == "" {
+			content = deletedMediaLabel(message.MediaType)
+		}
+		fmt.Fprintf(&b, "\n%d. %s · %s\n%s\n", shown+1, direction, message.MessageDate.Format(time.RFC3339), truncateUTF16(content, 480))
+		shown++
+	}
+	if remaining := count - shown; remaining > 0 {
+		fmt.Fprintf(&b, "\n…и ещё %d.", remaining)
+	}
+	return truncateUTF16(b.String(), 3900)
+}
+
+func privateDialogLabel(dialog db.PrivateDialog) string {
+	title := strings.TrimSpace(dialog.Title)
+	username := telegramUsername(dialog.Username)
+	if title == "" && username != "" {
+		return "@" + username
+	}
+	if title == "" {
+		return fmt.Sprintf("user:%d", dialog.PeerID)
+	}
+	if username != "" && !strings.EqualFold(title, username) && !strings.EqualFold(title, "@"+username) {
+		return fmt.Sprintf("%s (@%s)", title, username)
+	}
+	return title
+}
+
+func deletedMediaLabel(mediaType string) string {
+	switch strings.TrimSpace(mediaType) {
+	case "photo":
+		return "[фото без подписи]"
+	case "file":
+		return "[файл без подписи]"
+	case "contact":
+		return "[контакт]"
+	case "location":
+		return "[геолокация]"
+	case "poll":
+		return "[опрос]"
+	case "dice":
+		return "[дайс]"
+	case "game":
+		return "[игра]"
+	case "media":
+		return "[медиа без подписи]"
+	default:
+		return "[сообщение без текста]"
+	}
 }
 
 func helpText() string {
@@ -470,6 +656,7 @@ func helpText() string {
 		"/start - subscribe this chat to alerts",
 		"/stop - unsubscribe this chat",
 		"/add keyword - add a radar phrase",
+		"/watch name :: any1, any2 :: required1 :: excluded1 - add a flexible rule",
 		"/del keyword-or-id - delete a phrase",
 		"/keywords - list phrases",
 		"/recent - show recent matches",
@@ -486,4 +673,20 @@ func truncate(value string, limit int) string {
 	}
 	runes := []rune(value)
 	return string(runes[:limit]) + "..."
+}
+
+func truncateUTF16(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	if limit <= 3 {
+		return ""
+	}
+	encoded := utf16.Encode([]rune(value))
+	if len(encoded) <= limit {
+		return value
+	}
+	encoded = encoded[:limit-3]
+	if len(encoded) > 0 && encoded[len(encoded)-1] >= 0xD800 && encoded[len(encoded)-1] <= 0xDBFF {
+		encoded = encoded[:len(encoded)-1]
+	}
+	return string(utf16.Decode(encoded)) + "..."
 }

@@ -6,6 +6,7 @@ Single-binary Telegram radar MVP:
 - Telegram bot via `telego`.
 - Telegram user API monitoring via `gotd/td`.
 - Mini App compatible web UI via `net/http` and `html/template`.
+- Read-only MCP access to the logged-in Telegram account.
 - Fly.io deployment with a persistent `/data` volume.
 
 ## Run locally
@@ -36,6 +37,7 @@ Optional env:
 export TELEGRAM_PHONE="+15551234567"
 export TELEGRAM_PASSWORD="account-password"
 export TG_RADAR_ADMIN_CHAT_IDS="123456789"
+export TG_RADAR_MCP_TOKEN="a-long-random-bearer-token"
 ```
 
 The bot can authorize the gotd user session with `/login`. The bot only asks for the Telegram phone number and then sends a short-lived site login link. Enter the Telegram login code and 2FA password on the HTTPS site, not in the bot chat: Telegram blocks code-based sign-in after a code is shared in a bot chat. If `TG_RADAR_ADMIN_CHAT_IDS` is not set, the first chat that runs `/start` becomes the admin chat for MVP operations.
@@ -46,7 +48,8 @@ The CLI `login` command still works and stores the gotd user session in `data/te
 
 - `/start` subscribes the current chat to alerts.
 - `/stop` unsubscribes it.
-- `/add phrase` adds a monitored phrase.
+- `/add phrase` adds a simple one-term watch rule.
+- `/watch name :: any1, any2 :: required1 :: excluded1` adds a flexible watch rule.
 - `/del phrase-or-id` deletes a monitored phrase.
 - `/keywords` lists phrases.
 - `/recent` shows latest matches.
@@ -84,10 +87,19 @@ Fast code-only redeploy:
 scripts/deploy-fast.sh
 ```
 
-This builds a Linux/amd64 binary locally, packs it with UPX, and deploys via
-`fly deploy --local-only` using `fly.fast.toml`. It is meant for quick Go code
-iterations; use plain `fly deploy` after changing Fly config, Docker base
-images, mounts, or services.
+This builds the deployment image locally with Apple `container`, pushes it to
+the Fly registry, and deploys it using `fly.fast.toml`; OrbStack and a Docker
+daemon are not required. Install the lightweight OCI registry client once with
+`brew install regclient`; the script uses its `regctl` command to upload the
+image produced by Apple `container` because Fly's registry is not compatible
+with Apple `container image push`. Fly Machines currently run on x86_64, so
+the default deployment target remains `linux/amd64` even on Apple Silicon. The
+Dockerfiles and fast image are architecture-neutral, and a local ARM64 image
+can be built with `TARGET_GOARCH=arm64 PLATFORM=linux/arm64 MODE=build`.
+
+The fast path is meant for quick Go code iterations; use plain `fly deploy`
+after changing Fly config, Docker base images, mounts, or services. Set
+`BUILDER=docker` only when explicitly falling back to Docker Buildx.
 
 For an extra post-deploy public health check:
 
@@ -109,3 +121,87 @@ The old SSH path is still available:
 ```sh
 fly ssh console -C "tg-radar login"
 ```
+
+## MCP
+
+Set a dedicated bearer token to enable the Streamable HTTP endpoint at
+`https://<your-host>/mcp`:
+
+```sh
+fly secrets set TG_RADAR_MCP_TOKEN="$(openssl rand -hex 32)"
+```
+
+The MCP server reuses the live gotd client inside `tg-radar serve`, so it does
+not create a second Telegram session or require another login. Clients must
+send `Authorization: Bearer <token>` on every request.
+
+Available read-only tools:
+
+- `telegram_list_dialogs` lists recent dialogs and returns stable chat keys.
+- `telegram_search_messages` searches globally or within one returned chat key.
+- `telegram_get_history` reads and paginates a chat's message history.
+
+No tools for sending, editing, forwarding, or deleting messages are exposed.
+
+## Private message deletion alerts
+
+The logged-in user session keeps a private SQLite snapshot of direct,
+non-bot chats so the bot can report messages that later disappear. On the
+first run it seeds up to the latest 100 messages from each direct dialog in
+the 100 most recent Telegram dialogs, then keeps new messages and edits
+current. Snapshots are retained for 90 days, with a 25,000-message safety cap
+for the small Fly volume. Pending alerts are protected from pruning.
+
+It stores text/captions and a media kind, not photo, video, voice, or file
+bytes. The archive is not exposed on the dashboard or through MCP. Deletion
+alerts are sent only to the private bot chat whose user ID owns the logged-in
+Telegram session; that account must have sent `/start`. Failed sends stay in a
+durable outbox with capped backoff, and large deletions are delivered in
+small chunks.
+
+Telegram deletion updates do not identify the actor or reason and do not
+contain a distinct "whole chat deleted" flag. A batch is therefore reported
+as several disappeared messages and may indicate a cleared history, without
+attributing it to the other person. Clearing history only on the other
+person's device is invisible; revoking it for both sides is observable.
+Messages deleted before the first snapshot cannot be recovered. Secret chats
+are outside the cloud user API and are not archived.
+
+## Flexible watch rules
+
+The dashboard can create grouped rules with:
+
+- `any` aliases: at least one term must match;
+- `all` terms: every term must match;
+- `required_any`: one alias from every group must match (AND between groups,
+  OR inside a group);
+- `prefer` terms: matching terms add evidence to the score but never gate a
+  result;
+- `exclude` terms: any one suppresses the match;
+- an operator note that is copied into a live alert;
+- optional suppression of complete-bike listings, using the channel's
+  `#bikes` taxonomy plus conservative multilingual/spec-sheet signals;
+- optional Telegram source scoping;
+- token-safe, normalized, and typo-tolerant phrase matching. Model names such
+  as `XG1250`/`XG-1250` and `T25` normalize consistently without making `12`
+  match `1200`.
+
+Exclusions are exact-only so `продан` cannot suppress a normal `продам`
+listing. A required-any group can also contain a unit-aware numeric minimum,
+for example `num>=1000:lm|lumen|lumens|люмен|лм`; the number and unit must be
+adjacent, so a price or battery capacity cannot satisfy the light-output rule.
+
+Existing keywords remain valid and behave like a rule with one `any` term. New
+matches store a score and a short explanation of the matching alias.
+
+Rules can also be migrated silently and atomically from JSON without sending
+one bot status message per rule:
+
+```sh
+printf '%s' '{"delete":["old phrase"],"rules":[{"name":"front light","any":["front bike light","велофара"],"required_any":[["USB-C","Type-C"],["1000","1200","1600"]],"prefer":["daytime flash","Garmin mount"],"exclude":["sold","продано"],"note":"Verify the beam and underside mount."}]}' \
+  | tg-radar rules-import
+```
+
+Imports may also define `default_exclude`, `default_sources`, and
+`default_exclude_complete_bike`. A rule inherits the default sources when
+`sources` is omitted; an explicit `sources` array replaces the defaults.

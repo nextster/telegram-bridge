@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -56,12 +58,86 @@ func run(args []string) error {
 		defer store.Close()
 		fmt.Fprintf(os.Stdout, "SQLite schema is ready at %s\n", cfg.DBPath)
 		return nil
+	case "rules-import":
+		return importRules(ctx, cfg, os.Stdin, os.Stdout)
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
 	default:
 		return fmt.Errorf("unknown command %q", command)
 	}
+}
+
+type ruleImport struct {
+	Delete                     []string           `json:"delete"`
+	DefaultExclude             []string           `json:"default_exclude"`
+	DefaultSources             []ruleImportSource `json:"default_sources"`
+	DefaultExcludeCompleteBike bool               `json:"default_exclude_complete_bike"`
+	Rules                      []ruleImportItem   `json:"rules"`
+}
+
+type ruleImportItem struct {
+	Name                string             `json:"name"`
+	Any                 []string           `json:"any"`
+	All                 []string           `json:"all"`
+	RequiredAny         [][]string         `json:"required_any"`
+	Prefer              []string           `json:"prefer"`
+	Exclude             []string           `json:"exclude"`
+	Note                string             `json:"note"`
+	ExcludeCompleteBike *bool              `json:"exclude_complete_bike"`
+	Sources             []ruleImportSource `json:"sources"`
+}
+
+type ruleImportSource struct {
+	PeerType string `json:"peer_type"`
+	PeerID   int64  `json:"peer_id"`
+}
+
+func importRules(ctx context.Context, cfg config.Config, in io.Reader, out io.Writer) error {
+	var payload ruleImport
+	decoder := json.NewDecoder(in)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		return fmt.Errorf("decode rules import: %w", err)
+	}
+	store, err := db.Open(ctx, cfg.DBPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	rules := make([]db.Keyword, 0, len(payload.Rules))
+	for _, item := range payload.Rules {
+		importSources := item.Sources
+		if item.Sources == nil {
+			importSources = payload.DefaultSources
+		}
+		sources := make([]db.RuleSource, 0, len(importSources))
+		for _, source := range importSources {
+			sources = append(sources, db.RuleSource{PeerType: source.PeerType, PeerID: source.PeerID})
+		}
+		excludeCompleteBike := payload.DefaultExcludeCompleteBike
+		if item.ExcludeCompleteBike != nil {
+			excludeCompleteBike = *item.ExcludeCompleteBike
+		}
+		rules = append(rules, db.Keyword{
+			Phrase:              item.Name,
+			AnyTerms:            item.Any,
+			AllTerms:            item.All,
+			RequiredAnyGroups:   item.RequiredAny,
+			PreferredTerms:      item.Prefer,
+			ExcludeTerms:        append(append([]string(nil), payload.DefaultExclude...), item.Exclude...),
+			Note:                item.Note,
+			ExcludeCompleteBike: excludeCompleteBike,
+			Sources:             sources,
+			Enabled:             true,
+		})
+	}
+	deleted, err := store.ApplyWatchRules(ctx, rules, payload.Delete)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "Imported %d watch rules; deleted %d old rules\n", len(payload.Rules), deleted)
+	return nil
 }
 
 func serve(ctx context.Context, cfg config.Config) error {
@@ -144,6 +220,7 @@ Commands:
   serve    Run web UI, bot polling, and gotd monitor
   login    Authorize Telegram user session for gotd
   migrate  Create or update SQLite schema
+  rules-import  Import flexible watch rules from JSON on stdin
 
 Environment:
   TELEGRAM_BOT_TOKEN or BOT_TOKEN
@@ -151,5 +228,5 @@ Environment:
   TELEGRAM_API_HASH or TG_API_HASH
   TELEGRAM_PHONE or TG_PHONE
   TELEGRAM_PASSWORD or TG_PASSWORD
-  TG_RADAR_DB, TG_RADAR_SESSION, TG_RADAR_PUBLIC_URL, PORT`)
+  TG_RADAR_DB, TG_RADAR_SESSION, TG_RADAR_PUBLIC_URL, TG_RADAR_MCP_TOKEN, PORT`)
 }

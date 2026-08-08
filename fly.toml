@@ -3,6 +3,8 @@ primary_region = "fra"
 
 [build]
   dockerfile = "Dockerfile"
+  # Fly Machines currently run on x86_64. Apple container can cross-build the
+  # deployment image locally; the Dockerfile itself remains architecture-neutral.
 
 [env]
   PORT = "8080"

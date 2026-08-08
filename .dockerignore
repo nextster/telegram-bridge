@@ -2,6 +2,7 @@
 .env
 .env.*
 data/
-.fly-build/
+.fly-build/*
+!.fly-build/tg-radar
 *.session
 *.db

@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -12,7 +13,18 @@ import (
 )
 
 type captureNotifier struct {
-	events []db.Event
+	events      []db.Event
+	deletions   []db.PrivateMessageDeletion
+	failDeletes int
+}
+
+func (c *captureNotifier) NotifyDeletedMessages(_ context.Context, deletion db.PrivateMessageDeletion) error {
+	if c.failDeletes > 0 {
+		c.failDeletes--
+		return errors.New("temporary send failure")
+	}
+	c.deletions = append(c.deletions, deletion)
+	return nil
 }
 
 func (c *captureNotifier) NotifyEvent(_ context.Context, event db.Event) error {
@@ -95,5 +107,152 @@ func TestBackfillFloodWait(t *testing.T) {
 
 	if _, ok := backfillFloodWait(tgerr.New(400, "PHONE_CODE_INVALID")); ok {
 		t.Fatal("non-flood error recognized as flood wait")
+	}
+}
+
+func TestHandlerArchivesEditedPrivateMessageAndNotifiesDeletionOnce(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(ctx, t.TempDir()+"/private-deletions.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	notifier := &captureNotifier{}
+	handler := NewHandler(store, notifier)
+	handler.SetSelfUserID(100)
+	peer := &tg.PeerUser{UserID: 200}
+	from := &tg.PeerUser{UserID: 200}
+	users := []tg.UserClass{&tg.User{ID: 200, AccessHash: 300, FirstName: "Alice", LastName: "Example", Username: "alice"}}
+
+	if err := handler.Handle(ctx, &tg.Updates{
+		Users: users,
+		Updates: []tg.UpdateClass{&tg.UpdateNewMessage{Message: &tg.Message{
+			ID: 77, PeerID: peer, FromID: from, Date: 100, Message: "original private text",
+		}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.Handle(ctx, &tg.Updates{
+		Users: users,
+		Updates: []tg.UpdateClass{&tg.UpdateEditMessage{Message: &tg.Message{
+			ID: 77, PeerID: peer, FromID: from, Date: 100, EditDate: 110, Message: "edited private text",
+		}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deletion := &tg.Updates{Updates: []tg.UpdateClass{&tg.UpdateDeleteMessages{Messages: []int{77}}}}
+	if err := handler.Handle(ctx, deletion); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.flushPrivateDeletionOutbox(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.Handle(ctx, deletion); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.flushPrivateDeletionOutbox(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(notifier.events) != 0 {
+		t.Fatalf("private non-match created %d radar events", len(notifier.events))
+	}
+	if len(notifier.deletions) != 1 {
+		t.Fatalf("deletion notifications = %d, want 1", len(notifier.deletions))
+	}
+	got := notifier.deletions[0]
+	if got.Dialog.Title != "Alice Example" || got.Dialog.Username != "alice" {
+		t.Fatalf("deletion dialog = %#v", got.Dialog)
+	}
+	if len(got.Messages) != 1 || got.Messages[0].Text != "edited private text" || got.Messages[0].MessageID != 77 {
+		t.Fatalf("deleted messages = %#v", got.Messages)
+	}
+}
+
+func TestPrivateDeletionOutboxRetriesFailedNotification(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(ctx, t.TempDir()+"/private-deletion-retry.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	notifier := &captureNotifier{failDeletes: 1}
+	handler := NewHandler(store, notifier)
+	handler.SetSelfUserID(100)
+	users := []tg.UserClass{&tg.User{ID: 200, AccessHash: 300, FirstName: "Alice"}}
+	if err := handler.Handle(ctx, &tg.Updates{Users: users, Updates: []tg.UpdateClass{
+		&tg.UpdateNewMessage{Message: &tg.Message{ID: 88, PeerID: &tg.PeerUser{UserID: 200}, FromID: &tg.PeerUser{UserID: 200}, Date: 100, Message: "retry me"}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.Handle(ctx, &tg.Updates{Updates: []tg.UpdateClass{&tg.UpdateDeleteMessages{Messages: []int{88}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.flushPrivateDeletionOutbox(ctx); err == nil {
+		t.Fatal("first flush unexpectedly succeeded")
+	}
+	if len(notifier.deletions) != 0 {
+		t.Fatalf("failed attempt delivered %d notifications", len(notifier.deletions))
+	}
+	if err := store.MarkPrivateDeletionFailed(ctx, 100, []int{88}, time.Now().UTC(), time.Now().Add(-time.Second), "ready to retry"); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.flushPrivateDeletionOutbox(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(notifier.deletions) != 1 {
+		t.Fatalf("retried notifications = %d, want 1", len(notifier.deletions))
+	}
+}
+
+func TestPrivateDeletionOutboxChunksAndNopDoesNotAcknowledge(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(ctx, t.TempDir()+"/private-deletion-chunks.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	notifier := &captureNotifier{}
+	handler := NewHandler(store, notifier)
+	handler.SetSelfUserID(100)
+	users := []tg.UserClass{&tg.User{ID: 200, AccessHash: 300, FirstName: "Alice"}}
+	updates := make([]tg.UpdateClass, 0, 8)
+	ids := make([]int, 0, 8)
+	for id := 1; id <= 8; id++ {
+		ids = append(ids, id)
+		updates = append(updates, &tg.UpdateNewMessage{Message: &tg.Message{
+			ID: id, PeerID: &tg.PeerUser{UserID: 200}, FromID: &tg.PeerUser{UserID: 200}, Date: 100 + id, Message: "chunk me",
+		}})
+	}
+	if err := handler.Handle(ctx, &tg.Updates{Users: users, Updates: updates}); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.Handle(ctx, &tg.Updates{Updates: []tg.UpdateClass{&tg.UpdateDeleteMessages{Messages: ids}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.flushPrivateDeletionOutbox(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(notifier.deletions) != 2 || len(notifier.deletions[0].Messages) != 6 || len(notifier.deletions[1].Messages) != 2 {
+		t.Fatalf("deletion chunks = %#v", notifier.deletions)
+	}
+
+	if err := handler.Handle(ctx, &tg.Updates{Updates: []tg.UpdateClass{&tg.UpdateDeleteMessages{Messages: []int{999}}}}); err != nil {
+		t.Fatal(err)
+	}
+	nopHandler := NewHandler(store, nil)
+	nopHandler.SetSelfUserID(100)
+	if err := nopHandler.flushPrivateDeletionOutbox(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := store.PrivateArchiveStats(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Pending != 1 {
+		t.Fatalf("pending after nop flush = %d, want 1", stats.Pending)
 	}
 }
