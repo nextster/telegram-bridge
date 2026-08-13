@@ -9,9 +9,15 @@ Single-binary Telegram radar MVP:
 - Read-only MCP access to the logged-in Telegram account.
 - Fly.io deployment with a persistent `/data` volume.
 
+All authored source and desired configuration live in this repository,
+including the Codex plugin, marketplace manifest, watch-rule packs, CI, and
+Fly machine sizing. Real credentials, Telegram/SQLite state, generated build
+artifacts, Codex registration/cache, and live Fly resources remain external.
+
 ## Run locally
 
 ```sh
+test -e .env.local || cp .env.example .env.local
 go run ./cmd/tg-radar migrate
 go run ./cmd/tg-radar serve
 ```
@@ -142,6 +148,31 @@ Available read-only tools:
 - `telegram_get_history` reads and paginates a chat's message history.
 
 No tools for sending, editing, forwarding, or deleting messages are exposed.
+
+### Codex plugin
+
+The canonical Codex plugin source and its marketplace manifest are tracked in
+this repository under `plugins/tg-radar` and `.agents/plugins/marketplace.json`.
+Install it from the repository marketplace with:
+
+```sh
+scripts/codex-plugin.sh install
+```
+
+For a one-time cutover from the former `~/plugins/tg-radar` source, run
+`scripts/codex-plugin.sh migrate`. It removes only the old tg-radar plugin
+installation, not the shared personal marketplace or its other plugins.
+
+After changing the plugin or its skill, refresh its cachebuster and reinstall:
+
+```sh
+scripts/codex-plugin.sh reload
+```
+
+The reload command intentionally changes the tracked plugin version. Commit
+that cachebuster with the plugin change. The Codex installation record and
+generated plugin cache remain machine-local; start a new Codex task after a
+reload so it picks up the new skill and MCP schema.
 
 ## Private message deletion alerts
 

@@ -1,0 +1,35 @@
+{
+  "name": "tg-radar",
+  "version": "0.1.0+codex.20260813233833",
+  "description": "Search and inspect the authenticated Telegram account through the read-only tg-radar MCP service.",
+  "author": {
+    "name": "Artem"
+  },
+  "homepage": "https://tg-radar.fly.dev/",
+  "repository": "https://github.com/nextster/tg-radar",
+  "keywords": [
+    "telegram",
+    "search",
+    "chat-history",
+    "mcp",
+    "tg-radar"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "TG Radar",
+    "shortDescription": "Search your Telegram chats from Codex",
+    "longDescription": "Search dialogs and messages, inspect recent history, and run date-bounded research against Artem's authenticated Telegram account through the read-only tg-radar MCP service.",
+    "developerName": "Artem",
+    "category": "Productivity",
+    "capabilities": [
+      "Read"
+    ],
+    "websiteURL": "https://tg-radar.fly.dev/",
+    "defaultPrompt": [
+      "Search my Telegram chats for a recent conversation.",
+      "Find recent marketplace posts matching this item.",
+      "Summarize what this Telegram chat discussed."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

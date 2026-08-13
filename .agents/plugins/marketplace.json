@@ -1,0 +1,20 @@
+{
+  "name": "tg-radar-repo",
+  "interface": {
+    "displayName": "TG Radar Repository"
+  },
+  "plugins": [
+    {
+      "name": "tg-radar",
+      "source": {
+        "source": "local",
+        "path": "./plugins/tg-radar"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

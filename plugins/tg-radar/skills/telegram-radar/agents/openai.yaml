@@ -1,0 +1,13 @@
+interface:
+  display_name: "Telegram Radar"
+  short_description: "Search and inspect your Telegram chats"
+  default_prompt: "Use $telegram-radar to search my Telegram chats for a recent conversation or listing."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "tg-radar"
+      description: "Read-only access to the authenticated Telegram account"
+      transport: "streamable_http"
+      url: "https://tg-radar.fly.dev/mcp"
+policy:
+  allow_implicit_invocation: true
