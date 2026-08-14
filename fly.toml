@@ -15,6 +15,11 @@ primary_region = "fra"
   source = "tg_radar_data"
   destination = "/data"
 
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "256mb"
+
 [http_service]
   internal_port = 8080
   force_https = true

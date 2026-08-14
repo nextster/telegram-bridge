@@ -30,5 +30,21 @@ WAIT_HEALTH=1 scripts/deploy-fast.sh
 Before finishing code changes, run:
 
 ```sh
-go test ./...
+scripts/check.sh
 ```
+
+## Codex plugin
+
+The canonical plugin source is `plugins/tg-radar`, and the repository-local
+marketplace manifest is `.agents/plugins/marketplace.json`. Do not edit a copy
+under `~/plugins/tg-radar` as an independent source.
+
+After plugin or skill changes, run:
+
+```sh
+scripts/codex-plugin.sh reload
+```
+
+This validates the skill and plugin, refreshes the tracked cachebuster, and
+reinstalls from the repository marketplace. Commit the resulting manifest
+version together with the plugin change.
