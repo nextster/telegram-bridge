@@ -529,15 +529,30 @@ func (s *Service) eventMarkup(ctx context.Context, event db.Event, chatID int64)
 	if err != nil {
 		log.Printf("check event action admin chat %d failed: %v", chatID, err)
 	}
-	if err == nil && admin && event.ID > 0 && strings.TrimSpace(event.Keyword) != "" {
-		rows = append(rows, tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("Stop keyword").WithCallbackData(fmt.Sprintf("kwdel:%d", event.ID)),
-		))
+	if err == nil && admin {
+		actions := make([]telego.InlineKeyboardButton, 0, 2)
+		if ruleURL := s.ruleWebAppURL(event.RuleID); ruleURL != "" {
+			actions = append(actions, tu.InlineKeyboardButton("Правило").WithWebApp(&telego.WebAppInfo{URL: ruleURL}))
+		}
+		if event.ID > 0 && strings.TrimSpace(event.Keyword) != "" {
+			actions = append(actions, tu.InlineKeyboardButton("Stop keyword").WithCallbackData(fmt.Sprintf("kwdel:%d", event.ID)))
+		}
+		if len(actions) > 0 {
+			rows = append(rows, tu.InlineKeyboardRow(actions...))
+		}
 	}
 	if len(rows) == 0 {
 		return nil
 	}
 	return tu.InlineKeyboard(rows...)
+}
+
+func (s *Service) ruleWebAppURL(ruleID int64) string {
+	baseURL := strings.TrimRight(strings.TrimSpace(s.cfg.PublicBaseURL), "/")
+	if baseURL == "" || ruleID <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s/#rule-%d", baseURL, ruleID)
 }
 
 func adminOnlyCommand(command string) bool {

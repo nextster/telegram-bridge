@@ -47,6 +47,9 @@ func TestDashboardRequiresTelegramAdminSession(t *testing.T) {
 	if body := unauthenticated.Body.String(); !strings.Contains(body, "Open the dashboard from the tg-radar bot admin chat") || strings.Contains(body, "private dashboard phrase") {
 		t.Fatalf("unauthenticated dashboard body leaked data or missed bootstrap: %q", body)
 	}
+	if !strings.Contains(unauthenticated.Body.String(), "window.location.reload()") {
+		t.Fatal("authentication bootstrap does not preserve rule deep-links")
+	}
 
 	for _, path := range []string{
 		"/keywords/add", "/rules/add", "/keywords/delete", "/sources/sync", "/sources/toggle", "/history/backfill",
@@ -77,6 +80,9 @@ func TestDashboardRequiresTelegramAdminSession(t *testing.T) {
 	handler.ServeHTTP(authenticated, authenticatedRequest)
 	if authenticated.Code != http.StatusOK || !strings.Contains(authenticated.Body.String(), "private dashboard phrase") {
 		t.Fatalf("authenticated dashboard status=%d body=%q", authenticated.Code, authenticated.Body.String())
+	}
+	if !strings.Contains(authenticated.Body.String(), `id="rule-1"`) {
+		t.Fatalf("authenticated dashboard has no rule anchor: %q", authenticated.Body.String())
 	}
 
 	nonAdmin := authenticateWebAppRequest(t, handler, cfg.BotToken, 99, now)
