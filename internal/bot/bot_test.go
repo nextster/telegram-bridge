@@ -209,6 +209,10 @@ func TestOnlyAdminReceivesDashboardAndDestructiveButtons(t *testing.T) {
 	if !ok || len(adminMarkup.InlineKeyboard) != 2 {
 		t.Fatalf("admin event markup = %#v, want link and stop rows", adminMarkup)
 	}
+	actions := adminMarkup.InlineKeyboard[1]
+	if len(actions) != 2 || actions[0].Text != "Правило" || actions[0].WebApp == nil || actions[0].WebApp.URL != "https://tg-radar.example/#rule-4" {
+		t.Fatalf("admin event actions = %#v, want rule deep-link and stop button", actions)
+	}
 	nonAdminMarkup, ok := service.eventMarkup(ctx, event, 222).(*telego.InlineKeyboardMarkup)
 	if !ok || len(nonAdminMarkup.InlineKeyboard) != 1 {
 		t.Fatalf("non-admin event markup = %#v, want link row only", nonAdminMarkup)

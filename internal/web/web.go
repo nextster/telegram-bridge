@@ -520,6 +520,11 @@ const dashboardTemplate = `<!doctype html>
     .keyword code, .source-main {
       overflow-wrap: anywhere;
     }
+    .keyword:target {
+      scroll-margin-top: 16px;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(15, 118, 110, .18);
+    }
     .rule-form { display: grid; gap: 10px; margin-bottom: 16px; }
     .rule-form label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
     .source-picker { display: flex; flex-wrap: wrap; gap: 7px 12px; }
@@ -672,7 +677,7 @@ const dashboardTemplate = `<!doctype html>
           <button type="submit">Start watching</button>
         </form>
         {{range .Keywords}}
-          <div class="keyword">
+          <div class="keyword" id="rule-{{.ID}}">
             <div class="rule-copy">
               <code>#{{.ID}} {{.Phrase}}</code>
               {{if .AnyTerms}}<small>any: {{join .AnyTerms ", "}}</small>{{end}}

@@ -254,7 +254,7 @@ const webAppBootstrapPage = `<!doctype html>
           body,
         });
         if (!response.ok) throw new Error('authentication rejected');
-        window.location.replace('/');
+		window.location.reload();
       } catch (_) {
         status.textContent = 'Dashboard access was rejected. Open it from the configured admin chat.';
       }
