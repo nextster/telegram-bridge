@@ -79,12 +79,11 @@ func (s *Service) NotifyEvent(ctx context.Context, event db.Event) error {
 	}
 
 	body := formatEvent(event)
-	markup := s.eventMarkup(ctx, event)
 	for _, sub := range subscribers {
 		_, sendErr := s.bot.SendMessage(ctx, &telego.SendMessageParams{
 			ChatID:      telego.ChatID{ID: sub.ChatID},
 			Text:        body,
-			ReplyMarkup: markup,
+			ReplyMarkup: s.eventMarkup(ctx, event, sub.ChatID),
 		})
 		if sendErr != nil {
 			log.Printf("send alert to %d failed: %v", sub.ChatID, sendErr)
@@ -192,6 +191,15 @@ func (s *Service) handleUpdate(ctx context.Context, update telego.Update) error 
 	}
 
 	command, _, payload := tu.ParseCommandPayload(text)
+	if adminOnlyCommand(command) {
+		admin, err := s.isAdminChat(ctx, message.Chat.ID)
+		if err != nil {
+			return err
+		}
+		if !admin {
+			return s.reply(ctx, message.Chat.ID, "This chat is not allowed to manage tg-radar.", nil)
+		}
+	}
 	switch command {
 	case "start":
 		return s.handleStart(ctx, message)
@@ -226,6 +234,14 @@ func (s *Service) handleCallbackQuery(ctx context.Context, query *telego.Callbac
 	}
 	data := strings.TrimSpace(query.Data)
 	if strings.HasPrefix(data, "kwdel:") {
+		chatID := callbackChatID(query)
+		admin, err := s.isAdminChat(ctx, chatID)
+		if err != nil {
+			return err
+		}
+		if !admin {
+			return s.answerCallback(ctx, query.ID, "This chat is not allowed to manage tg-radar.")
+		}
 		return s.handleStopKeywordCallback(ctx, query, strings.TrimPrefix(data, "kwdel:"))
 	}
 	return s.answerCallback(ctx, query.ID, "Unknown action.")
@@ -300,6 +316,14 @@ func (s *Service) sendCallbackConfirmation(ctx context.Context, query *telego.Ca
 }
 
 func (s *Service) handleStart(ctx context.Context, message *telego.Message) error {
+	allowed, err := s.canSubscribe(ctx, message.Chat.ID)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return s.reply(ctx, message.Chat.ID, "This chat is not allowed to subscribe to tg-radar.", nil)
+	}
+
 	var username, firstName, lastName string
 	if message.From != nil {
 		username = message.From.Username
@@ -330,7 +354,7 @@ func (s *Service) handleStart(ctx context.Context, message *telego.Message) erro
 			text += "\n\nThis chat is the bot admin chat. Use /login to authorize Telegram monitoring."
 		}
 	}
-	return s.reply(ctx, message.Chat.ID, text, s.webAppMarkup())
+	return s.reply(ctx, message.Chat.ID, text, s.webAppMarkup(ctx, message.Chat.ID))
 }
 
 func (s *Service) handleStop(ctx context.Context, message *telego.Message) error {
@@ -423,7 +447,7 @@ func (s *Service) handleKeywords(ctx context.Context, message *telego.Message) e
 		}
 		b.WriteByte('\n')
 	}
-	return s.reply(ctx, message.Chat.ID, strings.TrimSpace(b.String()), s.webAppMarkup())
+	return s.reply(ctx, message.Chat.ID, strings.TrimSpace(b.String()), s.webAppMarkup(ctx, message.Chat.ID))
 }
 
 func formatRuleTerms(terms []string, limit int) string {
@@ -447,7 +471,7 @@ func (s *Service) handleRecent(ctx context.Context, message *telego.Message) err
 	for _, event := range events {
 		fmt.Fprintf(&b, "\n#%d [%s] %s:%d\n%s", event.ID, event.Keyword, event.SourcePeerType, event.SourcePeerID, truncate(event.Text, 180))
 	}
-	return s.reply(ctx, message.Chat.ID, strings.TrimSpace(b.String()), s.webAppMarkup())
+	return s.reply(ctx, message.Chat.ID, strings.TrimSpace(b.String()), s.webAppMarkup(ctx, message.Chat.ID))
 }
 
 func (s *Service) handleLoginStatus(ctx context.Context, message *telego.Message) error {
@@ -476,8 +500,16 @@ func (s *Service) reply(ctx context.Context, chatID int64, text string, markup t
 	return err
 }
 
-func (s *Service) webAppMarkup() telego.ReplyMarkup {
+func (s *Service) webAppMarkup(ctx context.Context, chatID int64) telego.ReplyMarkup {
 	if s.cfg.PublicBaseURL == "" {
+		return nil
+	}
+	admin, err := s.isAdminChat(ctx, chatID)
+	if err != nil {
+		log.Printf("check dashboard admin chat %d failed: %v", chatID, err)
+		return nil
+	}
+	if !admin {
 		return nil
 	}
 	return tu.InlineKeyboard(
@@ -487,14 +519,18 @@ func (s *Service) webAppMarkup() telego.ReplyMarkup {
 	)
 }
 
-func (s *Service) eventMarkup(ctx context.Context, event db.Event) telego.ReplyMarkup {
+func (s *Service) eventMarkup(ctx context.Context, event db.Event, chatID int64) telego.ReplyMarkup {
 	rows := make([][]telego.InlineKeyboardButton, 0, 2)
 	if url := s.messageURL(ctx, event); url != "" {
 		rows = append(rows, tu.InlineKeyboardRow(
 			tu.InlineKeyboardButton("Open message").WithURL(url),
 		))
 	}
-	if event.ID > 0 && strings.TrimSpace(event.Keyword) != "" {
+	admin, err := s.isAdminChat(ctx, chatID)
+	if err != nil {
+		log.Printf("check event action admin chat %d failed: %v", chatID, err)
+	}
+	if err == nil && admin && event.ID > 0 && strings.TrimSpace(event.Keyword) != "" {
 		rows = append(rows, tu.InlineKeyboardRow(
 			tu.InlineKeyboardButton("Stop keyword").WithCallbackData(fmt.Sprintf("kwdel:%d", event.ID)),
 		))
@@ -503,6 +539,38 @@ func (s *Service) eventMarkup(ctx context.Context, event db.Event) telego.ReplyM
 		return nil
 	}
 	return tu.InlineKeyboard(rows...)
+}
+
+func adminOnlyCommand(command string) bool {
+	switch command {
+	case "add", "watch", "del", "delete", "keywords", "recent", "login", "loginstatus", "cancel":
+		return true
+	default:
+		return false
+	}
+}
+
+func callbackChatID(query *telego.CallbackQuery) int64 {
+	if query == nil {
+		return 0
+	}
+	if query.Message != nil {
+		if chatID := query.Message.GetChat().ID; chatID != 0 {
+			return chatID
+		}
+	}
+	return query.From.ID
+}
+
+func (s *Service) canSubscribe(ctx context.Context, chatID int64) (bool, error) {
+	if len(s.cfg.BotAdminChatIDs) > 0 {
+		return s.cfg.IsConfiguredBotAdmin(chatID), nil
+	}
+	first, ok, err := s.store.FirstSubscriber(ctx)
+	if err != nil || !ok {
+		return !ok, err
+	}
+	return first.ChatID == chatID, nil
 }
 
 func (s *Service) messageURL(ctx context.Context, event db.Event) string {

@@ -217,6 +217,12 @@ The dashboard can create grouped rules with:
   as `XG1250`/`XG-1250` and `T25` normalize consistently without making `12`
   match `1200`.
 
+Dashboard reads and mutations require a validated Telegram Mini App session
+from the configured bot admin chat. Opening the public URL directly shows only
+an authentication prompt; it does not render sources, rules, or recent match
+text. Bot management commands and destructive callback buttons are likewise
+restricted to the admin chat.
+
 Exclusions are exact-only so `продан` cannot suppress a normal `продам`
 listing. A required-any group can also contain a unit-aware numeric minimum,
 for example `num>=1000:lm|lumen|lumens|люмен|лм`; the number and unit must be
