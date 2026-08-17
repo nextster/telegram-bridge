@@ -7,7 +7,6 @@ import (
 	"log"
 	"strconv"
 	"strings"
-	"time"
 	"unicode/utf16"
 
 	"github.com/mymmrac/telego"
@@ -630,20 +629,11 @@ func telegramChannelID(peerID int64) string {
 }
 
 func formatEvent(event db.Event) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "tg-radar match: %s\n", event.Keyword)
-	fmt.Fprintf(&b, "Source: %s:%d message %d\n", event.SourcePeerType, event.SourcePeerID, event.MessageID)
-	if event.MatchReason != "" {
-		fmt.Fprintf(&b, "Why: %s (score %d)\n", event.MatchReason, event.MatchScore)
+	content := strings.TrimSpace(event.Text)
+	if content == "" {
+		content = "[сообщение без текста]"
 	}
-	if event.RuleNote != "" {
-		fmt.Fprintf(&b, "Specs: %s\n", event.RuleNote)
-	}
-	if !event.MessageDate.IsZero() {
-		fmt.Fprintf(&b, "Time: %s\n", event.MessageDate.Format(time.RFC3339))
-	}
-	fmt.Fprintf(&b, "\n%s", truncate(event.Text, 2600))
-	return b.String()
+	return "🔎 Найдено:\n\n" + truncate(content, 2800)
 }
 
 func formatDeletedMessages(deletion db.PrivateMessageDeletion) string {
@@ -651,27 +641,25 @@ func formatDeletedMessages(deletion db.PrivateMessageDeletion) string {
 	label := privateDialogLabel(deletion.Dialog)
 	var b strings.Builder
 	if count == 1 {
-		fmt.Fprintf(&b, "🫥 В личном чате %s исчезло сообщение.\n", label)
+		fmt.Fprintf(&b, "🫥 Удалено из: %s\n", label)
 	} else {
-		fmt.Fprintf(&b, "🧹 В личном чате %s исчезли %d сообщений.\n", label, count)
-		b.WriteString("Это может быть очистка истории, но Telegram не даёт отдельного признака «удалён весь чат».\n")
+		fmt.Fprintf(&b, "🫥 Удалено из: %s · %d сообщений\n", label, count)
 	}
-	b.WriteString("Telegram не сообщает причину и автора удаления: это мог быть собеседник, другая твоя сессия или автоудаление.\n")
 
 	shown := 0
 	for _, message := range deletion.Messages {
 		if shown == 6 {
 			break
 		}
-		direction := "входящее"
-		if message.Outgoing {
-			direction = "исходящее"
-		}
 		content := strings.TrimSpace(message.Text)
 		if content == "" {
 			content = deletedMediaLabel(message.MediaType)
 		}
-		fmt.Fprintf(&b, "\n%d. %s · %s\n%s\n", shown+1, direction, message.MessageDate.Format(time.RFC3339), truncateUTF16(content, 480))
+		if count == 1 {
+			fmt.Fprintf(&b, "\n%s", truncateUTF16(content, 1200))
+		} else {
+			fmt.Fprintf(&b, "\n%d. %s", shown+1, truncateUTF16(content, 480))
+		}
 		shown++
 	}
 	if remaining := count - shown; remaining > 0 {
