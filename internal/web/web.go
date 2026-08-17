@@ -113,13 +113,14 @@ func (s *Server) Run(ctx context.Context) error {
 
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", s.dashboard)
-	mux.HandleFunc("POST /keywords/add", s.addKeyword)
-	mux.HandleFunc("POST /rules/add", s.addWatchRule)
-	mux.HandleFunc("POST /keywords/delete", s.deleteKeyword)
-	mux.HandleFunc("POST /sources/sync", s.syncSources)
-	mux.HandleFunc("POST /sources/toggle", s.toggleSource)
-	mux.HandleFunc("POST /history/backfill", s.backfillHistory)
+	mux.HandleFunc("GET /{$}", s.dashboardEntry)
+	mux.HandleFunc("POST /webapp/auth", s.authenticateWebApp)
+	mux.HandleFunc("POST /keywords/add", s.requireWebAdmin(s.addKeyword))
+	mux.HandleFunc("POST /rules/add", s.requireWebAdmin(s.addWatchRule))
+	mux.HandleFunc("POST /keywords/delete", s.requireWebAdmin(s.deleteKeyword))
+	mux.HandleFunc("POST /sources/sync", s.requireWebAdmin(s.syncSources))
+	mux.HandleFunc("POST /sources/toggle", s.requireWebAdmin(s.toggleSource))
+	mux.HandleFunc("POST /history/backfill", s.requireWebAdmin(s.backfillHistory))
 	mux.HandleFunc("GET /login", s.loginPage)
 	mux.HandleFunc("POST /login", s.loginSubmit)
 	mux.HandleFunc("POST /login/restart", s.loginRestart)
@@ -133,6 +134,10 @@ func (s *Server) routes() http.Handler {
 
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors https://web.telegram.org https://*.telegram.org")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	stats, err := s.store.Stats(ctx)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
