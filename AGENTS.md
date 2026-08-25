@@ -1,4 +1,4 @@
-# tg-radar Agent Notes
+# telegram-bridge Agent Notes
 
 ## Deploy
 
@@ -35,9 +35,9 @@ scripts/check.sh
 
 ## Codex plugin
 
-The canonical plugin source is `plugins/tg-radar`, and the repository-local
+The canonical plugin source is `plugins/telegram-bridge`, and the repository-local
 marketplace manifest is `.agents/plugins/marketplace.json`. Do not edit a copy
-under `~/plugins/tg-radar` as an independent source.
+under `~/plugins/telegram-bridge` as an independent source.
 
 After plugin or skill changes, run:
 

@@ -3,7 +3,7 @@
 !/.env.example
 .DS_Store
 
-/tg-radar
+/telegram-bridge
 .fly-build/
 
 data/*.db

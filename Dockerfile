@@ -11,17 +11,17 @@ ARG TARGETARCH
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
-    go build -trimpath -ldflags="-s -w" -o /out/tg-radar ./cmd/tg-radar
+    go build -trimpath -ldflags="-s -w" -o /out/telegram-bridge ./cmd/telegram-bridge
 
 FROM alpine:3.22
 
 RUN adduser -D -H -u 10001 app
 WORKDIR /app
-COPY --from=build /out/tg-radar /usr/local/bin/tg-radar
+COPY --from=build /out/telegram-bridge /usr/local/bin/telegram-bridge
 RUN mkdir -p /data && chown app:app /data
 USER app
 
 ENV PORT=8080
 EXPOSE 8080
 
-CMD ["tg-radar", "serve"]
+CMD ["telegram-bridge", "serve"]

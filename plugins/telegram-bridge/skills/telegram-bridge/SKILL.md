@@ -1,11 +1,11 @@
 ---
-name: telegram-radar
-description: Search and inspect the authenticated Telegram account through the read-only tg-radar MCP tools. Use when the user asks to find messages, listings, links, products, conversations, or recent history in Telegram chats; search one named channel or many chats; constrain Telegram research by date; or summarize retrieved Telegram messages.
+name: telegram-bridge
+description: Search and inspect the authenticated Telegram account through the read-only telegram-bridge MCP tools. Use when the user asks to find messages, listings, links, products, conversations, or recent history in Telegram chats; search one named channel or many chats; constrain Telegram research by date; or summarize retrieved Telegram messages.
 ---
 
-# Telegram Radar
+# Telegram Bridge
 
-Use the tg-radar MCP server as the source of truth for Telegram content. Keep every operation read-only.
+Use the telegram-bridge MCP server as the source of truth for Telegram content. Keep every operation read-only.
 
 Read `references/tool-contract.md` before constructing nontrivial date-bounded or paginated calls.
 

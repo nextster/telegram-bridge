@@ -20,10 +20,10 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
-	"github.com/nextster/tg-radar/internal/config"
-	"github.com/nextster/tg-radar/internal/db"
-	"github.com/nextster/tg-radar/internal/match"
-	"github.com/nextster/tg-radar/internal/notify"
+	"github.com/nextster/telegram-bridge/internal/config"
+	"github.com/nextster/telegram-bridge/internal/db"
+	"github.com/nextster/telegram-bridge/internal/match"
+	"github.com/nextster/telegram-bridge/internal/notify"
 )
 
 type Handler struct {
@@ -172,7 +172,7 @@ func (s *Service) runOnce(ctx context.Context) error {
 			return fmt.Errorf("check Telegram user auth status: %w", err)
 		}
 		if !status.Authorized || status.User == nil {
-			log.Print("telegram user API monitoring disabled: session is not authorized; run `tg-radar login` first")
+			log.Print("telegram user API monitoring disabled: session is not authorized; run `telegram-bridge login` first")
 			s.setState(nil, 0, false, "")
 			select {
 			case <-ctx.Done():
@@ -414,7 +414,7 @@ func (s *Service) readyAPI() (*tg.Client, int64, error) {
 		return nil, 0, errors.New("telegram user API is not configured")
 	}
 	if !s.authorized || s.api == nil {
-		return nil, 0, errors.New("telegram user session is not authorized; run tg-radar login")
+		return nil, 0, errors.New("telegram user session is not authorized; run telegram-bridge login")
 	}
 	return s.api, s.userID, nil
 }

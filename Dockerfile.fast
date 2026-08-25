@@ -4,11 +4,11 @@ FROM alpine:3.22
 
 RUN adduser -D -H -u 10001 app
 WORKDIR /app
-COPY .fly-build/tg-radar /usr/local/bin/tg-radar
+COPY .fly-build/telegram-bridge /usr/local/bin/telegram-bridge
 RUN mkdir -p /data && chown app:app /data
 USER app
 
 ENV PORT=8080
 EXPOSE 8080
 
-CMD ["tg-radar", "serve"]
+CMD ["telegram-bridge", "serve"]

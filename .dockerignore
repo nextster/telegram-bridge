@@ -3,6 +3,6 @@
 .env.*
 data/
 .fly-build/*
-!.fly-build/tg-radar
+!.fly-build/telegram-bridge
 *.session
 *.db

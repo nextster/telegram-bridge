@@ -39,7 +39,7 @@ func TestMCPHandshakeAndToolsList(t *testing.T) {
 		clone.Header.Set("Authorization", "Bearer secret")
 		return baseTransport.RoundTrip(clone)
 	})}
-	client := mcp.NewClient(&mcp.Implementation{Name: "tg-radar-test", Version: "1.0.0"}, nil)
+	client := mcp.NewClient(&mcp.Implementation{Name: "telegram-bridge-test", Version: "1.0.0"}, nil)
 	session, err := client.Connect(context.Background(), &mcp.StreamableClientTransport{
 		Endpoint:             httpServer.URL,
 		HTTPClient:           httpClient,

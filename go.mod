@@ -1,4 +1,4 @@
-module github.com/nextster/tg-radar
+module github.com/nextster/telegram-bridge
 
 go 1.26.4
 

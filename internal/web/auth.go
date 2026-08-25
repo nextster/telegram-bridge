@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	webAuthCookieName = "tg_radar_admin"
+	webAuthCookieName = "telegram_bridge_admin"
 	webAuthMaxAge     = 24 * time.Hour
 	webInitDataMaxAge = 10 * time.Minute
 )
@@ -205,7 +205,7 @@ func decodeWebSession(value, botToken string, now time.Time) (int64, error) {
 
 func webSessionMAC(encoded, botToken string) []byte {
 	mac := hmac.New(sha256.New, []byte(botToken))
-	_, _ = mac.Write([]byte("tg-radar-web-session\n" + encoded))
+	_, _ = mac.Write([]byte("telegram-bridge-web-session\n" + encoded))
 	return mac.Sum(nil)
 }
 
@@ -228,12 +228,12 @@ const webAppBootstrapPage = `<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>tg-radar</title>
+  <title>telegram-bridge</title>
   <style>body{font-family:system-ui,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem;color:#202124}code{background:#f2f3f5;padding:.15rem .35rem;border-radius:.3rem}</style>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
 </head>
 <body>
-  <h1>tg-radar</h1>
+  <h1>telegram-bridge</h1>
   <p id="status">Authenticating Telegram Mini App…</p>
   <script>
     (async () => {
@@ -241,7 +241,7 @@ const webAppBootstrapPage = `<!doctype html>
       const app = window.Telegram && window.Telegram.WebApp;
       const initData = app && app.initData;
       if (!initData) {
-        status.textContent = 'Open the dashboard from the tg-radar bot admin chat.';
+        status.textContent = 'Open the dashboard from the telegram-bridge bot admin chat.';
         return;
       }
       app.ready();

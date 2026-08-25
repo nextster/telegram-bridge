@@ -10,7 +10,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/nextster/tg-radar/internal/monitor"
+	"github.com/nextster/telegram-bridge/internal/monitor"
 )
 
 type Server struct {
@@ -49,7 +49,7 @@ type getHistoryInput struct {
 
 func New(service *monitor.Service, token string) *Server {
 	server := &Server{monitor: service, token: strings.TrimSpace(token)}
-	mcpServer := mcp.NewServer(&mcp.Implementation{Name: "tg-radar", Version: "1.0.0"}, nil)
+	mcpServer := mcp.NewServer(&mcp.Implementation{Name: "telegram-bridge", Version: "1.0.0"}, nil)
 	mcp.AddTool(mcpServer, &mcp.Tool{
 		Name:        "telegram_list_dialogs",
 		Description: "List recent Telegram dialogs for the logged-in account, optionally filtering by chat title or username. Read-only.",
@@ -104,7 +104,7 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		provided := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if provided == r.Header.Get("Authorization") || subtle.ConstantTimeCompare([]byte(provided), []byte(s.token)) != 1 {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="tg-radar-mcp"`)
+			w.Header().Set("WWW-Authenticate", `Bearer realm="telegram-bridge-mcp"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}

@@ -1,4 +1,4 @@
-app = "tg-radar"
+app = "telegram-bridge"
 primary_region = "fra"
 
 [build]
@@ -8,11 +8,11 @@ primary_region = "fra"
 
 [env]
   PORT = "8080"
-  TG_RADAR_DB = "/data/tg-radar.db"
-  TG_RADAR_SESSION = "/data/telegram.session"
+  TELEGRAM_BRIDGE_DB = "/data/telegram-bridge.db"
+  TELEGRAM_BRIDGE_SESSION = "/data/telegram.session"
 
 [mounts]
-  source = "tg_radar_data"
+  source = "telegram_bridge_data"
   destination = "/data"
 
 [[vm]]

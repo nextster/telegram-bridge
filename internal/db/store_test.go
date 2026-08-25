@@ -39,7 +39,7 @@ func TestOpenEnablesForeignKeysOnEveryPooledConnection(t *testing.T) {
 
 func TestGetEvent(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(ctx, t.TempDir()+"/tg-radar.db")
+	store, err := Open(ctx, t.TempDir()+"/telegram-bridge.db")
 	if err != nil {
 		t.Fatal(err)
 	}

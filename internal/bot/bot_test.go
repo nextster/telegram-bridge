@@ -9,8 +9,8 @@ import (
 
 	"github.com/mymmrac/telego"
 
-	"github.com/nextster/tg-radar/internal/config"
-	"github.com/nextster/tg-radar/internal/db"
+	"github.com/nextster/telegram-bridge/internal/config"
+	"github.com/nextster/telegram-bridge/internal/db"
 )
 
 func TestMessageURLFromPeer(t *testing.T) {
@@ -195,7 +195,7 @@ func TestOnlyAdminReceivesDashboardAndDestructiveButtons(t *testing.T) {
 	if err := store.UpsertSubscriber(ctx, db.Subscriber{ChatID: 111}); err != nil {
 		t.Fatal(err)
 	}
-	service := &Service{store: store, cfg: config.Config{PublicBaseURL: "https://tg-radar.example"}}
+	service := &Service{store: store, cfg: config.Config{PublicBaseURL: "https://telegram-bridge.example"}}
 
 	if service.webAppMarkup(ctx, 111) == nil {
 		t.Fatal("admin dashboard button is missing")
@@ -210,7 +210,7 @@ func TestOnlyAdminReceivesDashboardAndDestructiveButtons(t *testing.T) {
 		t.Fatalf("admin event markup = %#v, want link and stop rows", adminMarkup)
 	}
 	actions := adminMarkup.InlineKeyboard[1]
-	if len(actions) != 2 || actions[0].Text != "Правило" || actions[0].WebApp == nil || actions[0].WebApp.URL != "https://tg-radar.example/#rule-4" {
+	if len(actions) != 2 || actions[0].Text != "Правило" || actions[0].WebApp == nil || actions[0].WebApp.URL != "https://telegram-bridge.example/#rule-4" {
 		t.Fatalf("admin event actions = %#v, want rule deep-link and stop button", actions)
 	}
 	nonAdminMarkup, ok := service.eventMarkup(ctx, event, 222).(*telego.InlineKeyboardMarkup)
