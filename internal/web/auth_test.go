@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nextster/tg-radar/internal/config"
-	"github.com/nextster/tg-radar/internal/db"
+	"github.com/nextster/telegram-bridge/internal/config"
+	"github.com/nextster/telegram-bridge/internal/db"
 )
 
 func TestDashboardRequiresTelegramAdminSession(t *testing.T) {
@@ -44,7 +44,7 @@ func TestDashboardRequiresTelegramAdminSession(t *testing.T) {
 	if unauthenticated.Code != http.StatusOK {
 		t.Fatalf("GET / status = %d, want %d", unauthenticated.Code, http.StatusOK)
 	}
-	if body := unauthenticated.Body.String(); !strings.Contains(body, "Open the dashboard from the tg-radar bot admin chat") || strings.Contains(body, "private dashboard phrase") {
+	if body := unauthenticated.Body.String(); !strings.Contains(body, "Open the dashboard from the telegram-bridge bot admin chat") || strings.Contains(body, "private dashboard phrase") {
 		t.Fatalf("unauthenticated dashboard body leaked data or missed bootstrap: %q", body)
 	}
 	if !strings.Contains(unauthenticated.Body.String(), "window.location.reload()") {

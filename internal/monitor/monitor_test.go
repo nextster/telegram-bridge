@@ -9,7 +9,7 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
-	"github.com/nextster/tg-radar/internal/db"
+	"github.com/nextster/telegram-bridge/internal/db"
 )
 
 type captureNotifier struct {
@@ -34,7 +34,7 @@ func (c *captureNotifier) NotifyEvent(_ context.Context, event db.Event) error {
 
 func TestHandlerRecordsAndNotifiesKeywordMatchOnce(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(ctx, t.TempDir()+"/tg-radar.db")
+	store, err := db.Open(ctx, t.TempDir()+"/telegram-bridge.db")
 	if err != nil {
 		t.Fatal(err)
 	}

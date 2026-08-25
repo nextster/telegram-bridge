@@ -12,11 +12,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nextster/tg-radar/internal/config"
-	"github.com/nextster/tg-radar/internal/db"
-	"github.com/nextster/tg-radar/internal/mcpserver"
-	"github.com/nextster/tg-radar/internal/monitor"
-	"github.com/nextster/tg-radar/internal/notify"
+	"github.com/nextster/telegram-bridge/internal/config"
+	"github.com/nextster/telegram-bridge/internal/db"
+	"github.com/nextster/telegram-bridge/internal/mcpserver"
+	"github.com/nextster/telegram-bridge/internal/monitor"
+	"github.com/nextster/telegram-bridge/internal/notify"
 )
 
 type Server struct {
@@ -390,7 +390,7 @@ const dashboardTemplate = `<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>tg-radar</title>
+  <title>telegram-bridge</title>
   <style>
     :root {
       color-scheme: light;
@@ -600,7 +600,7 @@ const dashboardTemplate = `<!doctype html>
 <body>
   <header>
     <div class="wrap top">
-      <h1>tg-radar</h1>
+      <h1>telegram-bridge</h1>
       <div class="muted">Updated {{time .Now}}</div>
     </div>
   </header>

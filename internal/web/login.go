@@ -11,9 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nextster/tg-radar/internal/db"
-	"github.com/nextster/tg-radar/internal/monitor"
-	"github.com/nextster/tg-radar/internal/notify"
+	"github.com/nextster/telegram-bridge/internal/db"
+	"github.com/nextster/telegram-bridge/internal/monitor"
+	"github.com/nextster/telegram-bridge/internal/notify"
 )
 
 const webLoginTimeout = 10 * time.Minute
@@ -408,7 +408,7 @@ const loginTemplate = `<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   {{if .AutoRefresh}}<meta http-equiv="refresh" content="2">{{end}}
-  <title>tg-radar login</title>
+  <title>telegram-bridge login</title>
   <style>
     :root {
       color-scheme: light;
@@ -519,7 +519,7 @@ const loginTemplate = `<!doctype html>
 <body>
   <main>
     <section class="panel">
-      <h1>tg-radar login</h1>
+      <h1>telegram-bridge login</h1>
       {{if .Phone}}<p class="muted">{{.Phone}}</p>{{end}}
 
       {{if .PageError}}<div class="alert error-box">{{.PageError}}</div>{{end}}

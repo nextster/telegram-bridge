@@ -1,14 +1,14 @@
 {
-  "name": "tg-radar-repo",
+  "name": "telegram-bridge-repo",
   "interface": {
-    "displayName": "TG Radar Repository"
+    "displayName": "Telegram Bridge Repository"
   },
   "plugins": [
     {
-      "name": "tg-radar",
+      "name": "telegram-bridge",
       "source": {
         "source": "local",
-        "path": "./plugins/tg-radar"
+        "path": "./plugins/telegram-bridge"
       },
       "policy": {
         "installation": "AVAILABLE",

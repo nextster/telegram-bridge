@@ -5,8 +5,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/nextster/tg-radar/internal/config"
-	"github.com/nextster/tg-radar/internal/monitor"
+	"github.com/nextster/telegram-bridge/internal/config"
+	"github.com/nextster/telegram-bridge/internal/monitor"
 )
 
 func TestRoutesAllowRootAndMCP(t *testing.T) {

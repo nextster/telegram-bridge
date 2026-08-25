@@ -1,9 +1,0 @@
-{
-  "mcpServers": {
-    "tg-radar": {
-      "type": "http",
-      "url": "https://tg-radar.fly.dev/mcp",
-      "bearer_token_env_var": "TG_RADAR_MCP_TOKEN"
-    }
-  }
-}

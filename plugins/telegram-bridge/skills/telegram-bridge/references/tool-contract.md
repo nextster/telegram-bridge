@@ -1,6 +1,6 @@
-# tg-radar MCP tool contract
+# telegram-bridge MCP tool contract
 
-The server exposes three read-only tools over Streamable HTTP at `https://tg-radar.fly.dev/mcp`. Authentication uses `Authorization: Bearer ...`; the plugin obtains that value from `TG_RADAR_MCP_TOKEN`.
+The server exposes three read-only tools over Streamable HTTP at `https://telegram-bridge.fly.dev/mcp`. Authentication uses `Authorization: Bearer ...`; the plugin obtains that value from `TELEGRAM_BRIDGE_MCP_TOKEN`.
 
 ## `telegram_list_dialogs`
 

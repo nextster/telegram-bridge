@@ -6,7 +6,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/nextster/tg-radar/internal/db"
+	"github.com/nextster/telegram-bridge/internal/db"
 )
 
 type Result struct {

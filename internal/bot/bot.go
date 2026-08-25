@@ -12,9 +12,9 @@ import (
 	"github.com/mymmrac/telego"
 	tu "github.com/mymmrac/telego/telegoutil"
 
-	"github.com/nextster/tg-radar/internal/config"
-	"github.com/nextster/tg-radar/internal/db"
-	"github.com/nextster/tg-radar/internal/monitor"
+	"github.com/nextster/telegram-bridge/internal/config"
+	"github.com/nextster/telegram-bridge/internal/db"
+	"github.com/nextster/telegram-bridge/internal/monitor"
 )
 
 type Service struct {
@@ -196,7 +196,7 @@ func (s *Service) handleUpdate(ctx context.Context, update telego.Update) error 
 			return err
 		}
 		if !admin {
-			return s.reply(ctx, message.Chat.ID, "This chat is not allowed to manage tg-radar.", nil)
+			return s.reply(ctx, message.Chat.ID, "This chat is not allowed to manage telegram-bridge.", nil)
 		}
 	}
 	switch command {
@@ -239,7 +239,7 @@ func (s *Service) handleCallbackQuery(ctx context.Context, query *telego.Callbac
 			return err
 		}
 		if !admin {
-			return s.answerCallback(ctx, query.ID, "This chat is not allowed to manage tg-radar.")
+			return s.answerCallback(ctx, query.ID, "This chat is not allowed to manage telegram-bridge.")
 		}
 		return s.handleStopKeywordCallback(ctx, query, strings.TrimPrefix(data, "kwdel:"))
 	}
@@ -320,7 +320,7 @@ func (s *Service) handleStart(ctx context.Context, message *telego.Message) erro
 		return err
 	}
 	if !allowed {
-		return s.reply(ctx, message.Chat.ID, "This chat is not allowed to subscribe to tg-radar.", nil)
+		return s.reply(ctx, message.Chat.ID, "This chat is not allowed to subscribe to telegram-bridge.", nil)
 	}
 
 	var username, firstName, lastName string
@@ -347,7 +347,7 @@ func (s *Service) handleStart(ctx context.Context, message *telego.Message) erro
 		return err
 	}
 
-	text := fmt.Sprintf("Subscribed to tg-radar alerts.\n\nKeywords: %d\nMatches stored: %d\n\nUse /add keyword to add a radar phrase.", stats.Keywords, stats.Events)
+	text := fmt.Sprintf("Subscribed to telegram-bridge alerts.\n\nKeywords: %d\nMatches stored: %d\n\nUse /add keyword to add a radar phrase.", stats.Keywords, stats.Events)
 	if len(s.cfg.BotAdminChatIDs) == 0 {
 		if first, ok, err := s.store.FirstSubscriber(ctx); err == nil && ok && first.ChatID == message.Chat.ID {
 			text += "\n\nThis chat is the bot admin chat. Use /login to authorize Telegram monitoring."
@@ -360,7 +360,7 @@ func (s *Service) handleStop(ctx context.Context, message *telego.Message) error
 	if err := s.store.DeleteSubscriber(ctx, message.Chat.ID); err != nil {
 		return err
 	}
-	return s.reply(ctx, message.Chat.ID, "Unsubscribed from tg-radar alerts.", nil)
+	return s.reply(ctx, message.Chat.ID, "Unsubscribed from telegram-bridge alerts.", nil)
 }
 
 func (s *Service) handleAddKeyword(ctx context.Context, message *telego.Message, payload string) error {
@@ -723,7 +723,7 @@ func deletedMediaLabel(mediaType string) string {
 
 func helpText() string {
 	return strings.Join([]string{
-		"tg-radar commands:",
+		"telegram-bridge commands:",
 		"/start - subscribe this chat to alerts",
 		"/stop - unsubscribe this chat",
 		"/add keyword - add a radar phrase",

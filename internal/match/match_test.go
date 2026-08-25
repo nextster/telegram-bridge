@@ -3,7 +3,7 @@ package match
 import (
 	"testing"
 
-	"github.com/nextster/tg-radar/internal/db"
+	"github.com/nextster/telegram-bridge/internal/db"
 )
 
 func TestEvaluateFlexibleRule(t *testing.T) {

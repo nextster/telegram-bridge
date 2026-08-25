@@ -1,4 +1,4 @@
-# tg-radar
+# telegram-bridge
 
 Single-binary Telegram radar MVP:
 
@@ -18,8 +18,8 @@ artifacts, Codex registration/cache, and live Fly resources remain external.
 
 ```sh
 test -e .env.local || cp .env.example .env.local
-go run ./cmd/tg-radar migrate
-go run ./cmd/tg-radar serve
+go run ./cmd/telegram-bridge migrate
+go run ./cmd/telegram-bridge serve
 ```
 
 Required env for the bot:
@@ -42,11 +42,11 @@ Optional env:
 ```sh
 export TELEGRAM_PHONE="+15551234567"
 export TELEGRAM_PASSWORD="account-password"
-export TG_RADAR_ADMIN_CHAT_IDS="123456789"
-export TG_RADAR_MCP_TOKEN="a-long-random-bearer-token"
+export TELEGRAM_BRIDGE_ADMIN_CHAT_IDS="123456789"
+export TELEGRAM_BRIDGE_MCP_TOKEN="a-long-random-bearer-token"
 ```
 
-The bot can authorize the gotd user session with `/login`. The bot only asks for the Telegram phone number and then sends a short-lived site login link. Enter the Telegram login code and 2FA password on the HTTPS site, not in the bot chat: Telegram blocks code-based sign-in after a code is shared in a bot chat. If `TG_RADAR_ADMIN_CHAT_IDS` is not set, the first chat that runs `/start` becomes the admin chat for MVP operations.
+The bot can authorize the gotd user session with `/login`. The bot only asks for the Telegram phone number and then sends a short-lived site login link. Enter the Telegram login code and 2FA password on the HTTPS site, not in the bot chat: Telegram blocks code-based sign-in after a code is shared in a bot chat. If `TELEGRAM_BRIDGE_ADMIN_CHAT_IDS` is not set, the first chat that runs `/start` becomes the admin chat for MVP operations.
 
 The CLI `login` command still works and stores the gotd user session in `data/telegram.session` by default. On Fly.io it uses `/data/telegram.session`.
 
@@ -68,8 +68,8 @@ The CLI `login` command still works and stores the gotd user session in `data/te
 Create the app and volume once:
 
 ```sh
-fly apps create tg-radar
-fly volumes create tg_radar_data -r fra -s 1
+fly apps create telegram-bridge
+fly volumes create telegram_bridge_data -r fra -s 1
 ```
 
 Set secrets:
@@ -78,7 +78,7 @@ Set secrets:
 fly secrets set TELEGRAM_BOT_TOKEN="123:bot-token"
 fly secrets set TELEGRAM_API_ID="123456"
 fly secrets set TELEGRAM_API_HASH="api_hash"
-fly secrets set TG_RADAR_PUBLIC_URL="https://tg-radar.fly.dev"
+fly secrets set TELEGRAM_BRIDGE_PUBLIC_URL="https://telegram-bridge.fly.dev"
 ```
 
 Deploy:
@@ -125,7 +125,7 @@ Authorize the user session once through the bot:
 The old SSH path is still available:
 
 ```sh
-fly ssh console -C "tg-radar login"
+fly ssh console -C "telegram-bridge login"
 ```
 
 ## MCP
@@ -134,10 +134,10 @@ Set a dedicated bearer token to enable the Streamable HTTP endpoint at
 `https://<your-host>/mcp`:
 
 ```sh
-fly secrets set TG_RADAR_MCP_TOKEN="$(openssl rand -hex 32)"
+fly secrets set TELEGRAM_BRIDGE_MCP_TOKEN="$(openssl rand -hex 32)"
 ```
 
-The MCP server reuses the live gotd client inside `tg-radar serve`, so it does
+The MCP server reuses the live gotd client inside `telegram-bridge serve`, so it does
 not create a second Telegram session or require another login. Clients must
 send `Authorization: Bearer <token>` on every request.
 
@@ -152,16 +152,12 @@ No tools for sending, editing, forwarding, or deleting messages are exposed.
 ### Codex plugin
 
 The canonical Codex plugin source and its marketplace manifest are tracked in
-this repository under `plugins/tg-radar` and `.agents/plugins/marketplace.json`.
+this repository under `plugins/telegram-bridge` and `.agents/plugins/marketplace.json`.
 Install it from the repository marketplace with:
 
 ```sh
 scripts/codex-plugin.sh install
 ```
-
-For a one-time cutover from the former `~/plugins/tg-radar` source, run
-`scripts/codex-plugin.sh migrate`. It removes only the old tg-radar plugin
-installation, not the shared personal marketplace or its other plugins.
 
 After changing the plugin or its skill, refresh its cachebuster and reinstall:
 
@@ -236,7 +232,7 @@ one bot status message per rule:
 
 ```sh
 printf '%s' '{"delete":["old phrase"],"rules":[{"name":"front light","any":["front bike light","велофара"],"required_any":[["USB-C","Type-C"],["1000","1200","1600"]],"prefer":["daytime flash","Garmin mount"],"exclude":["sold","продано"],"note":"Verify the beam and underside mount."}]}' \
-  | tg-radar rules-import
+  | telegram-bridge rules-import
 ```
 
 Imports may also define `default_exclude`, `default_sources`, and

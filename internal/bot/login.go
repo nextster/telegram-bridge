@@ -13,7 +13,7 @@ import (
 	"github.com/mymmrac/telego"
 	tu "github.com/mymmrac/telego/telegoutil"
 
-	"github.com/nextster/tg-radar/internal/monitor"
+	"github.com/nextster/telegram-bridge/internal/monitor"
 )
 
 const (
@@ -58,7 +58,7 @@ func (m *loginManager) Start(ctx context.Context, message *telego.Message, paylo
 		return err
 	}
 	if !admin {
-		return m.service.reply(ctx, message.Chat.ID, "This chat is not allowed to run /login. Send /start from the admin chat first or set TG_RADAR_ADMIN_CHAT_IDS.", nil)
+		return m.service.reply(ctx, message.Chat.ID, "This chat is not allowed to run /login. Send /start from the admin chat first or set TELEGRAM_BRIDGE_ADMIN_CHAT_IDS.", nil)
 	}
 
 	if status := m.service.monitorService.Status(); status.Authorized {
@@ -208,7 +208,7 @@ func (m *loginManager) finishPhone(ctx context.Context, session *loginSession, p
 
 func (m *loginManager) sendLoginLink(ctx context.Context, chatID int64, phone string) error {
 	if m.service.cfg.PublicBaseURL == "" {
-		return m.service.reply(ctx, chatID, "Set TG_RADAR_PUBLIC_URL to use site login.", removeKeyboard())
+		return m.service.reply(ctx, chatID, "Set TELEGRAM_BRIDGE_PUBLIC_URL to use site login.", removeKeyboard())
 	}
 	token, err := m.service.store.CreateLoginToken(ctx, chatID, normalizePhone(phone), loginLinkTTL)
 	if err != nil {

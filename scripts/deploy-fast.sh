@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP="${APP:-tg-radar}"
+APP="${APP:-telegram-bridge}"
 MODE="${MODE:-local}"
 BUILDER="${BUILDER:-container}"
 RUN_TESTS="${RUN_TESTS:-0}"
@@ -143,7 +143,7 @@ fi
 
 start_step "build ${TARGET_GOOS}/${TARGET_GOARCH}"
 GOOS="$TARGET_GOOS" GOARCH="$TARGET_GOARCH" CGO_ENABLED=0 \
-  go build -trimpath -ldflags="-s -w" -o .fly-build/tg-radar.raw ./cmd/tg-radar
+  go build -trimpath -ldflags="-s -w" -o .fly-build/telegram-bridge.raw ./cmd/telegram-bridge
 end_step
 
 if [[ "$PACK" == "1" ]]; then
@@ -152,10 +152,10 @@ if [[ "$PACK" == "1" ]]; then
     printf 'upx not found; install it or run with PACK=0\n' >&2
     exit 1
   fi
-  upx -q "-${UPX_LEVEL}" -o .fly-build/tg-radar --force-overwrite .fly-build/tg-radar.raw
+  upx -q "-${UPX_LEVEL}" -o .fly-build/telegram-bridge --force-overwrite .fly-build/telegram-bridge.raw
   end_step
 else
-  cp .fly-build/tg-radar.raw .fly-build/tg-radar
+  cp .fly-build/telegram-bridge.raw .fly-build/telegram-bridge
 fi
 
 case "$MODE" in

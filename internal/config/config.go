@@ -28,11 +28,11 @@ func Load() (Config, error) {
 	loadDotenvFiles(".env.local", ".env")
 
 	cfg := Config{
-		Addr:          envFirst("TG_RADAR_ADDR", "ADDR"),
-		DBPath:        envFirstDefault("TG_RADAR_DB", "/data/tg-radar.db", "DB_PATH", "data/tg-radar.db"),
-		SessionPath:   envFirstDefault("TG_RADAR_SESSION", "/data/telegram.session", "TG_SESSION_PATH", "data/telegram.session"),
-		PublicBaseURL: strings.TrimRight(envFirst("TG_RADAR_PUBLIC_URL", "PUBLIC_BASE_URL"), "/"),
-		MCPToken:      envFirst("TG_RADAR_MCP_TOKEN", "MCP_TOKEN"),
+		Addr:          envFirst("TELEGRAM_BRIDGE_ADDR", "ADDR"),
+		DBPath:        envFirstDefault("TELEGRAM_BRIDGE_DB", "/data/telegram-bridge.db", "DB_PATH", "data/telegram-bridge.db"),
+		SessionPath:   envFirstDefault("TELEGRAM_BRIDGE_SESSION", "/data/telegram.session", "TG_SESSION_PATH", "data/telegram.session"),
+		PublicBaseURL: strings.TrimRight(envFirst("TELEGRAM_BRIDGE_PUBLIC_URL", "PUBLIC_BASE_URL"), "/"),
+		MCPToken:      envFirst("TELEGRAM_BRIDGE_MCP_TOKEN", "MCP_TOKEN"),
 		BotToken:      envFirst("TELEGRAM_BOT_TOKEN", "BOT_TOKEN"),
 		TelegramAPIHash: envFirst(
 			"TELEGRAM_API_HASH",
@@ -56,7 +56,7 @@ func Load() (Config, error) {
 	}
 	cfg.TelegramAPIID = apiID
 
-	adminChatIDs, err := parseInt64List(envFirst("TG_RADAR_ADMIN_CHAT_IDS", "ADMIN_CHAT_IDS"))
+	adminChatIDs, err := parseInt64List(envFirst("TELEGRAM_BRIDGE_ADMIN_CHAT_IDS", "ADMIN_CHAT_IDS"))
 	if err != nil {
 		return Config{}, err
 	}
@@ -213,7 +213,7 @@ func parseInt64List(value string) ([]int64, error) {
 		}
 		parsed, err := strconv.ParseInt(part, 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("TG_RADAR_ADMIN_CHAT_IDS contains invalid chat id %q: %w", part, err)
+			return nil, fmt.Errorf("TELEGRAM_BRIDGE_ADMIN_CHAT_IDS contains invalid chat id %q: %w", part, err)
 		}
 		out = append(out, parsed)
 	}

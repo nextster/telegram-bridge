@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PLUGIN_NAME="tg-radar"
+PLUGIN_NAME="telegram-bridge"
 PLUGIN_ROOT="${ROOT}/plugins/${PLUGIN_NAME}"
 MARKETPLACE_FILE="${ROOT}/.agents/plugins/marketplace.json"
 CODEX_HOME="${CODEX_HOME:-${HOME}/.codex}"
@@ -42,7 +42,7 @@ marketplace_name() {
 validate() {
   prepare
   python3 "${SKILL_CREATOR_ROOT}/scripts/quick_validate.py" \
-    "${PLUGIN_ROOT}/skills/telegram-radar"
+    "${PLUGIN_ROOT}/skills/telegram-bridge"
   python3 "${PLUGIN_CREATOR_ROOT}/scripts/validate_plugin.py" "${PLUGIN_ROOT}"
 }
 
@@ -118,27 +118,13 @@ install_plugin() {
   verify_repo_plugin_installed
 }
 
-remove_legacy_install() {
-  if plugin_is_installed tg-radar@plugins-cli; then
-    "${CODEX_BIN}" plugin remove tg-radar@plugins-cli
-  fi
-}
-
-assert_legacy_not_installed() {
-  if plugin_is_installed tg-radar@plugins-cli; then
-    printf 'legacy tg-radar@plugins-cli is still installed; run %s migrate first\n' "$0" >&2
-    exit 1
-  fi
-}
-
 usage() {
   cat <<'EOF'
-Usage: scripts/codex-plugin.sh <validate|install|reload|migrate>
+Usage: scripts/codex-plugin.sh <validate|install|reload>
 
   validate  Validate the tracked skill and plugin manifests.
   install   Register the repo marketplace if needed and install its current version.
   reload    Refresh the tracked cachebuster, validate, and reinstall.
-  migrate   Cut over from the old plugins-cli installation to this repository.
 EOF
 }
 
@@ -147,31 +133,12 @@ case "${1:-}" in
     validate
     ;;
   install)
-    assert_legacy_not_installed
     install_plugin
     ;;
   reload)
     validate
-    assert_legacy_not_installed
     python3 "${PLUGIN_CREATOR_ROOT}/scripts/update_plugin_cachebuster.py" "${PLUGIN_ROOT}"
     install_plugin
-    ;;
-  migrate)
-    legacy_was_installed=0
-    if plugin_is_installed tg-radar@plugins-cli; then
-      legacy_was_installed=1
-    fi
-    validate
-    ensure_marketplace
-    verify_repo_plugin_available
-    remove_legacy_install
-    if ! install_plugin; then
-      "${CODEX_BIN}" plugin remove "${PLUGIN_NAME}@$(marketplace_name)" >/dev/null 2>&1 || true
-      if [[ "${legacy_was_installed}" == "1" ]]; then
-        "${CODEX_BIN}" plugin add tg-radar@plugins-cli >/dev/null 2>&1 || true
-      fi
-      exit 1
-    fi
     ;;
   *)
     usage >&2

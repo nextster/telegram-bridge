@@ -3,7 +3,7 @@ package notify
 import (
 	"context"
 
-	"github.com/nextster/tg-radar/internal/db"
+	"github.com/nextster/telegram-bridge/internal/db"
 )
 
 type Notifier interface {

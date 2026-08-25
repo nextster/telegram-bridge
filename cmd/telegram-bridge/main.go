@@ -15,12 +15,12 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/nextster/tg-radar/internal/bot"
-	"github.com/nextster/tg-radar/internal/config"
-	"github.com/nextster/tg-radar/internal/db"
-	"github.com/nextster/tg-radar/internal/monitor"
-	"github.com/nextster/tg-radar/internal/notify"
-	"github.com/nextster/tg-radar/internal/web"
+	"github.com/nextster/telegram-bridge/internal/bot"
+	"github.com/nextster/telegram-bridge/internal/config"
+	"github.com/nextster/telegram-bridge/internal/db"
+	"github.com/nextster/telegram-bridge/internal/monitor"
+	"github.com/nextster/telegram-bridge/internal/notify"
+	"github.com/nextster/telegram-bridge/internal/web"
 )
 
 func main() {
@@ -214,7 +214,7 @@ func splitCommand(args []string) (string, []string) {
 }
 
 func printUsage() {
-	fmt.Fprintln(os.Stdout, `tg-radar
+	fmt.Fprintln(os.Stdout, `telegram-bridge
 
 Commands:
   serve    Run web UI, bot polling, and gotd monitor
@@ -228,5 +228,5 @@ Environment:
   TELEGRAM_API_HASH or TG_API_HASH
   TELEGRAM_PHONE or TG_PHONE
   TELEGRAM_PASSWORD or TG_PASSWORD
-  TG_RADAR_DB, TG_RADAR_SESSION, TG_RADAR_PUBLIC_URL, TG_RADAR_MCP_TOKEN, PORT`)
+  TELEGRAM_BRIDGE_DB, TELEGRAM_BRIDGE_SESSION, TELEGRAM_BRIDGE_PUBLIC_URL, TELEGRAM_BRIDGE_MCP_TOKEN, PORT`)
 }

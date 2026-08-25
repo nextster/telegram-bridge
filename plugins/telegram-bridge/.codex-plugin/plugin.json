@@ -1,0 +1,35 @@
+{
+  "name": "telegram-bridge",
+  "version": "0.1.0+codex.20260825223010",
+  "description": "Search and inspect the authenticated Telegram account through the read-only telegram-bridge MCP service.",
+  "author": {
+    "name": "Artem"
+  },
+  "homepage": "https://telegram-bridge.fly.dev/",
+  "repository": "https://github.com/nextster/telegram-bridge",
+  "keywords": [
+    "telegram",
+    "search",
+    "chat-history",
+    "mcp",
+    "telegram-bridge"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Telegram Bridge",
+    "shortDescription": "Search your Telegram chats from Codex",
+    "longDescription": "Search dialogs and messages, inspect recent history, and run date-bounded research against Artem's authenticated Telegram account through the read-only telegram-bridge MCP service.",
+    "developerName": "Artem",
+    "category": "Productivity",
+    "capabilities": [
+      "Read"
+    ],
+    "websiteURL": "https://telegram-bridge.fly.dev/",
+    "defaultPrompt": [
+      "Search my Telegram chats for a recent conversation.",
+      "Find recent marketplace posts matching this item.",
+      "Summarize what this Telegram chat discussed."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}
