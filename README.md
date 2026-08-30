@@ -67,6 +67,8 @@ The worker starts Codex with `workspace-write` and `approvalPolicy=never`: norma
 
 Every 30 seconds the local worker reads the complete active and archived task lists from `codex app-server`. Existing active Codex tasks that were not created from Telegram are mirrored into the private `Codex · Active` forum, one topic per top-level task. The topic contains only the latest visible user or Codex message plus the current `working`, `waiting for you`, `ready`, or `error` state; changed mirror posts replace the previous mirror post and preserve common Markdown formatting. Sub-agent threads are not mirrored separately.
 
+A plain text post in a Codex forum's General topic is promoted into a new forum topic and queued as a Codex task. The original General post is removed after successful promotion. `Codex · Active` uses the only configured execution project automatically; when several projects exist, use `project :: task`.
+
 Archiving a mapped task in Codex deletes its Telegram forum topic and all messages in that topic. The project forum remains. This deletion is intentionally one-way: unarchiving the Codex task does not recreate the Telegram topic.
 
 ## Bot commands

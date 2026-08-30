@@ -110,6 +110,23 @@ func (s *Store) GetCodexProject(ctx context.Context, slug string) (CodexProject,
 	return p, true, nil
 }
 
+func (s *Store) GetCodexProjectByChatID(ctx context.Context, chatID int64) (CodexProject, bool, error) {
+	var p CodexProject
+	var created, updated string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT slug, title, telegram_channel_id, telegram_access_hash, telegram_chat_id, created_at, updated_at
+		FROM codex_projects WHERE telegram_chat_id = ?
+	`, chatID).Scan(&p.Slug, &p.Title, &p.TelegramChannelID, &p.TelegramAccessHash, &p.TelegramChatID, &created, &updated)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CodexProject{}, false, nil
+	}
+	if err != nil {
+		return CodexProject{}, false, fmt.Errorf("get Codex project by Telegram chat: %w", err)
+	}
+	p.CreatedAt, p.UpdatedAt = parseDBTime(created), parseDBTime(updated)
+	return p, true, nil
+}
+
 func (s *Store) ListCodexProjects(ctx context.Context) ([]CodexProject, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT slug, title, telegram_channel_id, telegram_access_hash, telegram_chat_id, created_at, updated_at

@@ -210,8 +210,14 @@ func (s *Service) handleUpdate(ctx context.Context, update telego.Update) error 
 			return err
 		}
 	}
-	if text != "" && !strings.HasPrefix(text, "/") && message.MessageThreadID > 0 {
-		return s.handleCodexContinuation(ctx, message, text)
+	if text != "" && !strings.HasPrefix(text, "/") {
+		if message.MessageThreadID > 0 {
+			handled, err := s.handleCodexContinuation(ctx, message, text)
+			if handled || err != nil {
+				return err
+			}
+		}
+		return s.handleCodexGeneralPost(ctx, message, text)
 	}
 	if text == "" || !strings.HasPrefix(text, "/") {
 		return nil
@@ -769,9 +775,13 @@ func (s *Service) CreateCodexTask(ctx context.Context, projectSlug, prompt strin
 			return CodexTask{}, err
 		}
 	}
+	return s.createCodexTaskInForum(ctx, projectSlug, project, prompt)
+}
+
+func (s *Service) createCodexTaskInForum(ctx context.Context, projectSlug string, forum db.CodexProject, prompt string) (CodexTask, error) {
 	topicTitle := codexTopicTitle(prompt)
 	topic, err := s.bot.CreateForumTopic(ctx, &telego.CreateForumTopicParams{
-		ChatID:    telego.ChatID{ID: project.TelegramChatID},
+		ChatID:    telego.ChatID{ID: forum.TelegramChatID},
 		Name:      topicTitle,
 		IconColor: 0x6FB9F0,
 	})
@@ -779,8 +789,8 @@ func (s *Service) CreateCodexTask(ctx context.Context, projectSlug, prompt strin
 		return CodexTask{}, fmt.Errorf("create Codex topic: %w", err)
 	}
 	thread, err := s.store.CreateCodexThread(ctx, db.CodexThread{
-		ProjectSlug:     project.Slug,
-		TelegramChatID:  project.TelegramChatID,
+		ProjectSlug:     projectSlug,
+		TelegramChatID:  forum.TelegramChatID,
 		TelegramTopicID: topic.MessageThreadID,
 		Title:           topicTitle,
 	})
@@ -794,30 +804,93 @@ func (s *Service) CreateCodexTask(ctx context.Context, projectSlug, prompt strin
 	if err := s.replyTopic(ctx, thread.TelegramChatID, thread.TelegramTopicID, "🧵 Codex task queued · "+job.ID); err != nil {
 		return CodexTask{}, err
 	}
-	link := fmt.Sprintf("https://t.me/c/%d/%d", project.TelegramChannelID, thread.TelegramTopicID)
-	return CodexTask{Project: project, Thread: thread, Job: job, Link: link}, nil
+	link := fmt.Sprintf("https://t.me/c/%d/%d", forum.TelegramChannelID, thread.TelegramTopicID)
+	return CodexTask{Project: forum, Thread: thread, Job: job, Link: link}, nil
 }
 
-func (s *Service) handleCodexContinuation(ctx context.Context, message *telego.Message, prompt string) error {
+func (s *Service) handleCodexContinuation(ctx context.Context, message *telego.Message, prompt string) (bool, error) {
 	thread, ok, err := s.store.GetCodexThreadByTopic(ctx, message.Chat.ID, message.MessageThreadID)
 	if err != nil || !ok {
-		return err
+		return false, err
 	}
 	if message.From == nil || message.From.IsBot {
-		return nil
+		return true, nil
 	}
 	allowed, err := s.isAdminSender(ctx, message.From.ID)
 	if err != nil {
-		return err
+		return true, err
 	}
 	if !allowed {
-		return nil
+		return true, nil
 	}
 	job, err := s.store.EnqueueCodexJob(ctx, thread.ID, prompt)
 	if err != nil {
+		return true, err
+	}
+	return true, s.replyTopic(ctx, message.Chat.ID, message.MessageThreadID, "⏳ queued · "+job.ID)
+}
+
+func (s *Service) handleCodexGeneralPost(ctx context.Context, message *telego.Message, prompt string) error {
+	if message.MessageThreadID > 1 || message.From == nil || message.From.IsBot {
+		return nil
+	}
+	forum, ok, err := s.store.GetCodexProjectByChatID(ctx, message.Chat.ID)
+	if err != nil || !ok {
 		return err
 	}
-	return s.replyTopic(ctx, message.Chat.ID, message.MessageThreadID, "⏳ queued · "+job.ID)
+	allowed, err := s.isAdminSender(ctx, message.From.ID)
+	if err != nil || !allowed {
+		return err
+	}
+	projectSlug, prompt, err := s.resolveGeneralCodexProject(ctx, forum, prompt)
+	if err != nil {
+		return s.reply(ctx, message.Chat.ID, err.Error(), nil)
+	}
+	task, err := s.createCodexTaskInForum(ctx, projectSlug, forum, prompt)
+	if err != nil {
+		return err
+	}
+	if err := s.bot.DeleteMessage(ctx, &telego.DeleteMessageParams{
+		ChatID: telego.ChatID{ID: message.Chat.ID}, MessageID: message.MessageID,
+	}); err != nil {
+		log.Printf("delete promoted Codex General post %d/%d failed: %v; task: %s", message.Chat.ID, message.MessageID, err, task.Link)
+	}
+	return nil
+}
+
+func (s *Service) resolveGeneralCodexProject(ctx context.Context, forum db.CodexProject, input string) (string, string, error) {
+	if forum.Slug != "_active" {
+		return forum.Slug, strings.TrimSpace(input), nil
+	}
+	if project, prompt, ok := parseCodexPayload(input); ok && project != "_active" {
+		if _, exists, err := s.store.GetCodexProject(ctx, project); err != nil {
+			return "", "", err
+		} else if exists {
+			return project, prompt, nil
+		}
+		return "", "", fmt.Errorf("Unknown Codex project %q.", project)
+	}
+	projects, err := s.store.ListCodexProjects(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	var candidates []db.CodexProject
+	for _, project := range projects {
+		if project.Slug != "_active" {
+			candidates = append(candidates, project)
+		}
+	}
+	if len(candidates) == 1 {
+		return candidates[0].Slug, strings.TrimSpace(input), nil
+	}
+	if len(candidates) == 0 {
+		return "", "", errors.New("No Codex project is configured yet.")
+	}
+	var slugs []string
+	for _, project := range candidates {
+		slugs = append(slugs, project.Slug)
+	}
+	return "", "", fmt.Errorf("Choose a project: %s :: task", strings.Join(slugs, " / "))
 }
 
 func (s *Service) isAdminSender(ctx context.Context, userID int64) (bool, error) {

@@ -261,3 +261,33 @@ func TestFormatCodexSnapshotHighlightsWaitingForUser(t *testing.T) {
 		t.Fatalf("formatCodexSnapshot() = %q", got)
 	}
 }
+
+func TestResolveGeneralCodexProject(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(ctx, t.TempDir()+"/general-codex.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for _, project := range []db.CodexProject{
+		{Slug: "_active", Title: "Active", TelegramChannelID: 100, TelegramChatID: -1000000000100},
+		{Slug: "telegram-bridge", Title: "telegram-bridge", TelegramChannelID: 200, TelegramChatID: -1000000000200},
+	} {
+		if err := store.UpsertCodexProject(ctx, project); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service := &Service{store: store}
+	active, _, err := store.GetCodexProject(ctx, "_active")
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, prompt, err := service.resolveGeneralCodexProject(ctx, active, "make it nicer")
+	if err != nil || project != "telegram-bridge" || prompt != "make it nicer" {
+		t.Fatalf("single project resolution = %q, %q, %v", project, prompt, err)
+	}
+	project, prompt, err = service.resolveGeneralCodexProject(ctx, active, "telegram-bridge :: inspect this")
+	if err != nil || project != "telegram-bridge" || prompt != "inspect this" {
+		t.Fatalf("explicit project resolution = %q, %q, %v", project, prompt, err)
+	}
+}
