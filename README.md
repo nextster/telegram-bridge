@@ -65,7 +65,7 @@ scripts/install-codex-worker.sh telegram-bridge=/path/to/telegram-bridge
 
 The worker starts Codex with `workspace-write` and `approvalPolicy=never`: normal edits inside the selected project are possible, while permission escalation is unavailable from Telegram. Its log is `~/Library/Logs/telegram-bridge-worker.log`; the final Codex message is posted to the originating Telegram topic.
 
-Every 30 seconds the local worker reads the complete active and archived task lists from `codex app-server`. Existing active Codex tasks that were not created from Telegram are mirrored into the private `Codex · Active` forum, one topic per top-level task. The topic contains only the latest visible user or Codex message plus the current `working`, `waiting for you`, `ready`, or `error` state; changed mirror posts replace the previous mirror post and preserve common Markdown formatting. Sub-agent threads are not mirrored separately.
+Every 30 seconds the local worker reads the complete active and archived task lists from `codex app-server`. Existing active Codex tasks that were not created from Telegram are mirrored into the private `Codex · Active` forum, one topic per top-level task. The topic contains only the latest visible user or Codex message; changed mirror posts replace the previous mirror post and preserve common Markdown formatting. A short neutral state is shown only when a task has no visible message. Sub-agent threads are not mirrored separately.
 
 A plain text post in a Codex forum's General topic is promoted into a new forum topic and queued as a Codex task. The original General post is removed after successful promotion. `Codex · Active` uses the only configured execution project automatically; when several projects exist, use `project :: task`.
 

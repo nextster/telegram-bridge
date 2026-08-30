@@ -239,7 +239,6 @@ func TestFormatCodexSnapshotPreservesUsefulMarkdown(t *testing.T) {
 		Message:     "**Done** with [details](https://example.com).\n\n- one\n- `two`\n\n```go\nfmt.Println(\"ok\")\n```",
 	})
 	for _, want := range []string{
-		"⏳ working · <code>telegram-bridge</code>",
 		"<b>Done</b>",
 		"<a href=\"https://example.com\">details</a>",
 		"• one",
@@ -257,7 +256,14 @@ func TestFormatCodexSnapshotHighlightsWaitingForUser(t *testing.T) {
 		CWD: "/tmp/project", Status: "active", ActiveFlags: []string{"waitingOnUserInput"},
 		MessageRole: "user", Message: "Which one?",
 	})
-	if got != "🙋 waiting for you · <code>project</code> · you\n\nWhich one?" {
+	if got != "Which one?" {
+		t.Fatalf("formatCodexSnapshot() = %q", got)
+	}
+}
+
+func TestFormatCodexSnapshotUsesQuietEmptyState(t *testing.T) {
+	got := formatCodexSnapshot(db.CodexThreadSnapshot{Status: "active"})
+	if got != "В работе…" {
 		t.Fatalf("formatCodexSnapshot() = %q", got)
 	}
 }

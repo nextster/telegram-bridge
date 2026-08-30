@@ -3,7 +3,6 @@ package bot
 import (
 	"html"
 	"net/url"
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -17,41 +16,17 @@ import (
 )
 
 func formatCodexSnapshot(snapshot db.CodexThreadSnapshot) string {
-	status := codexStatusLabel(snapshot.Status, snapshot.ActiveFlags)
-	project := filepath.Base(strings.TrimSpace(snapshot.CWD))
-	if project == "." || project == "/" || project == "" {
-		project = "Codex"
-	}
-	prefix := status + " · <code>" + html.EscapeString(project) + "</code>"
 	message := strings.TrimSpace(snapshot.Message)
-	if message == "" {
-		return prefix
+	if message != "" {
+		return truncateTelegramHTML(markdownToTelegramHTML(truncateUTF16(message, 3600)))
 	}
-	if snapshot.MessageRole == "user" {
-		prefix += " · you"
-	}
-	body := markdownToTelegramHTML(truncateUTF16(message, 3300))
-	return truncateTelegramHTML(prefix + "\n\n" + body)
-}
-
-func codexStatusLabel(status string, flags []string) string {
-	for _, flag := range flags {
-		switch flag {
-		case "waitingOnApproval":
-			return "🛂 waiting for approval"
-		case "waitingOnUserInput":
-			return "🙋 waiting for you"
-		}
-	}
-	switch status {
+	switch snapshot.Status {
 	case "active":
-		return "⏳ working"
+		return "В работе…"
 	case "systemError":
-		return "⚠️ error"
-	case "idle":
-		return "✅ ready"
+		return "Не получилось завершить задачу."
 	default:
-		return "◻️ " + html.EscapeString(status)
+		return "Пока без ответа."
 	}
 }
 
