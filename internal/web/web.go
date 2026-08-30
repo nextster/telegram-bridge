@@ -144,10 +144,19 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("POST /worker/v1/jobs/claim", s.requireWorker(s.claimCodexJob))
 		mux.HandleFunc("POST /worker/v1/jobs/{id}/start", s.requireWorker(s.startCodexJob))
 		mux.HandleFunc("POST /worker/v1/jobs/{id}/finish", s.requireWorker(s.finishCodexJob))
+		mux.HandleFunc("POST /worker/v1/jobs/{id}/retry", s.requireWorker(s.retryCodexJob))
 		mux.HandleFunc("POST /worker/v1/tasks", s.requireWorker(s.createCodexTask))
 		log.Print("Codex worker API enabled at /worker/v1")
 	}
 	return mux
+}
+
+func (s *Server) retryCodexJob(w http.ResponseWriter, r *http.Request) {
+	if err := s.store.RetryCodexJob(r.Context(), r.PathValue("id")); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) createCodexTask(w http.ResponseWriter, r *http.Request) {

@@ -29,3 +29,29 @@ func TestAppServerIntegration(t *testing.T) {
 		t.Fatalf("unexpected result: %#v", result)
 	}
 }
+
+func TestAppServerForksWhenThreadHasActiveWriter(t *testing.T) {
+	threadID := os.Getenv("CODEX_ACTIVE_WRITER_THREAD_ID")
+	if threadID == "" {
+		t.Skip("set CODEX_ACTIVE_WRITER_THREAD_ID to an open Codex task")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	result, err := RunAppServer(ctx, AppServerConfig{
+		CodexBin:       "codex",
+		CWD:            "/path/to/telegram-bridge",
+		ThreadID:       threadID,
+		Prompt:         "Reply with exactly: fork-pong",
+		ApprovalPolicy: "never",
+		Sandbox:        "read-only",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ThreadID == threadID {
+		t.Fatalf("thread was not forked: %s", result.ThreadID)
+	}
+	if !strings.Contains(result.Text, "fork-pong") {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+}

@@ -252,6 +252,22 @@ func (s *Store) FinishCodexJob(ctx context.Context, id, leaseToken, resultText, 
 	return scanCodexJob(s.db.QueryRowContext(ctx, codexJobSelect+` WHERE j.id = ?`, id))
 }
 
+func (s *Store) RetryCodexJob(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE codex_jobs SET
+			status = 'queued', worker_id = '', lease_token = '', lease_expires_at = '',
+			result = '', error = '', updated_at = ?, started_at = '', finished_at = ''
+		WHERE id = ? AND status = 'failed'
+	`, nowText(), strings.TrimSpace(id))
+	if err != nil {
+		return fmt.Errorf("retry Codex job: %w", err)
+	}
+	if rows, _ := res.RowsAffected(); rows != 1 {
+		return errors.New("Codex job is missing or is not failed")
+	}
+	return nil
+}
+
 const codexJobSelect = `
 	SELECT j.id, j.thread_id, j.prompt, j.status, j.worker_id, j.lease_token, j.lease_expires_at,
 		j.result, j.error, j.created_at, j.updated_at, j.started_at, j.finished_at,

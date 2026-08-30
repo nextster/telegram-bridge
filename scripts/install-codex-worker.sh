@@ -62,6 +62,12 @@ PLIST_TAIL
 
 plutil -lint "${PLIST}"
 launchctl bootout "gui/${UID}/${LABEL}" 2>/dev/null || true
+for _ in {1..20}; do
+  if ! launchctl print "gui/${UID}/${LABEL}" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.25
+done
 launchctl bootstrap "gui/${UID}" "${PLIST}"
 launchctl kickstart -k "gui/${UID}/${LABEL}"
 echo "Installed ${LABEL}; log: ${LOG_DIR}/telegram-bridge-worker.log"

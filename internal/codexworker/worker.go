@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -286,6 +287,17 @@ func RunAppServer(ctx context.Context, cfg AppServerConfig, started func(string)
 		return AppServerResult{}, err
 	}
 	response, err := waitResponse(reader, 2)
+	turnRequestID := 3
+	if err != nil && method == "thread/resume" && isActiveWriterError(err) {
+		method = "thread/fork"
+		if err := encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": 3, "method": method, "params": map[string]any{
+			"threadId": cfg.ThreadID, "cwd": cfg.CWD, "approvalPolicy": cfg.ApprovalPolicy, "sandbox": cfg.Sandbox,
+		}}); err != nil {
+			return AppServerResult{}, err
+		}
+		response, err = waitResponse(reader, 3)
+		turnRequestID = 4
+	}
 	if err != nil {
 		return AppServerResult{}, appServerError(err, stderr.String())
 	}
@@ -305,13 +317,13 @@ func RunAppServer(ctx context.Context, cfg AppServerConfig, started func(string)
 			return AppServerResult{}, err
 		}
 	}
-	if err := encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": 3, "method": "turn/start", "params": map[string]any{
+	if err := encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": turnRequestID, "method": "turn/start", "params": map[string]any{
 		"threadId": threadResponse.Thread.ID,
 		"input":    []map[string]string{{"type": "text", "text": cfg.Prompt}},
 	}}); err != nil {
 		return AppServerResult{}, err
 	}
-	if _, err := waitResponse(reader, 3); err != nil {
+	if _, err := waitResponse(reader, turnRequestID); err != nil {
 		return AppServerResult{}, appServerError(err, stderr.String())
 	}
 
@@ -371,6 +383,10 @@ func waitResponse(reader *bufio.Reader, id int) (rpcMessage, error) {
 			continue
 		}
 		if len(message.Error) > 0 && string(message.Error) != "null" {
+			var rpcErr rpcResponseError
+			if json.Unmarshal(message.Error, &rpcErr) == nil && rpcErr.Message != "" {
+				return rpcMessage{}, &rpcErr
+			}
 			return rpcMessage{}, fmt.Errorf("JSON-RPC error: %s", message.Error)
 		}
 		return message, nil
@@ -389,8 +405,32 @@ func readRPC(reader *bufio.Reader) (rpcMessage, error) {
 	return message, nil
 }
 
+type rpcResponseError struct {
+	Code    int             `json:"code"`
+	Message string          `json:"message"`
+	Data    json.RawMessage `json:"data,omitempty"`
+}
+
+func (e *rpcResponseError) Error() string {
+	if e == nil {
+		return "JSON-RPC error"
+	}
+	return fmt.Sprintf("Codex app-server error %d: %s", e.Code, e.Message)
+}
+
+func isActiveWriterError(err error) bool {
+	var rpcErr *rpcResponseError
+	return errors.As(err, &rpcErr) && strings.Contains(strings.ToLower(rpcErr.Message), "active writer")
+}
+
+var ansiEscapePattern = regexp.MustCompile(`\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))`)
+
 func appServerError(err error, stderr string) error {
-	if value := strings.TrimSpace(stderr); value != "" {
+	var rpcErr *rpcResponseError
+	if errors.As(err, &rpcErr) {
+		return rpcErr
+	}
+	if value := strings.TrimSpace(ansiEscapePattern.ReplaceAllString(stderr, "")); value != "" {
 		return fmt.Errorf("%w: %s", err, value)
 	}
 	return err
