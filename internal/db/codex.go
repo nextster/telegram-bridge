@@ -139,9 +139,17 @@ func (s *Store) GetCodexThreadByTopic(ctx context.Context, chatID int64, topicID
 }
 
 func (s *Store) SetCodexThreadID(ctx context.Context, threadID int64, codexThreadID string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE codex_threads SET codex_thread_id = ?, updated_at = ? WHERE id = ?`, strings.TrimSpace(codexThreadID), nowText(), threadID)
+	codexThreadID = strings.TrimSpace(codexThreadID)
+	_, err := s.db.ExecContext(ctx, `UPDATE codex_threads SET codex_thread_id = ?, updated_at = ? WHERE id = ?`, codexThreadID, nowText(), threadID)
 	if err != nil {
 		return fmt.Errorf("set Codex thread id: %w", err)
+	}
+	if codexThreadID != "" {
+		if _, err := s.db.ExecContext(ctx, `
+			INSERT OR IGNORE INTO codex_thread_aliases(thread_id, codex_thread_id, observed_at) VALUES(?, ?, ?)
+		`, threadID, codexThreadID, nowText()); err != nil {
+			return fmt.Errorf("remember Codex thread alias: %w", err)
+		}
 	}
 	return nil
 }
@@ -225,12 +233,68 @@ func (s *Store) StartCodexJob(ctx context.Context, id, leaseToken, codexThreadID
 		return errors.New("Codex job lease is stale")
 	}
 	if strings.TrimSpace(codexThreadID) != "" {
-		_, err = s.db.ExecContext(ctx, `
-			UPDATE codex_threads SET codex_thread_id = ?, updated_at = ?
-			WHERE id = (SELECT thread_id FROM codex_jobs WHERE id = ?)
-		`, codexThreadID, now, id)
+		var threadID int64
+		if err = s.db.QueryRowContext(ctx, `SELECT thread_id FROM codex_jobs WHERE id = ?`, id).Scan(&threadID); err == nil {
+			err = s.SetCodexThreadID(ctx, threadID, codexThreadID)
+		}
 	}
 	return err
+}
+
+func (s *Store) PendingArchivedCodexThreads(ctx context.Context, archivedIDs []string) ([]CodexThread, error) {
+	archived := make(map[string]struct{}, len(archivedIDs))
+	for _, id := range archivedIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			archived[id] = struct{}{}
+		}
+	}
+	if len(archived) == 0 {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT t.id, t.project_slug, t.telegram_chat_id, t.telegram_topic_id, t.title,
+			t.codex_thread_id, t.created_at, t.updated_at, a.codex_thread_id
+		FROM codex_threads t
+		JOIN codex_thread_aliases a ON a.thread_id = t.id
+		LEFT JOIN codex_deleted_topics d ON d.thread_id = t.id
+		WHERE d.thread_id IS NULL
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list pending archived Codex threads: %w", err)
+	}
+	defer rows.Close()
+	byID := make(map[int64]CodexThread)
+	for rows.Next() {
+		var thread CodexThread
+		var created, updated, alias string
+		if err := rows.Scan(&thread.ID, &thread.ProjectSlug, &thread.TelegramChatID, &thread.TelegramTopicID,
+			&thread.Title, &thread.CodexThreadID, &created, &updated, &alias); err != nil {
+			return nil, fmt.Errorf("scan pending archived Codex thread: %w", err)
+		}
+		if _, ok := archived[alias]; !ok {
+			continue
+		}
+		thread.CreatedAt, thread.UpdatedAt = parseDBTime(created), parseDBTime(updated)
+		byID[thread.ID] = thread
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	threads := make([]CodexThread, 0, len(byID))
+	for _, thread := range byID {
+		threads = append(threads, thread)
+	}
+	return threads, nil
+}
+
+func (s *Store) MarkCodexTopicDeleted(ctx context.Context, threadID int64) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT OR IGNORE INTO codex_deleted_topics(thread_id, deleted_at) VALUES(?, ?)
+	`, threadID, nowText())
+	if err != nil {
+		return fmt.Errorf("mark Codex topic deleted: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) FinishCodexJob(ctx context.Context, id, leaseToken, resultText, errorText string) (CodexJob, error) {

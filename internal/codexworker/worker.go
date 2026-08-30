@@ -61,7 +61,14 @@ func New(cfg Config) (*Worker, error) {
 }
 
 func (w *Worker) Run(ctx context.Context) error {
+	nextArchiveSync := time.Time{}
 	for {
+		if !time.Now().Before(nextArchiveSync) {
+			if err := w.syncArchived(ctx); err != nil {
+				log.Printf("sync archived Codex tasks failed: %v", err)
+			}
+			nextArchiveSync = time.Now().Add(30 * time.Second)
+		}
 		job, ok, err := w.claim(ctx)
 		if err != nil {
 			log.Printf("claim Codex job failed: %v", err)
@@ -83,6 +90,27 @@ func (w *Worker) Run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+func (w *Worker) syncArchived(ctx context.Context) error {
+	threadIDs, err := ListArchivedThreadIDs(ctx, w.cfg.CodexBin)
+	if err != nil {
+		return err
+	}
+	var response struct {
+		Deleted int `json:"deleted"`
+	}
+	status, err := w.request(ctx, http.MethodPost, "/worker/v1/archive-sync", map[string]any{"thread_ids": threadIDs}, &response)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("archive sync returned HTTP %d", status)
+	}
+	if response.Deleted > 0 {
+		log.Printf("deleted %d Telegram topics for archived Codex tasks", response.Deleted)
+	}
+	return nil
 }
 
 func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
@@ -366,6 +394,80 @@ func RunAppServer(ctx context.Context, cfg AppServerConfig, started func(string)
 			}
 			return AppServerResult{ThreadID: threadResponse.Thread.ID, Text: text}, nil
 		}
+	}
+}
+
+func ListArchivedThreadIDs(ctx context.Context, codexBin string) ([]string, error) {
+	if strings.TrimSpace(codexBin) == "" {
+		codexBin = "codex"
+	}
+	cmd := exec.CommandContext(ctx, codexBin, "app-server", "--listen", "stdio://")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start codex app-server for archive sync: %w", err)
+	}
+	defer func() {
+		_ = stdin.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	}()
+	encoder := json.NewEncoder(stdin)
+	reader := bufio.NewReader(stdout)
+	if err := encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{
+		"clientInfo": map[string]string{"name": "telegram-bridge", "title": "Telegram Bridge", "version": "1"},
+	}}); err != nil {
+		return nil, err
+	}
+	if _, err := waitResponse(reader, 1); err != nil {
+		return nil, appServerError(err, stderr.String())
+	}
+	if err := encoder.Encode(map[string]any{"jsonrpc": "2.0", "method": "initialized"}); err != nil {
+		return nil, err
+	}
+
+	var ids []string
+	var cursor any
+	for requestID := 2; ; requestID++ {
+		params := map[string]any{"archived": true, "limit": 100, "useStateDbOnly": true}
+		if cursor != nil {
+			params["cursor"] = cursor
+		}
+		if err := encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": requestID, "method": "thread/list", "params": params}); err != nil {
+			return nil, err
+		}
+		response, err := waitResponse(reader, requestID)
+		if err != nil {
+			return nil, appServerError(err, stderr.String())
+		}
+		var page struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+			NextCursor *string `json:"nextCursor"`
+		}
+		if err := json.Unmarshal(response.Result, &page); err != nil {
+			return nil, fmt.Errorf("decode archived Codex tasks: %w", err)
+		}
+		for _, thread := range page.Data {
+			if strings.TrimSpace(thread.ID) != "" {
+				ids = append(ids, thread.ID)
+			}
+		}
+		if page.NextCursor == nil || *page.NextCursor == "" {
+			return ids, nil
+		}
+		cursor = *page.NextCursor
 	}
 }
 

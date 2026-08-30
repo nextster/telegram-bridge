@@ -43,6 +43,19 @@ func TestCodexJobLifecycle(t *testing.T) {
 	if finished.Status != "succeeded" || finished.Result != "done" || finished.Thread.CodexThreadID != "codex-thread" {
 		t.Fatalf("finished = %+v", finished)
 	}
+	if err := store.SetCodexThreadID(ctx, thread.ID, "codex-thread-fork"); err != nil {
+		t.Fatal(err)
+	}
+	archived, err := store.PendingArchivedCodexThreads(ctx, []string{"codex-thread"})
+	if err != nil || len(archived) != 1 || archived[0].ID != thread.ID {
+		t.Fatalf("archived=%+v err=%v", archived, err)
+	}
+	if err := store.MarkCodexTopicDeleted(ctx, thread.ID); err != nil {
+		t.Fatal(err)
+	}
+	if archived, err := store.PendingArchivedCodexThreads(ctx, []string{"codex-thread-fork"}); err != nil || len(archived) != 0 {
+		t.Fatalf("already deleted archived=%+v err=%v", archived, err)
+	}
 	if _, ok, err := store.ClaimCodexJob(ctx, "mac", time.Minute); err != nil || ok {
 		t.Fatalf("second claim ok=%v err=%v", ok, err)
 	}

@@ -354,6 +354,20 @@ var schema = []string{
 		FOREIGN KEY(project_slug) REFERENCES codex_projects(slug) ON DELETE CASCADE
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_codex_threads_codex_id ON codex_threads(codex_thread_id)`,
+	`CREATE TABLE IF NOT EXISTS codex_thread_aliases (
+		thread_id INTEGER NOT NULL,
+		codex_thread_id TEXT NOT NULL UNIQUE,
+		observed_at TEXT NOT NULL,
+		FOREIGN KEY(thread_id) REFERENCES codex_threads(id) ON DELETE CASCADE
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_codex_thread_aliases_thread ON codex_thread_aliases(thread_id)`,
+	`INSERT OR IGNORE INTO codex_thread_aliases(thread_id, codex_thread_id, observed_at)
+		SELECT id, codex_thread_id, updated_at FROM codex_threads WHERE codex_thread_id != ''`,
+	`CREATE TABLE IF NOT EXISTS codex_deleted_topics (
+		thread_id INTEGER PRIMARY KEY,
+		deleted_at TEXT NOT NULL,
+		FOREIGN KEY(thread_id) REFERENCES codex_threads(id) ON DELETE CASCADE
+	)`,
 	`CREATE TABLE IF NOT EXISTS codex_jobs (
 		id TEXT PRIMARY KEY,
 		thread_id INTEGER NOT NULL,

@@ -28,6 +28,9 @@ func TestAppServerIntegration(t *testing.T) {
 	if result.ThreadID == "" || !strings.Contains(result.Text, "bridge-pong") {
 		t.Fatalf("unexpected result: %#v", result)
 	}
+	if _, err := ListArchivedThreadIDs(ctx, "codex"); err != nil {
+		t.Fatalf("list archived threads: %v", err)
+	}
 }
 
 func TestAppServerForksWhenThreadHasActiveWriter(t *testing.T) {

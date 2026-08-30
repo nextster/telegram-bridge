@@ -532,6 +532,41 @@ func (s *Service) SendCodexJobResult(ctx context.Context, job db.CodexJob) error
 	return s.replyTopic(ctx, job.Thread.TelegramChatID, job.Thread.TelegramTopicID, text)
 }
 
+func (s *Service) DeleteArchivedCodexTopics(ctx context.Context, archivedThreadIDs []string) (int, error) {
+	threads, err := s.store.PendingArchivedCodexThreads(ctx, archivedThreadIDs)
+	if err != nil {
+		return 0, err
+	}
+	deleted := 0
+	var failures []error
+	for _, thread := range threads {
+		err := s.bot.DeleteForumTopic(ctx, &telego.DeleteForumTopicParams{
+			ChatID:          telego.ChatID{ID: thread.TelegramChatID},
+			MessageThreadID: thread.TelegramTopicID,
+		})
+		if err != nil && !codexTopicAlreadyGone(err) {
+			failures = append(failures, fmt.Errorf("delete Telegram topic %d/%d: %w", thread.TelegramChatID, thread.TelegramTopicID, err))
+			continue
+		}
+		if err := s.store.MarkCodexTopicDeleted(ctx, thread.ID); err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		deleted++
+	}
+	return deleted, errors.Join(failures...)
+}
+
+func codexTopicAlreadyGone(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "message thread not found") ||
+		strings.Contains(message, "topic_deleted") ||
+		strings.Contains(message, "topic was deleted")
+}
+
 func (s *Service) handleCodex(ctx context.Context, message *telego.Message, payload string) error {
 	if !s.cfg.HasWorkerAPI() {
 		return s.reply(ctx, message.Chat.ID, "Codex worker API is not configured.", nil)
