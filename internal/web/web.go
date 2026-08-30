@@ -150,9 +150,35 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("POST /worker/v1/tasks", s.requireWorker(s.createCodexTask))
 		mux.HandleFunc("POST /worker/v1/archive-sync", s.requireWorker(s.syncCodexArchives))
 		mux.HandleFunc("POST /worker/v1/thread-sync", s.requireWorker(s.syncCodexThreads))
+		mux.HandleFunc("POST /worker/v1/read-receipts/claim", s.requireWorker(s.claimCodexReadReceipts))
+		mux.HandleFunc("POST /worker/v1/read-receipts/ack", s.requireWorker(s.ackCodexReadReceipts))
 		log.Print("Codex worker API enabled at /worker/v1")
 	}
 	return mux
+}
+
+func (s *Server) claimCodexReadReceipts(w http.ResponseWriter, r *http.Request) {
+	ids, err := s.store.PendingCodexReadReceipts(r.Context(), 100)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeWorkerJSON(w, http.StatusOK, map[string]any{"thread_ids": ids})
+}
+
+func (s *Server) ackCodexReadReceipts(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		ThreadIDs []string `json:"thread_ids"`
+	}
+	if err := decodeWorkerJSON(r, &request); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.store.AckCodexReadReceipts(r.Context(), request.ThreadIDs); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) syncCodexThreads(w http.ResponseWriter, r *http.Request) {

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -63,7 +64,14 @@ func New(cfg Config) (*Worker, error) {
 
 func (w *Worker) Run(ctx context.Context) error {
 	nextThreadSync := time.Time{}
+	nextReadSync := time.Time{}
 	for {
+		if !time.Now().Before(nextReadSync) {
+			if err := w.syncReadReceipts(ctx); err != nil {
+				log.Printf("sync Telegram read receipts to Codex failed: %v", err)
+			}
+			nextReadSync = time.Now().Add(3 * time.Second)
+		}
 		if !time.Now().Before(nextThreadSync) {
 			if err := w.syncThreads(ctx); err != nil {
 				log.Printf("sync Codex tasks failed: %v", err)
@@ -91,6 +99,34 @@ func (w *Worker) Run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+func (w *Worker) syncReadReceipts(ctx context.Context) error {
+	var response struct {
+		ThreadIDs []string `json:"thread_ids"`
+	}
+	status, err := w.request(ctx, http.MethodPost, "/worker/v1/read-receipts/claim", map[string]any{}, &response)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("read receipt claim returned HTTP %d", status)
+	}
+	if len(response.ThreadIDs) == 0 {
+		return nil
+	}
+	if err := MarkCodexThreadsRead(ctx, codexStatePath(), response.ThreadIDs); err != nil {
+		return err
+	}
+	status, err = w.request(ctx, http.MethodPost, "/worker/v1/read-receipts/ack", map[string]any{"thread_ids": response.ThreadIDs}, nil)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusNoContent {
+		return fmt.Errorf("read receipt ack returned HTTP %d", status)
+	}
+	log.Printf("marked %d Codex tasks read from Telegram", len(response.ThreadIDs))
+	return nil
 }
 
 func (w *Worker) syncThreads(ctx context.Context) error {
@@ -583,13 +619,15 @@ func ListActiveThreadSnapshots(ctx context.Context, codexBin string, previous ma
 		cursor = *page.NextCursor
 	}
 
+	unreadStates, _ := readCodexUnreadStates(ctx, codexStatePath())
 	nextState := make(map[string]string, len(threads))
 	var snapshots []db.CodexThreadSnapshot
 	for _, thread := range threads {
 		if strings.TrimSpace(thread.ID) == "" || thread.ParentThreadID != nil {
 			continue
 		}
-		state := activeThreadState(thread)
+		unread, hasUnread := unreadStates[thread.ID]
+		state := activeThreadState(thread, unread, hasUnread)
 		nextState[thread.ID] = state
 		if previous[thread.ID] == state {
 			continue
@@ -619,9 +657,14 @@ func ListActiveThreadSnapshots(ctx context.Context, codexBin string, previous ma
 		if title == "" {
 			title = "Codex task"
 		}
+		var unreadPtr *bool
+		if hasUnread {
+			value := unread
+			unreadPtr = &value
+		}
 		snapshots = append(snapshots, db.CodexThreadSnapshot{
 			CodexThreadID: thread.ID, Title: title, CWD: thread.CWD, Status: status,
-			ActiveFlags: thread.Status.ActiveFlags, MessageRole: role, Message: message, UpdatedAt: thread.UpdatedAt,
+			ActiveFlags: thread.Status.ActiveFlags, MessageRole: role, Message: message, UpdatedAt: thread.UpdatedAt, Unread: unreadPtr,
 		})
 	}
 	return snapshots, nextState, nil
@@ -656,13 +699,63 @@ func initializeAppServer(encoder *json.Encoder, reader *bufio.Reader) error {
 	return encoder.Encode(map[string]any{"jsonrpc": "2.0", "method": "initialized"})
 }
 
-func activeThreadState(thread appServerThread) string {
+func activeThreadState(thread appServerThread, unread bool, hasUnread bool) string {
 	name := ""
 	if thread.Name != nil {
 		name = *thread.Name
 	}
-	data, _ := json.Marshal([]any{thread.UpdatedAt, thread.CWD, name, thread.Preview, thread.Status.Type, thread.Status.ActiveFlags})
+	data, _ := json.Marshal([]any{thread.UpdatedAt, thread.CWD, name, thread.Preview, thread.Status.Type, thread.Status.ActiveFlags, unread, hasUnread})
 	return string(data)
+}
+
+func codexStatePath() string {
+	if home := strings.TrimSpace(os.Getenv("CODEX_HOME")); home != "" {
+		return filepath.Join(home, "state_5.sqlite")
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".codex", "state_5.sqlite")
+}
+
+func readCodexUnreadStates(ctx context.Context, path string) (map[string]bool, error) {
+	dbHandle, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(5000)")
+	if err != nil {
+		return nil, err
+	}
+	defer dbHandle.Close()
+	rows, err := dbHandle.QueryContext(ctx, `SELECT id, has_user_event FROM threads WHERE archived = 0`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	states := map[string]bool{}
+	for rows.Next() {
+		var id string
+		var unread bool
+		if err := rows.Scan(&id, &unread); err != nil {
+			return nil, err
+		}
+		states[id] = unread
+	}
+	return states, rows.Err()
+}
+
+func MarkCodexThreadsRead(ctx context.Context, path string, threadIDs []string) error {
+	dbHandle, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		return err
+	}
+	defer dbHandle.Close()
+	tx, err := dbHandle.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, id := range threadIDs {
+		if _, err := tx.ExecContext(ctx, `UPDATE threads SET has_user_event = 0 WHERE id = ?`, strings.TrimSpace(id)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func lastVisibleMessage(thread appServerThread) (string, string) {

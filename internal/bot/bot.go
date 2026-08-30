@@ -212,6 +212,13 @@ func (s *Service) handleUpdate(ctx context.Context, update telego.Update) error 
 	}
 	if text != "" && !strings.HasPrefix(text, "/") {
 		if message.MessageThreadID > 0 {
+			mirrored, err := s.store.ConsumeCodexOutboundMessage(ctx, message.Chat.ID, message.MessageThreadID, message.MessageID, text)
+			if err != nil {
+				return err
+			}
+			if mirrored {
+				return nil
+			}
 			handled, err := s.handleCodexContinuation(ctx, message, text)
 			if handled || err != nil {
 				return err
@@ -650,12 +657,16 @@ func (s *Service) SyncCodexThreads(ctx context.Context, snapshots []db.CodexThre
 		}
 
 		text := formatCodexSnapshot(snapshot)
-		hash := fmt.Sprintf("%x", sha256.Sum256([]byte(topicTitle+"\x00"+text)))
+		hash := fmt.Sprintf("%x", sha256.Sum256([]byte(topicTitle+"\x00"+snapshot.MessageRole+"\x00"+text)))
 		if mirror.ContentHash == hash && mirror.TelegramMessageID > 0 {
+			if err := s.markCodexMirrorRead(ctx, mirror, snapshot, mirror.TelegramMessageID); err != nil {
+				failures = append(failures, err)
+				continue
+			}
 			result.Skipped++
 			continue
 		}
-		messageID, err := s.replaceCodexMirrorMessage(ctx, mirror, text)
+		messageID, err := s.replaceCodexMirrorMessage(ctx, mirror, snapshot, text)
 		if err != nil {
 			failures = append(failures, err)
 			continue
@@ -664,6 +675,9 @@ func (s *Service) SyncCodexThreads(ctx context.Context, snapshots []db.CodexThre
 			failures = append(failures, err)
 			continue
 		}
+		if err := s.markCodexMirrorRead(ctx, mirror, snapshot, messageID); err != nil {
+			failures = append(failures, err)
+		}
 		if exists {
 			result.Updated++
 		}
@@ -671,7 +685,18 @@ func (s *Service) SyncCodexThreads(ctx context.Context, snapshots []db.CodexThre
 	return result, errors.Join(failures...)
 }
 
-func (s *Service) replaceCodexMirrorMessage(ctx context.Context, mirror db.CodexThreadMirror, text string) (int, error) {
+func (s *Service) markCodexMirrorRead(ctx context.Context, mirror db.CodexThreadMirror, snapshot db.CodexThreadSnapshot, messageID int) error {
+	if snapshot.Unread == nil || *snapshot.Unread || s.monitorService == nil || messageID <= 0 {
+		return nil
+	}
+	project, ok, err := s.store.GetCodexProjectByChatID(ctx, mirror.Thread.TelegramChatID)
+	if err != nil || !ok {
+		return err
+	}
+	return s.monitorService.MarkCodexTopicRead(ctx, project, mirror.Thread.TelegramTopicID, messageID)
+}
+
+func (s *Service) replaceCodexMirrorMessage(ctx context.Context, mirror db.CodexThreadMirror, snapshot db.CodexThreadSnapshot, text string) (int, error) {
 	if mirror.TelegramMessageID > 0 {
 		err := s.bot.DeleteMessage(ctx, &telego.DeleteMessageParams{
 			ChatID: telego.ChatID{ID: mirror.Thread.TelegramChatID}, MessageID: mirror.TelegramMessageID,
@@ -686,6 +711,19 @@ func (s *Service) replaceCodexMirrorMessage(ctx context.Context, mirror db.Codex
 			}
 			return 0, fmt.Errorf("replace Codex mirror message: delete: %v; edit: %w", err, editErr)
 		}
+	}
+	if snapshot.MessageRole == "user" && strings.TrimSpace(snapshot.Message) != "" {
+		if s.monitorService == nil {
+			return 0, errors.New("Telegram user API is unavailable")
+		}
+		project, ok, err := s.store.GetCodexProjectByChatID(ctx, mirror.Thread.TelegramChatID)
+		if err != nil {
+			return 0, err
+		}
+		if !ok {
+			return 0, fmt.Errorf("Codex Telegram project for chat %d not found", mirror.Thread.TelegramChatID)
+		}
+		return s.monitorService.SendCodexMessage(ctx, project, mirror.Thread.TelegramTopicID, truncateUTF16(snapshot.Message, 3600))
 	}
 	message, err := s.bot.SendMessage(ctx, &telego.SendMessageParams{
 		ChatID: telego.ChatID{ID: mirror.Thread.TelegramChatID}, MessageThreadID: mirror.Thread.TelegramTopicID,

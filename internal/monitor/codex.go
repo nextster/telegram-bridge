@@ -2,16 +2,101 @@ package monitor
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"strings"
 
+	"github.com/gotd/td/telegram/message"
+	telegrammarkdown "github.com/gotd/td/telegram/message/markdown"
 	"github.com/gotd/td/tg"
 
 	"github.com/nextster/telegram-bridge/internal/db"
 )
 
 const codexFolderTitle = "Codex"
+
+// SendCodexMessage mirrors a Codex user item through the authenticated user
+// session, so Telegram displays the actual account as its sender.
+func (s *Service) SendCodexMessage(ctx context.Context, project db.CodexProject, topicID int, markdown string) (int, error) {
+	markdown = strings.TrimSpace(markdown)
+	if project.TelegramChannelID <= 0 || project.TelegramAccessHash == 0 || topicID <= 0 || markdown == "" {
+		return 0, errors.New("invalid Codex user message destination")
+	}
+	api, _, err := s.readyAPI()
+	if err != nil {
+		return 0, err
+	}
+	if err := s.store.ReserveCodexOutboundMessage(ctx, project.TelegramChatID, topicID, markdown); err != nil {
+		return 0, err
+	}
+	peer := &tg.InputPeerChannel{ChannelID: project.TelegramChannelID, AccessHash: project.TelegramAccessHash}
+	updates, err := message.NewSender(api).To(peer).Reply(topicID).RandomID(codexRandomID()).StyledText(ctx, telegrammarkdown.String(nil, markdown))
+	if err != nil {
+		s.store.CancelCodexOutboundMessage(ctx, project.TelegramChatID, topicID)
+		return 0, fmt.Errorf("send Codex message as Telegram user: %w", err)
+	}
+	messageID := sentMessageID(updates)
+	if messageID <= 0 {
+		s.store.CancelCodexOutboundMessage(ctx, project.TelegramChatID, topicID)
+		return 0, fmt.Errorf("send Codex message: response %T has no message id", updates)
+	}
+	if err := s.store.CompleteCodexOutboundMessage(ctx, project.TelegramChatID, topicID, messageID, markdown); err != nil {
+		return 0, err
+	}
+	return messageID, nil
+}
+
+func (s *Service) MarkCodexTopicRead(ctx context.Context, project db.CodexProject, topicID, readMaxID int) error {
+	if readMaxID <= 0 {
+		return nil
+	}
+	api, _, err := s.readyAPI()
+	if err != nil {
+		return err
+	}
+	_, err = api.MessagesReadDiscussion(ctx, &tg.MessagesReadDiscussionRequest{
+		Peer:  &tg.InputPeerChannel{ChannelID: project.TelegramChannelID, AccessHash: project.TelegramAccessHash},
+		MsgID: topicID, ReadMaxID: readMaxID,
+	})
+	if err != nil {
+		return fmt.Errorf("mark Codex Telegram topic read: %w", err)
+	}
+	return nil
+}
+
+func codexRandomID() int64 {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		return int64(binary.LittleEndian.Uint64(b[:]))
+	}
+	return 0
+}
+
+func sentMessageID(updates tg.UpdatesClass) int {
+	switch typed := updates.(type) {
+	case *tg.UpdateShortSentMessage:
+		return typed.ID
+	case *tg.Updates:
+		return sentMessageIDFromUpdates(typed.Updates)
+	case *tg.UpdatesCombined:
+		return sentMessageIDFromUpdates(typed.Updates)
+	}
+	return 0
+}
+
+func sentMessageIDFromUpdates(updates []tg.UpdateClass) int {
+	for _, update := range updates {
+		switch typed := update.(type) {
+		case *tg.UpdateNewMessage:
+			return typed.Message.GetID()
+		case *tg.UpdateNewChannelMessage:
+			return typed.Message.GetID()
+		}
+	}
+	return 0
+}
 
 // EnsureCodexProject creates the Telegram-side project container through the
 // already-authorized user session. It never starts a second gotd client.

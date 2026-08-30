@@ -627,6 +627,8 @@ func (h *Handler) Handle(ctx context.Context, update tg.UpdatesClass) error {
 
 func (h *Handler) handleUpdate(ctx context.Context, update tg.UpdateClass, privateDialogs map[int64]db.PrivateDialog) error {
 	switch typed := update.(type) {
+	case *tg.UpdateReadChannelDiscussionInbox:
+		return h.store.RecordCodexReadReceiptByTopic(ctx, botAPIChannelID(typed.ChannelID), typed.TopMsgID)
 	case *tg.UpdateNewMessage:
 		return h.handleMessageClass(ctx, typed.Message, privateDialogs)
 	case *tg.UpdateNewChannelMessage:

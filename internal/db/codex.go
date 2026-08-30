@@ -42,6 +42,7 @@ type CodexThreadSnapshot struct {
 	MessageRole   string   `json:"message_role,omitempty"`
 	Message       string   `json:"message,omitempty"`
 	UpdatedAt     int64    `json:"updated_at"`
+	Unread        *bool    `json:"unread,omitempty"`
 }
 
 type CodexThreadMirror struct {
@@ -218,6 +219,102 @@ func (s *Store) SaveCodexThreadMirror(ctx context.Context, threadID int64, cwd s
 		return fmt.Errorf("save Codex thread mirror: %w", err)
 	}
 	return nil
+}
+
+func (s *Store) RecordCodexReadReceiptByTopic(ctx context.Context, telegramChatID int64, telegramTopicID int) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO codex_read_receipts(thread_id, requested_at, delivered_at)
+		SELECT id, ?, '' FROM codex_threads
+		WHERE telegram_chat_id = ? AND telegram_topic_id = ?
+		ON CONFLICT(thread_id) DO UPDATE SET requested_at = excluded.requested_at, delivered_at = ''
+	`, nowText(), telegramChatID, telegramTopicID)
+	if err != nil {
+		return fmt.Errorf("record Codex read receipt: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) PendingCodexReadReceipts(ctx context.Context, limit int) ([]string, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT COALESCE(NULLIF(t.codex_thread_id, ''), a.codex_thread_id)
+		FROM codex_read_receipts r
+		JOIN codex_threads t ON t.id = r.thread_id
+		LEFT JOIN codex_thread_aliases a ON a.thread_id = t.id
+		WHERE r.delivered_at = ''
+		GROUP BY t.id
+		ORDER BY r.requested_at
+		LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list Codex read receipts: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		if id = strings.TrimSpace(id); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids, rows.Err()
+}
+
+func (s *Store) AckCodexReadReceipts(ctx context.Context, threadIDs []string) error {
+	for _, id := range threadIDs {
+		if _, err := s.db.ExecContext(ctx, `
+			UPDATE codex_read_receipts SET delivered_at = ? WHERE thread_id IN (
+				SELECT thread_id FROM codex_thread_aliases WHERE codex_thread_id = ?
+				UNION SELECT id FROM codex_threads WHERE codex_thread_id = ?
+			)
+		`, nowText(), strings.TrimSpace(id), strings.TrimSpace(id)); err != nil {
+			return fmt.Errorf("ack Codex read receipt: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) ReserveCodexOutboundMessage(ctx context.Context, chatID int64, topicID int, text string) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT OR REPLACE INTO codex_outbound_messages(telegram_chat_id, telegram_topic_id, telegram_message_id, text, created_at)
+		VALUES(?, ?, 0, ?, ?)
+	`, chatID, topicID, text, nowText())
+	return err
+}
+
+func (s *Store) CompleteCodexOutboundMessage(ctx context.Context, chatID int64, topicID, messageID int, text string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM codex_outbound_messages WHERE telegram_chat_id = ? AND telegram_topic_id = ? AND telegram_message_id = 0`, chatID, topicID)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT OR REPLACE INTO codex_outbound_messages(telegram_chat_id, telegram_topic_id, telegram_message_id, text, created_at)
+		VALUES(?, ?, ?, ?, ?)
+	`, chatID, topicID, messageID, text, nowText())
+	return err
+}
+
+func (s *Store) CancelCodexOutboundMessage(ctx context.Context, chatID int64, topicID int) {
+	_, _ = s.db.ExecContext(ctx, `DELETE FROM codex_outbound_messages WHERE telegram_chat_id = ? AND telegram_topic_id = ? AND telegram_message_id = 0`, chatID, topicID)
+}
+
+func (s *Store) ConsumeCodexOutboundMessage(ctx context.Context, chatID int64, topicID, messageID int, text string) (bool, error) {
+	cutoff := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano)
+	res, err := s.db.ExecContext(ctx, `
+		DELETE FROM codex_outbound_messages
+		WHERE telegram_chat_id = ? AND telegram_topic_id = ? AND created_at >= ?
+		AND (telegram_message_id = ? OR (telegram_message_id = 0 AND text = ?))
+	`, chatID, topicID, cutoff, messageID, text)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
 }
 
 func (s *Store) SetCodexThreadTitle(ctx context.Context, threadID int64, title string) error {

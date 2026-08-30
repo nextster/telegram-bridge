@@ -376,6 +376,20 @@ var schema = []string{
 		updated_at TEXT NOT NULL,
 		FOREIGN KEY(thread_id) REFERENCES codex_threads(id) ON DELETE CASCADE
 	)`,
+	`CREATE TABLE IF NOT EXISTS codex_read_receipts (
+		thread_id INTEGER PRIMARY KEY,
+		requested_at TEXT NOT NULL,
+		delivered_at TEXT NOT NULL DEFAULT '',
+		FOREIGN KEY(thread_id) REFERENCES codex_threads(id) ON DELETE CASCADE
+	)`,
+	`CREATE TABLE IF NOT EXISTS codex_outbound_messages (
+		telegram_chat_id INTEGER NOT NULL,
+		telegram_topic_id INTEGER NOT NULL,
+		telegram_message_id INTEGER NOT NULL DEFAULT 0,
+		text TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		PRIMARY KEY(telegram_chat_id, telegram_topic_id, telegram_message_id)
+	)`,
 	`CREATE TABLE IF NOT EXISTS codex_jobs (
 		id TEXT PRIMARY KEY,
 		thread_id INTEGER NOT NULL,
