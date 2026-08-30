@@ -231,3 +231,33 @@ func TestFormatEventIsConcise(t *testing.T) {
 		t.Fatalf("formatEvent() = %q", got)
 	}
 }
+
+func TestFormatCodexSnapshotPreservesUsefulMarkdown(t *testing.T) {
+	got := formatCodexSnapshot(db.CodexThreadSnapshot{
+		CWD: "/path/to/telegram-bridge", Status: "active",
+		MessageRole: "assistant",
+		Message:     "**Done** with [details](https://example.com).\n\n- one\n- `two`\n\n```go\nfmt.Println(\"ok\")\n```",
+	})
+	for _, want := range []string{
+		"⏳ working · <code>telegram-bridge</code>",
+		"<b>Done</b>",
+		"<a href=\"https://example.com\">details</a>",
+		"• one",
+		"<code>two</code>",
+		"<pre><code class=\"language-go\">fmt.Println(&#34;ok&#34;)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatted snapshot does not contain %q: %s", want, got)
+		}
+	}
+}
+
+func TestFormatCodexSnapshotHighlightsWaitingForUser(t *testing.T) {
+	got := formatCodexSnapshot(db.CodexThreadSnapshot{
+		CWD: "/tmp/project", Status: "active", ActiveFlags: []string{"waitingOnUserInput"},
+		MessageRole: "user", Message: "Which one?",
+	})
+	if got != "🙋 waiting for you · <code>project</code> · you\n\nWhich one?" {
+		t.Fatalf("formatCodexSnapshot() = %q", got)
+	}
+}

@@ -28,8 +28,26 @@ type CodexThread struct {
 	TelegramTopicID int       `json:"telegram_topic_id"`
 	Title           string    `json:"title"`
 	CodexThreadID   string    `json:"codex_thread_id"`
+	CWD             string    `json:"cwd,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
+}
+
+type CodexThreadSnapshot struct {
+	CodexThreadID string   `json:"thread_id"`
+	Title         string   `json:"title"`
+	CWD           string   `json:"cwd"`
+	Status        string   `json:"status"`
+	ActiveFlags   []string `json:"active_flags,omitempty"`
+	MessageRole   string   `json:"message_role,omitempty"`
+	Message       string   `json:"message,omitempty"`
+	UpdatedAt     int64    `json:"updated_at"`
+}
+
+type CodexThreadMirror struct {
+	Thread            CodexThread
+	TelegramMessageID int
+	ContentHash       string
 }
 
 type CodexJob struct {
@@ -136,6 +154,62 @@ func (s *Store) GetCodexThreadByTopic(ctx context.Context, chatID int64, topicID
 		SELECT id, project_slug, telegram_chat_id, telegram_topic_id, title, codex_thread_id, created_at, updated_at
 		FROM codex_threads WHERE telegram_chat_id = ? AND telegram_topic_id = ?
 	`, chatID, topicID))
+}
+
+func (s *Store) GetCodexThreadMirrorByCodexID(ctx context.Context, codexThreadID string) (CodexThreadMirror, bool, error) {
+	var mirror CodexThreadMirror
+	var created, updated string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT t.id, t.project_slug, t.telegram_chat_id, t.telegram_topic_id, t.title,
+			t.codex_thread_id, t.created_at, t.updated_at,
+			COALESCE(m.cwd, ''), COALESCE(m.telegram_message_id, 0), COALESCE(m.content_hash, '')
+		FROM codex_thread_aliases a
+		JOIN codex_threads t ON t.id = a.thread_id
+		LEFT JOIN codex_thread_mirrors m ON m.thread_id = t.id
+		WHERE a.codex_thread_id = ?
+	`, strings.TrimSpace(codexThreadID)).Scan(&mirror.Thread.ID, &mirror.Thread.ProjectSlug,
+		&mirror.Thread.TelegramChatID, &mirror.Thread.TelegramTopicID, &mirror.Thread.Title,
+		&mirror.Thread.CodexThreadID, &created, &updated, &mirror.Thread.CWD,
+		&mirror.TelegramMessageID, &mirror.ContentHash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CodexThreadMirror{}, false, nil
+	}
+	if err != nil {
+		return CodexThreadMirror{}, false, fmt.Errorf("get Codex thread mirror: %w", err)
+	}
+	mirror.Thread.CreatedAt, mirror.Thread.UpdatedAt = parseDBTime(created), parseDBTime(updated)
+	return mirror, true, nil
+}
+
+func (s *Store) IsCodexTopicDeleted(ctx context.Context, threadID int64) (bool, error) {
+	var exists int
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM codex_deleted_topics WHERE thread_id = ?)`, threadID).Scan(&exists)
+	return exists != 0, err
+}
+
+func (s *Store) SaveCodexThreadMirror(ctx context.Context, threadID int64, cwd string, telegramMessageID int, contentHash string) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO codex_thread_mirrors(thread_id, cwd, telegram_message_id, content_hash, updated_at)
+		VALUES(?, ?, ?, ?, ?)
+		ON CONFLICT(thread_id) DO UPDATE SET
+			cwd = excluded.cwd,
+			telegram_message_id = CASE WHEN excluded.telegram_message_id > 0 THEN excluded.telegram_message_id ELSE codex_thread_mirrors.telegram_message_id END,
+			content_hash = excluded.content_hash,
+			updated_at = excluded.updated_at
+	`, threadID, strings.TrimSpace(cwd), telegramMessageID, strings.TrimSpace(contentHash), nowText())
+	if err != nil {
+		return fmt.Errorf("save Codex thread mirror: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) SetCodexThreadTitle(ctx context.Context, threadID int64, title string) error {
+	_, err := s.db.ExecContext(ctx, "UPDATE codex_threads SET title = ?, updated_at = ? WHERE id = ?",
+		strings.TrimSpace(title), nowText(), threadID)
+	if err != nil {
+		return fmt.Errorf("set Codex thread title: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) SetCodexThreadID(ctx context.Context, threadID int64, codexThreadID string) error {
@@ -258,7 +332,7 @@ func (s *Store) PendingArchivedCodexThreads(ctx context.Context, archivedIDs []s
 		JOIN codex_thread_aliases a ON a.thread_id = t.id
 		LEFT JOIN codex_deleted_topics d ON d.thread_id = t.id
 		WHERE d.thread_id IS NULL
-	`)
+`)
 	if err != nil {
 		return nil, fmt.Errorf("list pending archived Codex threads: %w", err)
 	}
@@ -335,8 +409,10 @@ func (s *Store) RetryCodexJob(ctx context.Context, id string) error {
 const codexJobSelect = `
 	SELECT j.id, j.thread_id, j.prompt, j.status, j.worker_id, j.lease_token, j.lease_expires_at,
 		j.result, j.error, j.created_at, j.updated_at, j.started_at, j.finished_at,
-		t.id, t.project_slug, t.telegram_chat_id, t.telegram_topic_id, t.title, t.codex_thread_id, t.created_at, t.updated_at
-	FROM codex_jobs j JOIN codex_threads t ON t.id = j.thread_id`
+		t.id, t.project_slug, t.telegram_chat_id, t.telegram_topic_id, t.title, t.codex_thread_id, t.created_at, t.updated_at,
+		COALESCE(m.cwd, '')
+	FROM codex_jobs j JOIN codex_threads t ON t.id = j.thread_id
+	LEFT JOIN codex_thread_mirrors m ON m.thread_id = t.id`
 
 type rowScanner interface{ Scan(...any) error }
 
@@ -345,7 +421,8 @@ func scanCodexJob(row rowScanner) (CodexJob, error) {
 	var leaseExpires, created, updated, started, finished, threadCreated, threadUpdated string
 	err := row.Scan(&j.ID, &j.ThreadID, &j.Prompt, &j.Status, &j.WorkerID, &j.LeaseToken, &leaseExpires,
 		&j.Result, &j.Error, &created, &updated, &started, &finished,
-		&j.Thread.ID, &j.Thread.ProjectSlug, &j.Thread.TelegramChatID, &j.Thread.TelegramTopicID, &j.Thread.Title, &j.Thread.CodexThreadID, &threadCreated, &threadUpdated)
+		&j.Thread.ID, &j.Thread.ProjectSlug, &j.Thread.TelegramChatID, &j.Thread.TelegramTopicID, &j.Thread.Title, &j.Thread.CodexThreadID, &threadCreated, &threadUpdated,
+		&j.Thread.CWD)
 	if err != nil {
 		return CodexJob{}, fmt.Errorf("scan Codex job: %w", err)
 	}

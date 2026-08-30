@@ -2,14 +2,18 @@ package bot
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf16"
 
 	"github.com/mymmrac/telego"
+	"github.com/mymmrac/telego/telegoapi"
 	tu "github.com/mymmrac/telego/telegoutil"
 
 	"github.com/nextster/telegram-bridge/internal/config"
@@ -32,11 +36,24 @@ type CodexTask struct {
 	Link    string          `json:"link"`
 }
 
+type CodexSyncResult struct {
+	Created int `json:"created"`
+	Updated int `json:"updated"`
+	Skipped int `json:"skipped"`
+}
+
 func New(cfg config.Config, store *db.Store) (*Service, error) {
 	if strings.TrimSpace(cfg.BotToken) == "" {
 		return nil, errors.New("bot token is empty")
 	}
-	b, err := telego.NewBot(cfg.BotToken)
+	b, err := telego.NewBot(cfg.BotToken, telego.WithAPICaller(&telegoapi.RetryCaller{
+		Caller:       telegoapi.HTTPCaller{Client: &http.Client{}},
+		MaxAttempts:  5,
+		ExponentBase: 2,
+		StartDelay:   time.Second,
+		MaxDelay:     2 * time.Minute,
+		RateLimit:    telegoapi.RetryRateLimitWait,
+	}))
 	if err != nil {
 		return nil, fmt.Errorf("create bot: %w", err)
 	}
@@ -530,6 +547,148 @@ func (s *Service) SendCodexJobResult(ctx context.Context, job db.CodexJob) error
 		text = "Codex finished without a text response."
 	}
 	return s.replyTopic(ctx, job.Thread.TelegramChatID, job.Thread.TelegramTopicID, text)
+}
+
+func (s *Service) SyncCodexThreads(ctx context.Context, snapshots []db.CodexThreadSnapshot) (CodexSyncResult, error) {
+	var result CodexSyncResult
+	var dashboard db.CodexProject
+	var dashboardReady bool
+	var failures []error
+
+	for _, snapshot := range snapshots {
+		snapshot.CodexThreadID = strings.TrimSpace(snapshot.CodexThreadID)
+		snapshot.Title = strings.TrimSpace(snapshot.Title)
+		snapshot.CWD = strings.TrimSpace(snapshot.CWD)
+		if snapshot.CodexThreadID == "" || snapshot.CWD == "" {
+			result.Skipped++
+			continue
+		}
+		mirror, exists, err := s.store.GetCodexThreadMirrorByCodexID(ctx, snapshot.CodexThreadID)
+		if err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		if exists && mirror.Thread.CodexThreadID != "" && mirror.Thread.CodexThreadID != snapshot.CodexThreadID {
+			// A fallback fork is the canonical continuation of this Telegram
+			// topic; do not let its still-listed ancestor overwrite it.
+			result.Skipped++
+			continue
+		}
+		if exists {
+			deleted, err := s.store.IsCodexTopicDeleted(ctx, mirror.Thread.ID)
+			if err != nil {
+				failures = append(failures, err)
+				continue
+			}
+			if deleted {
+				result.Skipped++
+				continue
+			}
+		} else {
+			if !dashboardReady {
+				if s.monitorService == nil {
+					failures = append(failures, errors.New("Telegram user API is unavailable"))
+					break
+				}
+				identity, err := s.bot.GetMe(ctx)
+				if err != nil {
+					failures = append(failures, fmt.Errorf("get bot identity: %w", err))
+					break
+				}
+				dashboard, err = s.monitorService.EnsureCodexProject(ctx, "_active", "Active", identity.Username)
+				if err != nil {
+					failures = append(failures, err)
+					break
+				}
+				dashboardReady = true
+			}
+			topicTitle := codexTopicTitle(snapshot.Title)
+			topic, err := s.bot.CreateForumTopic(ctx, &telego.CreateForumTopicParams{
+				ChatID: telego.ChatID{ID: dashboard.TelegramChatID}, Name: topicTitle, IconColor: 0x6FB9F0,
+			})
+			if err != nil {
+				failures = append(failures, fmt.Errorf("create Codex mirror topic: %w", err))
+				continue
+			}
+			thread, err := s.store.CreateCodexThread(ctx, db.CodexThread{
+				ProjectSlug: dashboard.Slug, TelegramChatID: dashboard.TelegramChatID,
+				TelegramTopicID: topic.MessageThreadID, Title: topicTitle,
+			})
+			if err != nil {
+				failures = append(failures, err)
+				continue
+			}
+			if err := s.store.SetCodexThreadID(ctx, thread.ID, snapshot.CodexThreadID); err != nil {
+				failures = append(failures, err)
+				continue
+			}
+			thread.CodexThreadID = snapshot.CodexThreadID
+			mirror = db.CodexThreadMirror{Thread: thread}
+			result.Created++
+		}
+
+		topicTitle := codexTopicTitle(snapshot.Title)
+		if topicTitle != mirror.Thread.Title {
+			if err := s.bot.EditForumTopic(ctx, &telego.EditForumTopicParams{
+				ChatID:          telego.ChatID{ID: mirror.Thread.TelegramChatID},
+				MessageThreadID: mirror.Thread.TelegramTopicID,
+				Name:            topicTitle,
+			}); err != nil {
+				failures = append(failures, fmt.Errorf("rename Codex mirror topic: %w", err))
+				continue
+			}
+			if err := s.store.SetCodexThreadTitle(ctx, mirror.Thread.ID, topicTitle); err != nil {
+				failures = append(failures, err)
+				continue
+			}
+		}
+
+		text := formatCodexSnapshot(snapshot)
+		hash := fmt.Sprintf("%x", sha256.Sum256([]byte(topicTitle+"\x00"+text)))
+		if mirror.ContentHash == hash && mirror.TelegramMessageID > 0 {
+			result.Skipped++
+			continue
+		}
+		messageID, err := s.replaceCodexMirrorMessage(ctx, mirror, text)
+		if err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		if err := s.store.SaveCodexThreadMirror(ctx, mirror.Thread.ID, snapshot.CWD, messageID, hash); err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		if exists {
+			result.Updated++
+		}
+	}
+	return result, errors.Join(failures...)
+}
+
+func (s *Service) replaceCodexMirrorMessage(ctx context.Context, mirror db.CodexThreadMirror, text string) (int, error) {
+	if mirror.TelegramMessageID > 0 {
+		err := s.bot.DeleteMessage(ctx, &telego.DeleteMessageParams{
+			ChatID: telego.ChatID{ID: mirror.Thread.TelegramChatID}, MessageID: mirror.TelegramMessageID,
+		})
+		if err != nil {
+			_, editErr := s.bot.EditMessageText(ctx, &telego.EditMessageTextParams{
+				ChatID: telego.ChatID{ID: mirror.Thread.TelegramChatID}, MessageID: mirror.TelegramMessageID,
+				Text: text, ParseMode: "HTML",
+			})
+			if editErr == nil || strings.Contains(strings.ToLower(editErr.Error()), "message is not modified") {
+				return mirror.TelegramMessageID, nil
+			}
+			return 0, fmt.Errorf("replace Codex mirror message: delete: %v; edit: %w", err, editErr)
+		}
+	}
+	message, err := s.bot.SendMessage(ctx, &telego.SendMessageParams{
+		ChatID: telego.ChatID{ID: mirror.Thread.TelegramChatID}, MessageThreadID: mirror.Thread.TelegramTopicID,
+		Text: text, ParseMode: "HTML", DisableNotification: true,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("send Codex mirror message: %w", err)
+	}
+	return message.MessageID, nil
 }
 
 func (s *Service) DeleteArchivedCodexTopics(ctx context.Context, archivedThreadIDs []string) (int, error) {

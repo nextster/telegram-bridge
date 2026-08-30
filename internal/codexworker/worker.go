@@ -31,7 +31,8 @@ type Config struct {
 }
 
 type Worker struct {
-	cfg Config
+	cfg               Config
+	activeThreadState map[string]string
 }
 
 func New(cfg Config) (*Worker, error) {
@@ -49,7 +50,7 @@ func New(cfg Config) (*Worker, error) {
 		cfg.Poll = 3 * time.Second
 	}
 	if cfg.Client == nil {
-		cfg.Client = &http.Client{Timeout: 45 * time.Second}
+		cfg.Client = &http.Client{Timeout: 3 * time.Minute}
 	}
 	if strings.TrimSpace(cfg.CodexBin) == "" {
 		cfg.CodexBin = "codex"
@@ -57,17 +58,17 @@ func New(cfg Config) (*Worker, error) {
 	for slug, path := range cfg.Projects {
 		cfg.Projects[strings.ToLower(strings.TrimSpace(slug))] = strings.TrimSpace(path)
 	}
-	return &Worker{cfg: cfg}, nil
+	return &Worker{cfg: cfg, activeThreadState: make(map[string]string)}, nil
 }
 
 func (w *Worker) Run(ctx context.Context) error {
-	nextArchiveSync := time.Time{}
+	nextThreadSync := time.Time{}
 	for {
-		if !time.Now().Before(nextArchiveSync) {
-			if err := w.syncArchived(ctx); err != nil {
-				log.Printf("sync archived Codex tasks failed: %v", err)
+		if !time.Now().Before(nextThreadSync) {
+			if err := w.syncThreads(ctx); err != nil {
+				log.Printf("sync Codex tasks failed: %v", err)
 			}
-			nextArchiveSync = time.Now().Add(30 * time.Second)
+			nextThreadSync = time.Now().Add(30 * time.Second)
 		}
 		job, ok, err := w.claim(ctx)
 		if err != nil {
@@ -90,6 +91,33 @@ func (w *Worker) Run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+func (w *Worker) syncThreads(ctx context.Context) error {
+	if err := w.syncArchived(ctx); err != nil {
+		return err
+	}
+	snapshots, state, err := ListActiveThreadSnapshots(ctx, w.cfg.CodexBin, w.activeThreadState)
+	if err != nil {
+		return err
+	}
+	if len(snapshots) > 0 {
+		var response struct {
+			Created int `json:"created"`
+			Updated int `json:"updated"`
+			Skipped int `json:"skipped"`
+		}
+		status, err := w.request(ctx, http.MethodPost, "/worker/v1/thread-sync", map[string]any{"threads": snapshots}, &response)
+		if err != nil {
+			return err
+		}
+		if status != http.StatusOK {
+			return fmt.Errorf("thread sync returned HTTP %d", status)
+		}
+		log.Printf("synced Codex tasks to Telegram: %d created, %d updated, %d skipped", response.Created, response.Updated, response.Skipped)
+	}
+	w.activeThreadState = state
+	return nil
 }
 
 func (w *Worker) syncArchived(ctx context.Context) error {
@@ -122,7 +150,10 @@ func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 }
 
 func (w *Worker) runJob(ctx context.Context, job db.CodexJob) error {
-	cwd := w.cfg.Projects[strings.ToLower(job.Thread.ProjectSlug)]
+	cwd := strings.TrimSpace(job.Thread.CWD)
+	if cwd == "" {
+		cwd = w.cfg.Projects[strings.ToLower(job.Thread.ProjectSlug)]
+	}
 	if cwd == "" {
 		err := fmt.Sprintf("No local path configured for project %q", job.Thread.ProjectSlug)
 		return w.finish(ctx, job, "", err)
@@ -469,6 +500,217 @@ func ListArchivedThreadIDs(ctx context.Context, codexBin string) ([]string, erro
 		}
 		cursor = *page.NextCursor
 	}
+}
+
+type appServerThread struct {
+	ID             string  `json:"id"`
+	Name           *string `json:"name"`
+	Preview        string  `json:"preview"`
+	CWD            string  `json:"cwd"`
+	UpdatedAt      int64   `json:"updatedAt"`
+	ParentThreadID *string `json:"parentThreadId"`
+	Status         struct {
+		Type        string   `json:"type"`
+		ActiveFlags []string `json:"activeFlags"`
+	} `json:"status"`
+	Turns []struct {
+		Status string            `json:"status"`
+		Items  []json.RawMessage `json:"items"`
+	} `json:"turns"`
+}
+
+// ListActiveThreadSnapshots returns only tasks whose visible state changed
+// since the caller's previous successful sync. It still lists the complete
+// non-archived task set so removed or archived IDs fall out of nextState.
+func ListActiveThreadSnapshots(ctx context.Context, codexBin string, previous map[string]string) ([]db.CodexThreadSnapshot, map[string]string, error) {
+	if strings.TrimSpace(codexBin) == "" {
+		codexBin = "codex"
+	}
+	cmd := exec.CommandContext(ctx, codexBin, "app-server", "--listen", "stdio://")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, nil, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, err
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return nil, nil, fmt.Errorf("start codex app-server for task sync: %w", err)
+	}
+	defer func() {
+		_ = stdin.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	}()
+	encoder := json.NewEncoder(stdin)
+	reader := bufio.NewReader(stdout)
+	if err := initializeAppServer(encoder, reader); err != nil {
+		return nil, nil, appServerError(err, stderr.String())
+	}
+
+	var threads []appServerThread
+	var cursor any
+	requestID := 2
+	for {
+		params := map[string]any{"archived": false, "limit": 100}
+		if cursor != nil {
+			params["cursor"] = cursor
+		}
+		if err := encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": requestID, "method": "thread/list", "params": params}); err != nil {
+			return nil, nil, err
+		}
+		response, err := waitResponse(reader, requestID)
+		requestID++
+		if err != nil {
+			return nil, nil, appServerError(err, stderr.String())
+		}
+		var page struct {
+			Data       []appServerThread `json:"data"`
+			NextCursor *string           `json:"nextCursor"`
+		}
+		if err := json.Unmarshal(response.Result, &page); err != nil {
+			return nil, nil, fmt.Errorf("decode active Codex tasks: %w", err)
+		}
+		threads = append(threads, page.Data...)
+		if page.NextCursor == nil || *page.NextCursor == "" {
+			break
+		}
+		cursor = *page.NextCursor
+	}
+
+	nextState := make(map[string]string, len(threads))
+	var snapshots []db.CodexThreadSnapshot
+	for _, thread := range threads {
+		if strings.TrimSpace(thread.ID) == "" || thread.ParentThreadID != nil {
+			continue
+		}
+		state := activeThreadState(thread)
+		nextState[thread.ID] = state
+		if previous[thread.ID] == state {
+			continue
+		}
+		if err := encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": requestID, "method": "thread/read", "params": map[string]any{
+			"threadId": thread.ID, "includeTurns": true,
+		}}); err != nil {
+			return nil, nil, err
+		}
+		response, err := waitResponse(reader, requestID)
+		requestID++
+		if err != nil {
+			return nil, nil, appServerError(err, stderr.String())
+		}
+		var read struct {
+			Thread appServerThread `json:"thread"`
+		}
+		if err := json.Unmarshal(response.Result, &read); err != nil {
+			return nil, nil, fmt.Errorf("decode Codex task %s: %w", thread.ID, err)
+		}
+		role, message := lastVisibleMessage(read.Thread)
+		status := effectiveThreadStatus(thread.Status.Type, read.Thread)
+		title := strings.TrimSpace(thread.Preview)
+		if thread.Name != nil && strings.TrimSpace(*thread.Name) != "" {
+			title = strings.TrimSpace(*thread.Name)
+		}
+		if title == "" {
+			title = "Codex task"
+		}
+		snapshots = append(snapshots, db.CodexThreadSnapshot{
+			CodexThreadID: thread.ID, Title: title, CWD: thread.CWD, Status: status,
+			ActiveFlags: thread.Status.ActiveFlags, MessageRole: role, Message: message, UpdatedAt: thread.UpdatedAt,
+		})
+	}
+	return snapshots, nextState, nil
+}
+
+func effectiveThreadStatus(listStatus string, thread appServerThread) string {
+	if listStatus != "" && listStatus != "notLoaded" {
+		return listStatus
+	}
+	if len(thread.Turns) == 0 {
+		return "idle"
+	}
+	switch thread.Turns[len(thread.Turns)-1].Status {
+	case "inProgress":
+		return "active"
+	case "failed":
+		return "systemError"
+	default:
+		return "idle"
+	}
+}
+
+func initializeAppServer(encoder *json.Encoder, reader *bufio.Reader) error {
+	if err := encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{
+		"clientInfo": map[string]string{"name": "telegram-bridge", "title": "Telegram Bridge", "version": "1"},
+	}}); err != nil {
+		return err
+	}
+	if _, err := waitResponse(reader, 1); err != nil {
+		return err
+	}
+	return encoder.Encode(map[string]any{"jsonrpc": "2.0", "method": "initialized"})
+}
+
+func activeThreadState(thread appServerThread) string {
+	name := ""
+	if thread.Name != nil {
+		name = *thread.Name
+	}
+	data, _ := json.Marshal([]any{thread.UpdatedAt, thread.CWD, name, thread.Preview, thread.Status.Type, thread.Status.ActiveFlags})
+	return string(data)
+}
+
+func lastVisibleMessage(thread appServerThread) (string, string) {
+	for turnIndex := len(thread.Turns) - 1; turnIndex >= 0; turnIndex-- {
+		items := thread.Turns[turnIndex].Items
+		for itemIndex := len(items) - 1; itemIndex >= 0; itemIndex-- {
+			var item struct {
+				Type    string `json:"type"`
+				Text    string `json:"text"`
+				Content []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+					Path string `json:"path"`
+					URL  string `json:"url"`
+					Name string `json:"name"`
+				} `json:"content"`
+			}
+			if json.Unmarshal(items[itemIndex], &item) != nil {
+				continue
+			}
+			switch item.Type {
+			case "agentMessage":
+				if text := strings.TrimSpace(item.Text); text != "" {
+					return "assistant", text
+				}
+			case "userMessage":
+				var parts []string
+				for _, content := range item.Content {
+					switch content.Type {
+					case "text":
+						parts = append(parts, strings.TrimSpace(content.Text))
+					case "image", "localImage":
+						parts = append(parts, "[image]")
+					case "audio", "localAudio":
+						parts = append(parts, "[audio]")
+					case "skill", "mention":
+						if content.Name != "" {
+							parts = append(parts, "[@"+content.Name+"]")
+						}
+					}
+				}
+				if text := strings.TrimSpace(strings.Join(parts, "\n")); text != "" {
+					return "user", text
+				}
+			}
+		}
+	}
+	return "", ""
 }
 
 func waitResponse(reader *bufio.Reader, id int) (rpcMessage, error) {

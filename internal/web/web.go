@@ -38,6 +38,7 @@ type CodexNotifier interface {
 	SendCodexJobResult(context.Context, db.CodexJob) error
 	CreateCodexTask(context.Context, string, string) (bot.CodexTask, error)
 	DeleteArchivedCodexTopics(context.Context, []string) (int, error)
+	SyncCodexThreads(context.Context, []db.CodexThreadSnapshot) (bot.CodexSyncResult, error)
 }
 
 type dashboardData struct {
@@ -148,9 +149,30 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("POST /worker/v1/jobs/{id}/retry", s.requireWorker(s.retryCodexJob))
 		mux.HandleFunc("POST /worker/v1/tasks", s.requireWorker(s.createCodexTask))
 		mux.HandleFunc("POST /worker/v1/archive-sync", s.requireWorker(s.syncCodexArchives))
+		mux.HandleFunc("POST /worker/v1/thread-sync", s.requireWorker(s.syncCodexThreads))
 		log.Print("Codex worker API enabled at /worker/v1")
 	}
 	return mux
+}
+
+func (s *Server) syncCodexThreads(w http.ResponseWriter, r *http.Request) {
+	if s.codexNotifier == nil {
+		http.Error(w, "Telegram bot is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	var request struct {
+		Threads []db.CodexThreadSnapshot `json:"threads"`
+	}
+	if err := decodeWorkerJSON(r, &request); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	result, err := s.codexNotifier.SyncCodexThreads(r.Context(), request.Threads)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	writeWorkerJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) syncCodexArchives(w http.ResponseWriter, r *http.Request) {

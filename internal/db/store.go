@@ -368,6 +368,14 @@ var schema = []string{
 		deleted_at TEXT NOT NULL,
 		FOREIGN KEY(thread_id) REFERENCES codex_threads(id) ON DELETE CASCADE
 	)`,
+	`CREATE TABLE IF NOT EXISTS codex_thread_mirrors (
+		thread_id INTEGER PRIMARY KEY,
+		cwd TEXT NOT NULL DEFAULT '',
+		telegram_message_id INTEGER NOT NULL DEFAULT 0,
+		content_hash TEXT NOT NULL DEFAULT '',
+		updated_at TEXT NOT NULL,
+		FOREIGN KEY(thread_id) REFERENCES codex_threads(id) ON DELETE CASCADE
+	)`,
 	`CREATE TABLE IF NOT EXISTS codex_jobs (
 		id TEXT PRIMARY KEY,
 		thread_id INTEGER NOT NULL,
