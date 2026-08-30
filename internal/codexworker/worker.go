@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -115,7 +114,7 @@ func (w *Worker) syncReadReceipts(ctx context.Context) error {
 	if len(response.ThreadIDs) == 0 {
 		return nil
 	}
-	if err := MarkCodexThreadsRead(ctx, codexStatePath(), response.ThreadIDs); err != nil {
+	if err := MarkCodexThreadsRead(codexGlobalStatePath(), response.ThreadIDs); err != nil {
 		return err
 	}
 	status, err = w.request(ctx, http.MethodPost, "/worker/v1/read-receipts/ack", map[string]any{"thread_ids": response.ThreadIDs}, nil)
@@ -619,7 +618,7 @@ func ListActiveThreadSnapshots(ctx context.Context, codexBin string, previous ma
 		cursor = *page.NextCursor
 	}
 
-	unreadStates, _ := readCodexUnreadStates(ctx, codexStatePath())
+	unreadStates, _ := readCodexUnreadStates(codexGlobalStatePath())
 	nextState := make(map[string]string, len(threads))
 	var snapshots []db.CodexThreadSnapshot
 	for _, thread := range threads {
@@ -708,54 +707,135 @@ func activeThreadState(thread appServerThread, unread bool, hasUnread bool) stri
 	return string(data)
 }
 
-func codexStatePath() string {
+func codexGlobalStatePath() string {
 	if home := strings.TrimSpace(os.Getenv("CODEX_HOME")); home != "" {
-		return filepath.Join(home, "state_5.sqlite")
+		return filepath.Join(home, ".codex-global-state.json")
 	}
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".codex", "state_5.sqlite")
+	return filepath.Join(home, ".codex", ".codex-global-state.json")
 }
 
-func readCodexUnreadStates(ctx context.Context, path string) (map[string]bool, error) {
-	dbHandle, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(5000)")
+const codexUnreadAtomKey = "unread-thread-ids-by-host-v1"
+
+func readCodexUnreadStates(path string) (map[string]bool, error) {
+	_, atoms, err := readCodexGlobalState(path)
 	if err != nil {
 		return nil, err
 	}
-	defer dbHandle.Close()
-	rows, err := dbHandle.QueryContext(ctx, `SELECT id, has_user_event FROM threads WHERE archived = 0`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	states := map[string]bool{}
-	for rows.Next() {
-		var id string
-		var unread bool
-		if err := rows.Scan(&id, &unread); err != nil {
-			return nil, err
+	var byHost map[string][]string
+	if raw := atoms[codexUnreadAtomKey]; len(raw) > 0 {
+		if err := json.Unmarshal(raw, &byHost); err != nil {
+			return nil, fmt.Errorf("decode Codex unread state: %w", err)
 		}
-		states[id] = unread
 	}
-	return states, rows.Err()
+	states := make(map[string]bool, len(byHost["local"]))
+	for _, id := range byHost["local"] {
+		if id = strings.TrimSpace(id); id != "" {
+			states[id] = true
+		}
+	}
+	return states, nil
 }
 
-func MarkCodexThreadsRead(ctx context.Context, path string, threadIDs []string) error {
-	dbHandle, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+func MarkCodexThreadsRead(path string, threadIDs []string) error {
+	root, atoms, err := readCodexGlobalState(path)
 	if err != nil {
 		return err
 	}
-	defer dbHandle.Close()
-	tx, err := dbHandle.BeginTx(ctx, nil)
-	if err != nil {
-		return err
+	var byHost map[string][]string
+	if raw := atoms[codexUnreadAtomKey]; len(raw) > 0 {
+		if err := json.Unmarshal(raw, &byHost); err != nil {
+			return fmt.Errorf("decode Codex unread state: %w", err)
+		}
 	}
-	defer tx.Rollback()
+	if byHost == nil {
+		byHost = make(map[string][]string)
+	}
+	read := make(map[string]struct{}, len(threadIDs))
 	for _, id := range threadIDs {
-		if _, err := tx.ExecContext(ctx, `UPDATE threads SET has_user_event = 0 WHERE id = ?`, strings.TrimSpace(id)); err != nil {
-			return err
+		if id = strings.TrimSpace(id); id != "" {
+			read[id] = struct{}{}
 		}
 	}
-	return tx.Commit()
+	local := byHost["local"]
+	kept := local[:0]
+	for _, id := range local {
+		if _, ok := read[id]; !ok {
+			kept = append(kept, id)
+		}
+	}
+	if len(kept) == len(local) {
+		return nil
+	}
+	byHost["local"] = kept
+	raw, err := json.Marshal(byHost)
+	if err != nil {
+		return err
+	}
+	atoms[codexUnreadAtomKey] = raw
+	atomsRaw, err := json.Marshal(atoms)
+	if err != nil {
+		return err
+	}
+	root["electron-persisted-atom-state"] = atomsRaw
+	return writeCodexGlobalState(path, root)
+}
+
+func readCodexGlobalState(path string) (map[string]json.RawMessage, map[string]json.RawMessage, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read Codex global state: %w", err)
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return nil, nil, fmt.Errorf("decode Codex global state: %w", err)
+	}
+	var atoms map[string]json.RawMessage
+	if raw := root["electron-persisted-atom-state"]; len(raw) > 0 {
+		if err := json.Unmarshal(raw, &atoms); err != nil {
+			return nil, nil, fmt.Errorf("decode Codex persisted atoms: %w", err)
+		}
+	}
+	if atoms == nil {
+		atoms = make(map[string]json.RawMessage)
+	}
+	return root, atoms, nil
+}
+
+func writeCodexGlobalState(path string, state map[string]json.RawMessage) error {
+	data, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".codex-global-state.*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(info.Mode().Perm()); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("replace Codex global state: %w", err)
+	}
+	return nil
 }
 
 func lastVisibleMessage(thread appServerThread) (string, string) {

@@ -1,43 +1,55 @@
 package codexworker
 
 import (
-	"context"
-	"database/sql"
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"testing"
-
-	_ "modernc.org/sqlite"
 )
 
 func TestCodexUnreadStateRoundTrip(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "state_5.sqlite")
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
+	path := filepath.Join(t.TempDir(), ".codex-global-state.json")
+	state := map[string]any{
+		"unrelated": map[string]any{"preserved": true},
+		"electron-persisted-atom-state": map[string]any{
+			codexUnreadAtomKey: map[string][]string{
+				"local":  {"thread-1", "thread-2"},
+				"remote": {"remote-thread"},
+			},
+		},
 	}
-	if _, err := db.Exec(`CREATE TABLE threads(id TEXT PRIMARY KEY, has_user_event INTEGER NOT NULL, archived INTEGER NOT NULL)`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`INSERT INTO threads VALUES('thread-1', 1, 0), ('archived', 1, 1)`); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
+	data, _ := json.Marshal(state)
+	if err := os.WriteFile(path, data, 0o640); err != nil {
 		t.Fatal(err)
 	}
 
-	states, err := readCodexUnreadStates(ctx, path)
+	states, err := readCodexUnreadStates(path)
 	if err != nil || !states["thread-1"] {
 		t.Fatalf("states=%v err=%v", states, err)
 	}
-	if _, ok := states["archived"]; ok {
-		t.Fatal("archived task was included")
-	}
-	if err := MarkCodexThreadsRead(ctx, path, []string{"thread-1"}); err != nil {
+	if err := MarkCodexThreadsRead(path, []string{"thread-1"}); err != nil {
 		t.Fatal(err)
 	}
-	states, err = readCodexUnreadStates(ctx, path)
+	states, err = readCodexUnreadStates(path)
 	if err != nil || states["thread-1"] {
 		t.Fatalf("states after read=%v err=%v", states, err)
+	}
+	if !states["thread-2"] {
+		t.Fatal("unrelated unread task was removed")
+	}
+	root, atoms, err := readCodexGlobalState(path)
+	if err != nil || len(root["unrelated"]) == 0 {
+		t.Fatalf("unrelated root state was not preserved: err=%v", err)
+	}
+	var byHost map[string][]string
+	if err := json.Unmarshal(atoms[codexUnreadAtomKey], &byHost); err != nil {
+		t.Fatal(err)
+	}
+	if len(byHost["remote"]) != 1 || byHost["remote"][0] != "remote-thread" {
+		t.Fatalf("remote state changed: %v", byHost)
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.Mode().Perm() != 0o640 {
+		t.Fatalf("mode=%v err=%v", info.Mode().Perm(), err)
 	}
 }

@@ -389,6 +389,18 @@ var schema = []string{
 		updated_at TEXT NOT NULL,
 		FOREIGN KEY(thread_id) REFERENCES codex_threads(id) ON DELETE CASCADE
 	)`,
+	`CREATE TABLE IF NOT EXISTS telegram_bridge_migrations (
+		name TEXT PRIMARY KEY,
+		applied_at TEXT NOT NULL
+	)`,
+	`INSERT INTO codex_read_receipts(thread_id, requested_at, delivered_at)
+		SELECT thread_id, updated_at, '' FROM codex_topic_read_states
+		WHERE is_unread = 0 AND NOT EXISTS (
+			SELECT 1 FROM telegram_bridge_migrations WHERE name = 'requeue-read-receipts-for-desktop-atom-v2'
+		)
+		ON CONFLICT(thread_id) DO UPDATE SET requested_at = excluded.requested_at, delivered_at = ''`,
+	`INSERT OR IGNORE INTO telegram_bridge_migrations(name, applied_at)
+		VALUES('requeue-read-receipts-for-desktop-atom-v2', CURRENT_TIMESTAMP)`,
 	`CREATE TABLE IF NOT EXISTS codex_outbound_messages (
 		telegram_chat_id INTEGER NOT NULL,
 		telegram_topic_id INTEGER NOT NULL,
