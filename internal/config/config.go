@@ -14,6 +14,7 @@ type Config struct {
 	SessionPath   string
 	PublicBaseURL string
 	MCPToken      string
+	WorkerToken   string
 
 	BotToken        string
 	BotAdminChatIDs []int64
@@ -33,6 +34,7 @@ func Load() (Config, error) {
 		SessionPath:   envFirstDefault("TELEGRAM_BRIDGE_SESSION", "/data/telegram.session", "TG_SESSION_PATH", "data/telegram.session"),
 		PublicBaseURL: strings.TrimRight(envFirst("TELEGRAM_BRIDGE_PUBLIC_URL", "PUBLIC_BASE_URL"), "/"),
 		MCPToken:      envFirst("TELEGRAM_BRIDGE_MCP_TOKEN", "MCP_TOKEN"),
+		WorkerToken:   envFirst("TELEGRAM_BRIDGE_WORKER_TOKEN", "WORKER_TOKEN"),
 		BotToken:      envFirst("TELEGRAM_BOT_TOKEN", "BOT_TOKEN"),
 		TelegramAPIHash: envFirst(
 			"TELEGRAM_API_HASH",
@@ -108,6 +110,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.SessionPath, "session", c.SessionPath, "gotd Telegram session file path")
 	fs.StringVar(&c.PublicBaseURL, "public-url", c.PublicBaseURL, "public HTTPS base URL for Telegram Mini App")
 	fs.StringVar(&c.MCPToken, "mcp-token", c.MCPToken, "bearer token protecting the MCP endpoint")
+	fs.StringVar(&c.WorkerToken, "worker-token", c.WorkerToken, "bearer token protecting the Codex worker API")
 	fs.StringVar(&c.BotToken, "bot-token", c.BotToken, "Telegram bot token")
 	fs.Func("admin-chat-ids", "comma-separated Telegram chat ids allowed to run bot admin commands", func(value string) error {
 		ids, err := parseInt64List(value)
@@ -142,6 +145,10 @@ func (c Config) HasTelegramUserAPI() bool {
 
 func (c Config) HasMCP() bool {
 	return strings.TrimSpace(c.MCPToken) != ""
+}
+
+func (c Config) HasWorkerAPI() bool {
+	return strings.TrimSpace(c.WorkerToken) != ""
 }
 
 func (c Config) ValidateLogin() error {

@@ -2,9 +2,12 @@ package web
 
 import (
 	"context"
+	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -12,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nextster/telegram-bridge/internal/bot"
 	"github.com/nextster/telegram-bridge/internal/config"
 	"github.com/nextster/telegram-bridge/internal/db"
 	"github.com/nextster/telegram-bridge/internal/mcpserver"
@@ -27,6 +31,12 @@ type Server struct {
 	template      *template.Template
 	loginTemplate *template.Template
 	login         *webLoginManager
+	codexNotifier CodexNotifier
+}
+
+type CodexNotifier interface {
+	SendCodexJobResult(context.Context, db.CodexJob) error
+	CreateCodexTask(context.Context, string, string) (bot.CodexTask, error)
 }
 
 type dashboardData struct {
@@ -40,7 +50,7 @@ type dashboardData struct {
 	Now            time.Time
 }
 
-func New(cfg config.Config, store *db.Store, monitorService *monitor.Service, notifier notify.SystemNotifier) (*Server, error) {
+func New(cfg config.Config, store *db.Store, monitorService *monitor.Service, notifier notify.SystemNotifier, codexNotifier CodexNotifier) (*Server, error) {
 	if notifier == nil {
 		notifier = notify.Nop{}
 	}
@@ -82,6 +92,7 @@ func New(cfg config.Config, store *db.Store, monitorService *monitor.Service, no
 		template:      tpl,
 		loginTemplate: loginTpl,
 		login:         newWebLoginManager(store, monitorService, notifier),
+		codexNotifier: codexNotifier,
 	}, nil
 }
 
@@ -129,7 +140,124 @@ func (s *Server) routes() http.Handler {
 		mux.Handle("/mcp", mcpserver.New(s.monitor, s.cfg.MCPToken))
 		log.Print("MCP endpoint enabled at /mcp")
 	}
+	if s.cfg.HasWorkerAPI() {
+		mux.HandleFunc("POST /worker/v1/jobs/claim", s.requireWorker(s.claimCodexJob))
+		mux.HandleFunc("POST /worker/v1/jobs/{id}/start", s.requireWorker(s.startCodexJob))
+		mux.HandleFunc("POST /worker/v1/jobs/{id}/finish", s.requireWorker(s.finishCodexJob))
+		mux.HandleFunc("POST /worker/v1/tasks", s.requireWorker(s.createCodexTask))
+		log.Print("Codex worker API enabled at /worker/v1")
+	}
 	return mux
+}
+
+func (s *Server) createCodexTask(w http.ResponseWriter, r *http.Request) {
+	if s.codexNotifier == nil {
+		http.Error(w, "Telegram bot is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	var request struct {
+		Project string `json:"project"`
+		Prompt  string `json:"prompt"`
+	}
+	if err := decodeWorkerJSON(r, &request); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	task, err := s.codexNotifier.CreateCodexTask(r.Context(), request.Project, request.Prompt)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	writeWorkerJSON(w, http.StatusCreated, task)
+}
+
+func (s *Server) requireWorker(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		auth := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		expected := strings.TrimSpace(s.cfg.WorkerToken)
+		if auth == "" || len(auth) != len(expected) || subtle.ConstantTimeCompare([]byte(auth), []byte(expected)) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		next(w, r)
+	}
+}
+
+func (s *Server) claimCodexJob(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		WorkerID string `json:"worker_id"`
+	}
+	if err := decodeWorkerJSON(r, &request); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	job, ok, err := s.store.ClaimCodexJob(r.Context(), request.WorkerID, 30*time.Minute)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !ok {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	writeWorkerJSON(w, http.StatusOK, job)
+}
+
+func (s *Server) startCodexJob(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		LeaseToken    string `json:"lease_token"`
+		CodexThreadID string `json:"codex_thread_id"`
+	}
+	if err := decodeWorkerJSON(r, &request); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.store.StartCodexJob(r.Context(), r.PathValue("id"), request.LeaseToken, request.CodexThreadID); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) finishCodexJob(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		LeaseToken string `json:"lease_token"`
+		Result     string `json:"result"`
+		Error      string `json:"error"`
+	}
+	if err := decodeWorkerJSON(r, &request); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	job, err := s.store.FinishCodexJob(r.Context(), r.PathValue("id"), request.LeaseToken, request.Result, request.Error)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	if s.codexNotifier != nil {
+		if err := s.codexNotifier.SendCodexJobResult(r.Context(), job); err != nil {
+			log.Printf("send Codex result to Telegram failed: %v", err)
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func decodeWorkerJSON(r *http.Request, target any) error {
+	decoder := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return fmt.Errorf("invalid JSON: %w", err)
+	}
+	return nil
+}
+
+func writeWorkerJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		log.Printf("encode worker response failed: %v", err)
+	}
 }
 
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {

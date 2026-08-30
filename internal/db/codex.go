@@ -1,0 +1,298 @@
+package db
+
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+)
+
+type CodexProject struct {
+	Slug               string    `json:"slug"`
+	Title              string    `json:"title"`
+	TelegramChannelID  int64     `json:"telegram_channel_id"`
+	TelegramAccessHash int64     `json:"-"`
+	TelegramChatID     int64     `json:"telegram_chat_id"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
+}
+
+type CodexThread struct {
+	ID              int64     `json:"id"`
+	ProjectSlug     string    `json:"project_slug"`
+	TelegramChatID  int64     `json:"telegram_chat_id"`
+	TelegramTopicID int       `json:"telegram_topic_id"`
+	Title           string    `json:"title"`
+	CodexThreadID   string    `json:"codex_thread_id"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
+type CodexJob struct {
+	ID             string      `json:"id"`
+	ThreadID       int64       `json:"thread_id"`
+	Prompt         string      `json:"prompt"`
+	Status         string      `json:"status"`
+	WorkerID       string      `json:"worker_id"`
+	LeaseToken     string      `json:"lease_token,omitempty"`
+	LeaseExpiresAt time.Time   `json:"lease_expires_at"`
+	Result         string      `json:"result,omitempty"`
+	Error          string      `json:"error,omitempty"`
+	CreatedAt      time.Time   `json:"created_at"`
+	UpdatedAt      time.Time   `json:"updated_at"`
+	StartedAt      time.Time   `json:"started_at"`
+	FinishedAt     time.Time   `json:"finished_at"`
+	Thread         CodexThread `json:"thread"`
+}
+
+func (s *Store) UpsertCodexProject(ctx context.Context, p CodexProject) error {
+	p.Slug = strings.TrimSpace(p.Slug)
+	p.Title = strings.TrimSpace(p.Title)
+	if p.Slug == "" || p.TelegramChannelID <= 0 || p.TelegramChatID == 0 {
+		return errors.New("invalid Codex project")
+	}
+	if p.Title == "" {
+		p.Title = p.Slug
+	}
+	now := nowText()
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO codex_projects(slug, title, telegram_channel_id, telegram_access_hash, telegram_chat_id, created_at, updated_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(slug) DO UPDATE SET
+			title = excluded.title,
+			telegram_channel_id = excluded.telegram_channel_id,
+			telegram_access_hash = excluded.telegram_access_hash,
+			telegram_chat_id = excluded.telegram_chat_id,
+			updated_at = excluded.updated_at
+	`, p.Slug, p.Title, p.TelegramChannelID, p.TelegramAccessHash, p.TelegramChatID, now, now)
+	if err != nil {
+		return fmt.Errorf("upsert Codex project: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetCodexProject(ctx context.Context, slug string) (CodexProject, bool, error) {
+	var p CodexProject
+	var created, updated string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT slug, title, telegram_channel_id, telegram_access_hash, telegram_chat_id, created_at, updated_at
+		FROM codex_projects WHERE slug = ? COLLATE NOCASE
+	`, strings.TrimSpace(slug)).Scan(&p.Slug, &p.Title, &p.TelegramChannelID, &p.TelegramAccessHash, &p.TelegramChatID, &created, &updated)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CodexProject{}, false, nil
+	}
+	if err != nil {
+		return CodexProject{}, false, fmt.Errorf("get Codex project: %w", err)
+	}
+	p.CreatedAt, p.UpdatedAt = parseDBTime(created), parseDBTime(updated)
+	return p, true, nil
+}
+
+func (s *Store) ListCodexProjects(ctx context.Context) ([]CodexProject, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT slug, title, telegram_channel_id, telegram_access_hash, telegram_chat_id, created_at, updated_at
+		FROM codex_projects ORDER BY title COLLATE NOCASE
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list Codex projects: %w", err)
+	}
+	defer rows.Close()
+	var projects []CodexProject
+	for rows.Next() {
+		var p CodexProject
+		var created, updated string
+		if err := rows.Scan(&p.Slug, &p.Title, &p.TelegramChannelID, &p.TelegramAccessHash, &p.TelegramChatID, &created, &updated); err != nil {
+			return nil, fmt.Errorf("scan Codex project: %w", err)
+		}
+		p.CreatedAt, p.UpdatedAt = parseDBTime(created), parseDBTime(updated)
+		projects = append(projects, p)
+	}
+	return projects, rows.Err()
+}
+
+func (s *Store) CreateCodexThread(ctx context.Context, t CodexThread) (CodexThread, error) {
+	now := nowText()
+	res, err := s.db.ExecContext(ctx, `
+		INSERT INTO codex_threads(project_slug, telegram_chat_id, telegram_topic_id, title, created_at, updated_at)
+		VALUES(?, ?, ?, ?, ?, ?)
+	`, t.ProjectSlug, t.TelegramChatID, t.TelegramTopicID, strings.TrimSpace(t.Title), now, now)
+	if err != nil {
+		return CodexThread{}, fmt.Errorf("create Codex thread: %w", err)
+	}
+	t.ID, err = res.LastInsertId()
+	if err != nil {
+		return CodexThread{}, fmt.Errorf("Codex thread id: %w", err)
+	}
+	t.CreatedAt, t.UpdatedAt = parseDBTime(now), parseDBTime(now)
+	return t, nil
+}
+
+func (s *Store) GetCodexThreadByTopic(ctx context.Context, chatID int64, topicID int) (CodexThread, bool, error) {
+	return s.scanCodexThread(s.db.QueryRowContext(ctx, `
+		SELECT id, project_slug, telegram_chat_id, telegram_topic_id, title, codex_thread_id, created_at, updated_at
+		FROM codex_threads WHERE telegram_chat_id = ? AND telegram_topic_id = ?
+	`, chatID, topicID))
+}
+
+func (s *Store) SetCodexThreadID(ctx context.Context, threadID int64, codexThreadID string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE codex_threads SET codex_thread_id = ?, updated_at = ? WHERE id = ?`, strings.TrimSpace(codexThreadID), nowText(), threadID)
+	if err != nil {
+		return fmt.Errorf("set Codex thread id: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) EnqueueCodexJob(ctx context.Context, threadID int64, prompt string) (CodexJob, error) {
+	prompt = strings.TrimSpace(prompt)
+	if threadID <= 0 || prompt == "" {
+		return CodexJob{}, errors.New("thread and prompt are required")
+	}
+	id, err := randomCodexToken(18)
+	if err != nil {
+		return CodexJob{}, err
+	}
+	now := nowText()
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO codex_jobs(id, thread_id, prompt, status, created_at, updated_at)
+		VALUES(?, ?, ?, 'queued', ?, ?)
+	`, id, threadID, prompt, now, now)
+	if err != nil {
+		return CodexJob{}, fmt.Errorf("enqueue Codex job: %w", err)
+	}
+	return CodexJob{ID: id, ThreadID: threadID, Prompt: prompt, Status: "queued", CreatedAt: parseDBTime(now), UpdatedAt: parseDBTime(now)}, nil
+}
+
+func (s *Store) ClaimCodexJob(ctx context.Context, workerID string, lease time.Duration) (CodexJob, bool, error) {
+	if lease <= 0 {
+		lease = 10 * time.Minute
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return CodexJob{}, false, err
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC()
+	var id string
+	err = tx.QueryRowContext(ctx, `
+		SELECT id FROM codex_jobs
+		WHERE status = 'queued' OR (status IN ('claimed', 'running') AND lease_expires_at != '' AND lease_expires_at < ?)
+		ORDER BY created_at LIMIT 1
+	`, formatTime(now)).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CodexJob{}, false, nil
+	}
+	if err != nil {
+		return CodexJob{}, false, fmt.Errorf("find Codex job: %w", err)
+	}
+	leaseToken, err := randomCodexToken(24)
+	if err != nil {
+		return CodexJob{}, false, err
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE codex_jobs SET status = 'claimed', worker_id = ?, lease_token = ?, lease_expires_at = ?, updated_at = ?
+		WHERE id = ?
+	`, strings.TrimSpace(workerID), leaseToken, formatTime(now.Add(lease)), formatTime(now), id)
+	if err != nil {
+		return CodexJob{}, false, fmt.Errorf("claim Codex job: %w", err)
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return CodexJob{}, false, nil
+	}
+	job, err := scanCodexJob(tx.QueryRowContext(ctx, codexJobSelect+` WHERE j.id = ?`, id))
+	if err != nil {
+		return CodexJob{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return CodexJob{}, false, err
+	}
+	return job, true, nil
+}
+
+func (s *Store) StartCodexJob(ctx context.Context, id, leaseToken, codexThreadID string) error {
+	now := nowText()
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE codex_jobs SET status = 'running', started_at = CASE WHEN started_at = '' THEN ? ELSE started_at END, updated_at = ?
+		WHERE id = ? AND lease_token = ? AND status = 'claimed'
+	`, now, now, id, leaseToken)
+	if err != nil {
+		return fmt.Errorf("start Codex job: %w", err)
+	}
+	if rows, _ := res.RowsAffected(); rows != 1 {
+		return errors.New("Codex job lease is stale")
+	}
+	if strings.TrimSpace(codexThreadID) != "" {
+		_, err = s.db.ExecContext(ctx, `
+			UPDATE codex_threads SET codex_thread_id = ?, updated_at = ?
+			WHERE id = (SELECT thread_id FROM codex_jobs WHERE id = ?)
+		`, codexThreadID, now, id)
+	}
+	return err
+}
+
+func (s *Store) FinishCodexJob(ctx context.Context, id, leaseToken, resultText, errorText string) (CodexJob, error) {
+	status := "succeeded"
+	if strings.TrimSpace(errorText) != "" {
+		status = "failed"
+	}
+	now := nowText()
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE codex_jobs SET status = ?, result = ?, error = ?, finished_at = ?, updated_at = ?, lease_expires_at = ''
+		WHERE id = ? AND lease_token = ? AND status IN ('claimed', 'running')
+	`, status, strings.TrimSpace(resultText), strings.TrimSpace(errorText), now, now, id, leaseToken)
+	if err != nil {
+		return CodexJob{}, fmt.Errorf("finish Codex job: %w", err)
+	}
+	if rows, _ := res.RowsAffected(); rows != 1 {
+		return CodexJob{}, errors.New("Codex job lease is stale")
+	}
+	return scanCodexJob(s.db.QueryRowContext(ctx, codexJobSelect+` WHERE j.id = ?`, id))
+}
+
+const codexJobSelect = `
+	SELECT j.id, j.thread_id, j.prompt, j.status, j.worker_id, j.lease_token, j.lease_expires_at,
+		j.result, j.error, j.created_at, j.updated_at, j.started_at, j.finished_at,
+		t.id, t.project_slug, t.telegram_chat_id, t.telegram_topic_id, t.title, t.codex_thread_id, t.created_at, t.updated_at
+	FROM codex_jobs j JOIN codex_threads t ON t.id = j.thread_id`
+
+type rowScanner interface{ Scan(...any) error }
+
+func scanCodexJob(row rowScanner) (CodexJob, error) {
+	var j CodexJob
+	var leaseExpires, created, updated, started, finished, threadCreated, threadUpdated string
+	err := row.Scan(&j.ID, &j.ThreadID, &j.Prompt, &j.Status, &j.WorkerID, &j.LeaseToken, &leaseExpires,
+		&j.Result, &j.Error, &created, &updated, &started, &finished,
+		&j.Thread.ID, &j.Thread.ProjectSlug, &j.Thread.TelegramChatID, &j.Thread.TelegramTopicID, &j.Thread.Title, &j.Thread.CodexThreadID, &threadCreated, &threadUpdated)
+	if err != nil {
+		return CodexJob{}, fmt.Errorf("scan Codex job: %w", err)
+	}
+	j.LeaseExpiresAt, j.CreatedAt, j.UpdatedAt = parseDBTime(leaseExpires), parseDBTime(created), parseDBTime(updated)
+	j.StartedAt, j.FinishedAt = parseDBTime(started), parseDBTime(finished)
+	j.Thread.CreatedAt, j.Thread.UpdatedAt = parseDBTime(threadCreated), parseDBTime(threadUpdated)
+	return j, nil
+}
+
+func (s *Store) scanCodexThread(row rowScanner) (CodexThread, bool, error) {
+	var t CodexThread
+	var created, updated string
+	err := row.Scan(&t.ID, &t.ProjectSlug, &t.TelegramChatID, &t.TelegramTopicID, &t.Title, &t.CodexThreadID, &created, &updated)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CodexThread{}, false, nil
+	}
+	if err != nil {
+		return CodexThread{}, false, fmt.Errorf("scan Codex thread: %w", err)
+	}
+	t.CreatedAt, t.UpdatedAt = parseDBTime(created), parseDBTime(updated)
+	return t, true, nil
+}
+
+func randomCodexToken(size int) (string, error) {
+	b := make([]byte, size)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate Codex token: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}

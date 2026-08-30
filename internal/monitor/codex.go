@@ -1,0 +1,196 @@
+package monitor
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/gotd/td/tg"
+
+	"github.com/nextster/telegram-bridge/internal/db"
+)
+
+const codexFolderTitle = "Codex"
+
+// EnsureCodexProject creates the Telegram-side project container through the
+// already-authorized user session. It never starts a second gotd client.
+func (s *Service) EnsureCodexProject(ctx context.Context, slug, title, botUsername string) (db.CodexProject, error) {
+	slug = strings.TrimSpace(slug)
+	title = strings.TrimSpace(title)
+	botUsername = strings.TrimPrefix(strings.TrimSpace(botUsername), "@")
+	if slug == "" {
+		return db.CodexProject{}, errors.New("project slug is empty")
+	}
+	if existing, ok, err := s.store.GetCodexProject(ctx, slug); err != nil || ok {
+		return existing, err
+	}
+	if title == "" {
+		title = slug
+	}
+	api, _, err := s.readyAPI()
+	if err != nil {
+		return db.CodexProject{}, err
+	}
+
+	created, err := api.ChannelsCreateChannel(ctx, &tg.ChannelsCreateChannelRequest{
+		Megagroup: true,
+		Forum:     true,
+		Title:     truncateTelegramTitle("Codex · " + title),
+		About:     "Codex tasks for " + title + ". Managed by telegram-bridge.",
+	})
+	if err != nil {
+		return db.CodexProject{}, fmt.Errorf("create Codex project forum: %w", err)
+	}
+	channel, err := channelFromUpdates(created)
+	if err != nil {
+		return db.CodexProject{}, err
+	}
+	accessHash, ok := channel.GetAccessHash()
+	if !ok || accessHash == 0 {
+		return db.CodexProject{}, errors.New("created Codex forum has no access hash")
+	}
+
+	if botUsername != "" {
+		if err := addForumBot(ctx, api, channel.AsInput(), botUsername); err != nil {
+			return db.CodexProject{}, err
+		}
+	}
+
+	project := db.CodexProject{
+		Slug:               slug,
+		Title:              title,
+		TelegramChannelID:  channel.ID,
+		TelegramAccessHash: accessHash,
+		TelegramChatID:     botAPIChannelID(channel.ID),
+	}
+	if err := s.store.UpsertCodexProject(ctx, project); err != nil {
+		return db.CodexProject{}, err
+	}
+	if err := s.ensureCodexFolder(ctx, api); err != nil {
+		return db.CodexProject{}, err
+	}
+	saved, ok, err := s.store.GetCodexProject(ctx, slug)
+	if err != nil {
+		return db.CodexProject{}, err
+	}
+	if !ok {
+		return db.CodexProject{}, errors.New("saved Codex project disappeared")
+	}
+	return saved, nil
+}
+
+func (s *Service) ensureCodexFolder(ctx context.Context, api *tg.Client) error {
+	projects, err := s.store.ListCodexProjects(ctx)
+	if err != nil {
+		return err
+	}
+	include := make([]tg.InputPeerClass, 0, len(projects))
+	for _, project := range projects {
+		include = append(include, &tg.InputPeerChannel{ChannelID: project.TelegramChannelID, AccessHash: project.TelegramAccessHash})
+	}
+	filters, err := api.MessagesGetDialogFilters(ctx)
+	if err != nil {
+		return fmt.Errorf("get Telegram folders: %w", err)
+	}
+	filterID := 2
+	used := map[int]bool{}
+	for _, item := range filters.Filters {
+		filter, ok := item.(*tg.DialogFilter)
+		if !ok {
+			continue
+		}
+		used[filter.ID] = true
+		if strings.EqualFold(strings.TrimSpace(filter.Title.Text), codexFolderTitle) {
+			filterID = filter.ID
+			break
+		}
+	}
+	if used[filterID] {
+		for id := 2; id <= 255; id++ {
+			if !used[id] {
+				filterID = id
+				break
+			}
+		}
+		for _, item := range filters.Filters {
+			if filter, ok := item.(*tg.DialogFilter); ok && strings.EqualFold(strings.TrimSpace(filter.Title.Text), codexFolderTitle) {
+				filterID = filter.ID
+				break
+			}
+		}
+	}
+	filter := &tg.DialogFilter{
+		ID:           filterID,
+		Title:        tg.TextWithEntities{Text: codexFolderTitle},
+		IncludePeers: include,
+	}
+	filter.SetEmoticon("💻")
+	ok, err := api.MessagesUpdateDialogFilter(ctx, &tg.MessagesUpdateDialogFilterRequest{ID: filterID, Filter: filter})
+	if err != nil {
+		return fmt.Errorf("update Codex Telegram folder: %w", err)
+	}
+	if !ok {
+		return errors.New("Telegram declined Codex folder update")
+	}
+	return nil
+}
+
+func addForumBot(ctx context.Context, api *tg.Client, channel *tg.InputChannel, username string) error {
+	resolved, err := api.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{Username: username})
+	if err != nil {
+		return fmt.Errorf("resolve bridge bot @%s: %w", username, err)
+	}
+	var bot *tg.User
+	for _, item := range resolved.Users {
+		if user, ok := item.(*tg.User); ok && user.Bot {
+			bot = user
+			break
+		}
+	}
+	if bot == nil {
+		return fmt.Errorf("@%s did not resolve to a bot", username)
+	}
+	inputBot := bot.AsInput()
+	rights := tg.ChatAdminRights{ChangeInfo: true, DeleteMessages: true, InviteUsers: true, PinMessages: true, ManageTopics: true, Other: true}
+	_, err = api.ChannelsEditAdmin(ctx, &tg.ChannelsEditAdminRequest{
+		Channel:     channel,
+		UserID:      inputBot,
+		AdminRights: rights,
+		Rank:        "Codex bridge",
+	})
+	if err != nil {
+		return fmt.Errorf("add bridge bot as forum admin: %w", err)
+	}
+	return nil
+}
+
+func channelFromUpdates(updates tg.UpdatesClass) (*tg.Channel, error) {
+	var chats []tg.ChatClass
+	switch typed := updates.(type) {
+	case *tg.Updates:
+		chats = typed.Chats
+	case *tg.UpdatesCombined:
+		chats = typed.Chats
+	default:
+		return nil, fmt.Errorf("unexpected create forum response %T", updates)
+	}
+	for _, item := range chats {
+		if channel, ok := item.(*tg.Channel); ok && channel.Megagroup {
+			return channel, nil
+		}
+	}
+	return nil, errors.New("create forum response did not contain a channel")
+}
+
+func botAPIChannelID(channelID int64) int64 {
+	return -(1_000_000_000_000 + channelID)
+}
+
+func truncateTelegramTitle(title string) string {
+	runes := []rune(strings.TrimSpace(title))
+	if len(runes) > 128 {
+		runes = runes[:128]
+	}
+	return string(runes)
+}

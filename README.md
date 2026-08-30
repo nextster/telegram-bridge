@@ -44,11 +44,26 @@ export TELEGRAM_PHONE="+15551234567"
 export TELEGRAM_PASSWORD="account-password"
 export TELEGRAM_BRIDGE_ADMIN_CHAT_IDS="123456789"
 export TELEGRAM_BRIDGE_MCP_TOKEN="a-long-random-bearer-token"
+export TELEGRAM_BRIDGE_WORKER_TOKEN="a-different-random-bearer-token"
 ```
 
 The bot can authorize the gotd user session with `/login`. The bot only asks for the Telegram phone number and then sends a short-lived site login link. Enter the Telegram login code and 2FA password on the HTTPS site, not in the bot chat: Telegram blocks code-based sign-in after a code is shared in a bot chat. If `TELEGRAM_BRIDGE_ADMIN_CHAT_IDS` is not set, the first chat that runs `/start` becomes the admin chat for MVP operations.
 
 The CLI `login` command still works and stores the gotd user session in `data/telegram.session` by default. On Fly.io it uses `/data/telegram.session`.
+
+## Telegram → Codex bridge
+
+`/codex project :: prompt` creates, when needed, a private forum supergroup named `Codex · project`, adds it to the Telegram folder `Codex`, creates one forum topic per Codex task, and queues the prompt for a worker on the Mac. Further plain-text messages in that topic continue the same Codex task.
+
+The Fly app only stores the queue and Telegram/Codex identifiers. Codex runs locally through `codex app-server`, so project files and the Codex login stay on the Mac. The worker API uses `TELEGRAM_BRIDGE_WORKER_TOKEN`, separate from the read-only MCP token.
+
+Install or refresh the macOS LaunchAgent with one or more local project mappings:
+
+```bash
+scripts/install-codex-worker.sh telegram-bridge=/path/to/telegram-bridge
+```
+
+The worker starts Codex with `workspace-write` and `approvalPolicy=never`: normal edits inside the selected project are possible, while permission escalation is unavailable from Telegram. Its log is `~/Library/Logs/telegram-bridge-worker.log`; the final Codex message is posted to the originating Telegram topic.
 
 ## Bot commands
 

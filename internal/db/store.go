@@ -332,6 +332,45 @@ var schema = []string{
 		)`,
 	`CREATE INDEX IF NOT EXISTS idx_private_message_deletions_pending
 		ON private_message_deletions(owner_user_id, notified_at, observed_at)`,
+	`CREATE TABLE IF NOT EXISTS codex_projects (
+		slug TEXT PRIMARY KEY COLLATE NOCASE,
+		title TEXT NOT NULL,
+		telegram_channel_id INTEGER NOT NULL,
+		telegram_access_hash INTEGER NOT NULL,
+		telegram_chat_id INTEGER NOT NULL UNIQUE,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS codex_threads (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		project_slug TEXT NOT NULL COLLATE NOCASE,
+		telegram_chat_id INTEGER NOT NULL,
+		telegram_topic_id INTEGER NOT NULL,
+		title TEXT NOT NULL,
+		codex_thread_id TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		UNIQUE(telegram_chat_id, telegram_topic_id),
+		FOREIGN KEY(project_slug) REFERENCES codex_projects(slug) ON DELETE CASCADE
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_codex_threads_codex_id ON codex_threads(codex_thread_id)`,
+	`CREATE TABLE IF NOT EXISTS codex_jobs (
+		id TEXT PRIMARY KEY,
+		thread_id INTEGER NOT NULL,
+		prompt TEXT NOT NULL,
+		status TEXT NOT NULL CHECK(status IN ('queued', 'claimed', 'running', 'succeeded', 'failed')),
+		worker_id TEXT NOT NULL DEFAULT '',
+		lease_token TEXT NOT NULL DEFAULT '',
+		lease_expires_at TEXT NOT NULL DEFAULT '',
+		result TEXT NOT NULL DEFAULT '',
+		error TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		started_at TEXT NOT NULL DEFAULT '',
+		finished_at TEXT NOT NULL DEFAULT '',
+		FOREIGN KEY(thread_id) REFERENCES codex_threads(id) ON DELETE CASCADE
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_codex_jobs_claim ON codex_jobs(status, created_at)`,
 }
 
 func (s *Store) UpsertSubscriber(ctx context.Context, sub Subscriber) error {

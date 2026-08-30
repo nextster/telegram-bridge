@@ -25,6 +25,13 @@ type Service struct {
 	login          *loginManager
 }
 
+type CodexTask struct {
+	Project db.CodexProject `json:"project"`
+	Thread  db.CodexThread  `json:"thread"`
+	Job     db.CodexJob     `json:"job"`
+	Link    string          `json:"link"`
+}
+
 func New(cfg config.Config, store *db.Store) (*Service, error) {
 	if strings.TrimSpace(cfg.BotToken) == "" {
 		return nil, errors.New("bot token is empty")
@@ -162,6 +169,7 @@ func (s *Service) setCommands(ctx context.Context) error {
 			{Command: "del", Description: "delete keyword by id or text"},
 			{Command: "keywords", Description: "list keywords"},
 			{Command: "recent", Description: "show recent matches"},
+			{Command: "codex", Description: "start a Codex task: project :: prompt"},
 			{Command: "login", Description: "authorize Telegram user session"},
 			{Command: "loginstatus", Description: "show Telegram user login status"},
 			{Command: "cancel", Description: "cancel current bot login"},
@@ -184,6 +192,9 @@ func (s *Service) handleUpdate(ctx context.Context, update telego.Update) error 
 		if consumed || err != nil {
 			return err
 		}
+	}
+	if text != "" && !strings.HasPrefix(text, "/") && message.MessageThreadID > 0 {
+		return s.handleCodexContinuation(ctx, message, text)
 	}
 	if text == "" || !strings.HasPrefix(text, "/") {
 		return nil
@@ -214,6 +225,8 @@ func (s *Service) handleUpdate(ctx context.Context, update telego.Update) error 
 		return s.handleKeywords(ctx, message)
 	case "recent":
 		return s.handleRecent(ctx, message)
+	case "codex":
+		return s.handleCodex(ctx, message, payload)
 	case "login":
 		return s.login.Start(ctx, message, payload)
 	case "loginstatus":
@@ -499,6 +512,153 @@ func (s *Service) reply(ctx context.Context, chatID int64, text string, markup t
 	return err
 }
 
+func (s *Service) replyTopic(ctx context.Context, chatID int64, topicID int, text string) error {
+	_, err := s.bot.SendMessage(ctx, &telego.SendMessageParams{
+		ChatID:          telego.ChatID{ID: chatID},
+		MessageThreadID: topicID,
+		Text:            truncateUTF16(text, 3900),
+	})
+	return err
+}
+
+func (s *Service) SendCodexJobResult(ctx context.Context, job db.CodexJob) error {
+	text := strings.TrimSpace(job.Result)
+	if job.Status == "failed" {
+		text = "⚠️ Codex: " + strings.TrimSpace(job.Error)
+	}
+	if text == "" {
+		text = "Codex finished without a text response."
+	}
+	return s.replyTopic(ctx, job.Thread.TelegramChatID, job.Thread.TelegramTopicID, text)
+}
+
+func (s *Service) handleCodex(ctx context.Context, message *telego.Message, payload string) error {
+	if !s.cfg.HasWorkerAPI() {
+		return s.reply(ctx, message.Chat.ID, "Codex worker API is not configured.", nil)
+	}
+	if s.monitorService == nil {
+		return s.reply(ctx, message.Chat.ID, "Telegram user API is not configured.", nil)
+	}
+	projectSlug, prompt, ok := parseCodexPayload(payload)
+	if !ok {
+		return s.reply(ctx, message.Chat.ID, "Usage: /codex project :: what Codex should do", nil)
+	}
+	task, err := s.CreateCodexTask(ctx, projectSlug, prompt)
+	if err != nil {
+		return err
+	}
+	return s.reply(ctx, message.Chat.ID, "Создал задачу в "+task.Project.Title+":\n"+task.Link, nil)
+}
+
+func (s *Service) CreateCodexTask(ctx context.Context, projectSlug, prompt string) (CodexTask, error) {
+	if !s.cfg.HasWorkerAPI() {
+		return CodexTask{}, errors.New("Codex worker API is not configured")
+	}
+	if s.monitorService == nil {
+		return CodexTask{}, errors.New("Telegram user API is not configured")
+	}
+	projectSlug, prompt = strings.ToLower(strings.TrimSpace(projectSlug)), strings.TrimSpace(prompt)
+	if projectSlug == "" || prompt == "" || strings.ContainsAny(projectSlug, " /\\") {
+		return CodexTask{}, errors.New("project and prompt are required")
+	}
+	project, exists, err := s.store.GetCodexProject(ctx, projectSlug)
+	if err != nil {
+		return CodexTask{}, err
+	}
+	if !exists {
+		identity, err := s.bot.GetMe(ctx)
+		if err != nil {
+			return CodexTask{}, fmt.Errorf("get bot identity: %w", err)
+		}
+		project, err = s.monitorService.EnsureCodexProject(ctx, projectSlug, projectSlug, identity.Username)
+		if err != nil {
+			return CodexTask{}, err
+		}
+	}
+	topicTitle := codexTopicTitle(prompt)
+	topic, err := s.bot.CreateForumTopic(ctx, &telego.CreateForumTopicParams{
+		ChatID:    telego.ChatID{ID: project.TelegramChatID},
+		Name:      topicTitle,
+		IconColor: 0x6FB9F0,
+	})
+	if err != nil {
+		return CodexTask{}, fmt.Errorf("create Codex topic: %w", err)
+	}
+	thread, err := s.store.CreateCodexThread(ctx, db.CodexThread{
+		ProjectSlug:     project.Slug,
+		TelegramChatID:  project.TelegramChatID,
+		TelegramTopicID: topic.MessageThreadID,
+		Title:           topicTitle,
+	})
+	if err != nil {
+		return CodexTask{}, err
+	}
+	job, err := s.store.EnqueueCodexJob(ctx, thread.ID, prompt)
+	if err != nil {
+		return CodexTask{}, err
+	}
+	if err := s.replyTopic(ctx, thread.TelegramChatID, thread.TelegramTopicID, "🧵 Codex task queued · "+job.ID); err != nil {
+		return CodexTask{}, err
+	}
+	link := fmt.Sprintf("https://t.me/c/%d/%d", project.TelegramChannelID, thread.TelegramTopicID)
+	return CodexTask{Project: project, Thread: thread, Job: job, Link: link}, nil
+}
+
+func (s *Service) handleCodexContinuation(ctx context.Context, message *telego.Message, prompt string) error {
+	thread, ok, err := s.store.GetCodexThreadByTopic(ctx, message.Chat.ID, message.MessageThreadID)
+	if err != nil || !ok {
+		return err
+	}
+	if message.From == nil || message.From.IsBot {
+		return nil
+	}
+	allowed, err := s.isAdminSender(ctx, message.From.ID)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return nil
+	}
+	job, err := s.store.EnqueueCodexJob(ctx, thread.ID, prompt)
+	if err != nil {
+		return err
+	}
+	return s.replyTopic(ctx, message.Chat.ID, message.MessageThreadID, "⏳ queued · "+job.ID)
+}
+
+func (s *Service) isAdminSender(ctx context.Context, userID int64) (bool, error) {
+	if userID <= 0 {
+		return false, nil
+	}
+	if len(s.cfg.BotAdminChatIDs) > 0 {
+		return s.cfg.IsConfiguredBotAdmin(userID), nil
+	}
+	first, ok, err := s.store.FirstSubscriber(ctx)
+	return ok && first.ChatID == userID, err
+}
+
+func parseCodexPayload(payload string) (string, string, bool) {
+	project, prompt, ok := strings.Cut(strings.TrimSpace(payload), "::")
+	project = strings.TrimSpace(project)
+	prompt = strings.TrimSpace(prompt)
+	if !ok || project == "" || prompt == "" || strings.ContainsAny(project, " /\\") {
+		return "", "", false
+	}
+	return strings.ToLower(project), prompt, true
+}
+
+func codexTopicTitle(prompt string) string {
+	line := strings.TrimSpace(strings.Split(prompt, "\n")[0])
+	runes := []rune(line)
+	if len(runes) > 72 {
+		runes = runes[:72]
+	}
+	if len(runes) == 0 {
+		return "New Codex task"
+	}
+	return string(runes)
+}
+
 func (s *Service) webAppMarkup(ctx context.Context, chatID int64) telego.ReplyMarkup {
 	if s.cfg.PublicBaseURL == "" {
 		return nil
@@ -557,7 +717,7 @@ func (s *Service) ruleWebAppURL(ruleID int64) string {
 
 func adminOnlyCommand(command string) bool {
 	switch command {
-	case "add", "watch", "del", "delete", "keywords", "recent", "login", "loginstatus", "cancel":
+	case "add", "watch", "del", "delete", "keywords", "recent", "codex", "login", "loginstatus", "cancel":
 		return true
 	default:
 		return false
@@ -731,6 +891,7 @@ func helpText() string {
 		"/del keyword-or-id - delete a phrase",
 		"/keywords - list phrases",
 		"/recent - show recent matches",
+		"/codex project :: prompt - create a Codex task and Telegram topic",
 		"/login - authorize Telegram user monitoring",
 		"/loginstatus - show Telegram user session status",
 		"/cancel - cancel current login",
