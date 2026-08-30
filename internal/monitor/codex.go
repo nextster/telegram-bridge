@@ -6,7 +6,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
+	"time"
 
 	"github.com/gotd/td/telegram/message"
 	telegrammarkdown "github.com/gotd/td/telegram/message/markdown"
@@ -16,6 +18,71 @@ import (
 )
 
 const codexFolderTitle = "Codex"
+
+const codexReadReconcileInterval = 15 * time.Second
+
+func (s *Service) runCodexReadReconcile(ctx context.Context) {
+	for {
+		topics, receipts, err := s.ReconcileCodexReadState(ctx)
+		if err != nil && ctx.Err() == nil {
+			log.Printf("Codex Telegram read-state reconcile failed: %v", err)
+		} else if receipts > 0 {
+			log.Printf("Codex Telegram read-state reconciled: topics=%d receipts=%d", topics, receipts)
+		}
+		timer := time.NewTimer(codexReadReconcileInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+func (s *Service) ReconcileCodexReadState(ctx context.Context) (int, int, error) {
+	api, _, err := s.readyAPI()
+	if err != nil {
+		return 0, 0, err
+	}
+	projects, err := s.store.ListCodexProjects(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	var topics, receipts int
+	for _, project := range projects {
+		threads, err := s.store.ListCodexThreadsByChatID(ctx, project.TelegramChatID)
+		if err != nil {
+			return topics, receipts, err
+		}
+		peer := &tg.InputPeerChannel{ChannelID: project.TelegramChannelID, AccessHash: project.TelegramAccessHash}
+		for start := 0; start < len(threads); start += 100 {
+			end := min(start+100, len(threads))
+			ids := make([]int, 0, end-start)
+			for _, thread := range threads[start:end] {
+				ids = append(ids, thread.TelegramTopicID)
+			}
+			result, err := api.MessagesGetForumTopicsByID(ctx, &tg.MessagesGetForumTopicsByIDRequest{Peer: peer, Topics: ids})
+			if err != nil {
+				return topics, receipts, fmt.Errorf("get Codex forum topics for %s: %w", project.Slug, err)
+			}
+			for _, item := range result.Topics {
+				topic, ok := item.(*tg.ForumTopic)
+				if !ok {
+					continue
+				}
+				topics++
+				deliver, err := s.store.ObserveCodexTopicReadState(ctx, project.TelegramChatID, topic.ID, topic.UnreadCount > 0, topic.ReadInboxMaxID)
+				if err != nil {
+					return topics, receipts, err
+				}
+				if deliver {
+					receipts++
+				}
+			}
+		}
+	}
+	return topics, receipts, nil
+}
 
 // SendCodexMessage mirrors a Codex user item through the authenticated user
 // session, so Telegram displays the actual account as its sender.

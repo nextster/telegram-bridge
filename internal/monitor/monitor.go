@@ -188,6 +188,7 @@ func (s *Service) runOnce(ctx context.Context) error {
 		err = manager.Run(ctx, client.API(), status.User.ID, updates.AuthOptions{
 			OnStart: func(managerCtx context.Context) {
 				go s.handler.runPrivateDeletionOutbox(managerCtx)
+				go s.runCodexReadReconcile(managerCtx)
 				go func() {
 					if count, syncErr := s.SyncDialogs(managerCtx); syncErr != nil {
 						log.Printf("telegram dialogs sync failed: %v", syncErr)
@@ -628,7 +629,8 @@ func (h *Handler) Handle(ctx context.Context, update tg.UpdatesClass) error {
 func (h *Handler) handleUpdate(ctx context.Context, update tg.UpdateClass, privateDialogs map[int64]db.PrivateDialog) error {
 	switch typed := update.(type) {
 	case *tg.UpdateReadChannelDiscussionInbox:
-		return h.store.RecordCodexReadReceiptByTopic(ctx, botAPIChannelID(typed.ChannelID), typed.TopMsgID)
+		_, err := h.store.ObserveCodexTopicReadState(ctx, botAPIChannelID(typed.ChannelID), typed.TopMsgID, false, typed.ReadMaxID)
+		return err
 	case *tg.UpdateNewMessage:
 		return h.handleMessageClass(ctx, typed.Message, privateDialogs)
 	case *tg.UpdateNewChannelMessage:

@@ -174,6 +174,29 @@ func (s *Store) GetCodexThreadByTopic(ctx context.Context, chatID int64, topicID
 	`, chatID, topicID))
 }
 
+func (s *Store) ListCodexThreadsByChatID(ctx context.Context, chatID int64) ([]CodexThread, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, project_slug, telegram_chat_id, telegram_topic_id, title, codex_thread_id, created_at, updated_at
+		FROM codex_threads WHERE telegram_chat_id = ? ORDER BY telegram_topic_id
+	`, chatID)
+	if err != nil {
+		return nil, fmt.Errorf("list Codex threads by Telegram chat: %w", err)
+	}
+	defer rows.Close()
+	var threads []CodexThread
+	for rows.Next() {
+		var thread CodexThread
+		var created, updated string
+		if err := rows.Scan(&thread.ID, &thread.ProjectSlug, &thread.TelegramChatID, &thread.TelegramTopicID,
+			&thread.Title, &thread.CodexThreadID, &created, &updated); err != nil {
+			return nil, err
+		}
+		thread.CreatedAt, thread.UpdatedAt = parseDBTime(created), parseDBTime(updated)
+		threads = append(threads, thread)
+	}
+	return threads, rows.Err()
+}
+
 func (s *Store) GetCodexThreadMirrorByCodexID(ctx context.Context, codexThreadID string) (CodexThreadMirror, bool, error) {
 	var mirror CodexThreadMirror
 	var created, updated string
@@ -221,17 +244,43 @@ func (s *Store) SaveCodexThreadMirror(ctx context.Context, threadID int64, cwd s
 	return nil
 }
 
-func (s *Store) RecordCodexReadReceiptByTopic(ctx context.Context, telegramChatID int64, telegramTopicID int) error {
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO codex_read_receipts(thread_id, requested_at, delivered_at)
-		SELECT id, ?, '' FROM codex_threads
-		WHERE telegram_chat_id = ? AND telegram_topic_id = ?
-		ON CONFLICT(thread_id) DO UPDATE SET requested_at = excluded.requested_at, delivered_at = ''
-	`, nowText(), telegramChatID, telegramTopicID)
+func (s *Store) ObserveCodexTopicReadState(ctx context.Context, telegramChatID int64, telegramTopicID int, unread bool, readMaxID int) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("record Codex read receipt: %w", err)
+		return false, err
 	}
-	return nil
+	defer tx.Rollback()
+	var threadID int64
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM codex_threads WHERE telegram_chat_id = ? AND telegram_topic_id = ?`, telegramChatID, telegramTopicID).Scan(&threadID); errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	var previousUnread bool
+	var previousReadMax int
+	stateExists := true
+	if err := tx.QueryRowContext(ctx, `SELECT is_unread, read_max_id FROM codex_topic_read_states WHERE thread_id = ?`, threadID).Scan(&previousUnread, &previousReadMax); errors.Is(err, sql.ErrNoRows) {
+		stateExists = false
+	} else if err != nil {
+		return false, err
+	}
+	now := nowText()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO codex_topic_read_states(thread_id, is_unread, read_max_id, updated_at) VALUES(?, ?, ?, ?)
+		ON CONFLICT(thread_id) DO UPDATE SET is_unread = excluded.is_unread, read_max_id = excluded.read_max_id, updated_at = excluded.updated_at
+	`, threadID, unread, readMaxID, now); err != nil {
+		return false, err
+	}
+	shouldDeliver := !unread && (!stateExists || previousUnread || readMaxID > previousReadMax)
+	if shouldDeliver {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO codex_read_receipts(thread_id, requested_at, delivered_at) VALUES(?, ?, '')
+			ON CONFLICT(thread_id) DO UPDATE SET requested_at = excluded.requested_at, delivered_at = ''
+		`, threadID, now); err != nil {
+			return false, err
+		}
+	}
+	return shouldDeliver, tx.Commit()
 }
 
 func (s *Store) PendingCodexReadReceipts(ctx context.Context, limit int) ([]string, error) {

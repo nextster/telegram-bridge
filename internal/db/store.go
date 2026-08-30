@@ -382,6 +382,13 @@ var schema = []string{
 		delivered_at TEXT NOT NULL DEFAULT '',
 		FOREIGN KEY(thread_id) REFERENCES codex_threads(id) ON DELETE CASCADE
 	)`,
+	`CREATE TABLE IF NOT EXISTS codex_topic_read_states (
+		thread_id INTEGER PRIMARY KEY,
+		is_unread INTEGER NOT NULL,
+		read_max_id INTEGER NOT NULL DEFAULT 0,
+		updated_at TEXT NOT NULL,
+		FOREIGN KEY(thread_id) REFERENCES codex_threads(id) ON DELETE CASCADE
+	)`,
 	`CREATE TABLE IF NOT EXISTS codex_outbound_messages (
 		telegram_chat_id INTEGER NOT NULL,
 		telegram_topic_id INTEGER NOT NULL,

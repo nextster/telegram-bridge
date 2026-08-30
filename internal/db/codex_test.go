@@ -114,7 +114,8 @@ func TestCodexReadReceiptsAndOutboundMessages(t *testing.T) {
 	if err := store.SetCodexThreadID(ctx, thread.ID, "thread-1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.RecordCodexReadReceiptByTopic(ctx, project.TelegramChatID, 7); err != nil {
+	deliver, err := store.ObserveCodexTopicReadState(ctx, project.TelegramChatID, 7, false, 88)
+	if err != nil || !deliver {
 		t.Fatal(err)
 	}
 	ids, err := store.PendingCodexReadReceipts(ctx, 10)
@@ -126,6 +127,15 @@ func TestCodexReadReceiptsAndOutboundMessages(t *testing.T) {
 	}
 	if ids, err := store.PendingCodexReadReceipts(ctx, 10); err != nil || len(ids) != 0 {
 		t.Fatalf("acked receipts=%v err=%v", ids, err)
+	}
+	if deliver, err := store.ObserveCodexTopicReadState(ctx, project.TelegramChatID, 7, false, 88); err != nil || deliver {
+		t.Fatalf("unchanged read state deliver=%v err=%v", deliver, err)
+	}
+	if deliver, err := store.ObserveCodexTopicReadState(ctx, project.TelegramChatID, 7, true, 88); err != nil || deliver {
+		t.Fatalf("unread state deliver=%v err=%v", deliver, err)
+	}
+	if deliver, err := store.ObserveCodexTopicReadState(ctx, project.TelegramChatID, 7, false, 91); err != nil || !deliver {
+		t.Fatalf("new read state deliver=%v err=%v", deliver, err)
 	}
 
 	if err := store.ReserveCodexOutboundMessage(ctx, project.TelegramChatID, 7, "**hello**"); err != nil {
