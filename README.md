@@ -193,6 +193,28 @@ that cachebuster with the plugin change. The Codex installation record and
 generated plugin cache remain machine-local; start a new Codex task after a
 reload so it picks up the new skill and MCP schema.
 
+For local development, link future MCP processes to the current checkout once:
+
+```sh
+scripts/codex-plugin.sh dev:link
+scripts/codex-plugin.sh dev:status
+```
+
+The dev override uses a stable bootstrap under `$CODEX_HOME/telegram-bridge-dev`
+and runs the MCP adapter from this checkout. The adapter proxies the production
+read-only HTTP MCP and never opens the Telegram session. The normal workflow is:
+edit → `scripts/check.sh` → open a new Codex task. Tool names and schemas are
+fixed during MCP initialization, so an already-open task does not reload them.
+
+MCP adapter changes need no reinstall or process restart. Changes to the local
+Codex worker are a separate cycle: rebuild and restart only that worker with
+`scripts/install-codex-worker.sh telegram-bridge=/path/to/telegram-bridge`.
+Return new tasks to the versioned production plugin with:
+
+```sh
+scripts/codex-plugin.sh dev:unlink
+```
+
 ## Private message deletion alerts
 
 The logged-in user session keeps a private SQLite snapshot of direct,

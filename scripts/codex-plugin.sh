@@ -24,6 +24,11 @@ require_file() {
   fi
 }
 
+dev_command() {
+  require_command python3
+  python3 "${ROOT}/scripts/codex_plugin_dev.py" "$1"
+}
+
 prepare() {
   require_command "${CODEX_BIN}"
   require_command python3
@@ -120,11 +125,14 @@ install_plugin() {
 
 usage() {
   cat <<'EOF'
-Usage: scripts/codex-plugin.sh <validate|install|reload>
+Usage: scripts/codex-plugin.sh <validate|install|reload|dev:link|dev:status|dev:unlink>
 
   validate  Validate the tracked skill and plugin manifests.
   install   Register the repo marketplace if needed and install its current version.
   reload    Refresh the tracked cachebuster, validate, and reinstall.
+  dev:link  Point future MCP processes at this checkout without reinstalling the plugin.
+  dev:status Show the repo, installed plugin, effective MCP, worker, and drift.
+  dev:unlink Remove the dev override and return future tasks to the production plugin.
 EOF
 }
 
@@ -139,6 +147,15 @@ case "${1:-}" in
     validate
     python3 "${PLUGIN_CREATOR_ROOT}/scripts/update_plugin_cachebuster.py" "${PLUGIN_ROOT}"
     install_plugin
+    ;;
+  dev:link)
+    dev_command link
+    ;;
+  dev:status)
+    dev_command status
+    ;;
+  dev:unlink)
+    dev_command unlink
     ;;
   *)
     usage >&2

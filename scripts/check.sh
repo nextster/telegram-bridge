@@ -6,6 +6,7 @@ cd "${ROOT}"
 
 go test ./...
 go vet ./...
+python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 bash -n scripts/*.sh
 scripts/verify-repo-boundaries.sh
 
