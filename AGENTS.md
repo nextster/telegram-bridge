@@ -35,9 +35,10 @@ scripts/check.sh
 
 ## Codex plugin
 
-The canonical plugin source is `plugins/telegram-bridge`, and the repository-local
-marketplace manifest is `.agents/plugins/marketplace.json`. Do not edit a copy
-under `~/plugins/telegram-bridge` as an independent source.
+The canonical plugin source is `plugins/telegram-bridge`, and its tracked
+Nextster marketplace entry is `.agents/plugins/marketplace.json`. Installation
+syncs the plugin into `~/.codex/marketplaces/nextster`; do not edit that generated
+copy as an independent source.
 
 After plugin or skill changes, run:
 
@@ -45,8 +46,8 @@ After plugin or skill changes, run:
 scripts/codex-plugin.sh reload
 ```
 
-This validates the skill and plugin, refreshes the tracked cachebuster, and
-reinstalls from the repository marketplace. Commit the resulting manifest
+This validates the skill and plugin, refreshes the tracked cachebuster, syncs
+the shared Nextster marketplace, and reinstalls from it. Commit the resulting manifest
 version together with the plugin change.
 
 For uncommitted MCP adapter development, prefer `scripts/codex-plugin.sh

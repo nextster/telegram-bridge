@@ -46,7 +46,7 @@ elif args[:2] == ["mcp", "get"]:
 elif args[:3] == ["plugin", "list", "--json"]:
     version = os.environ.get("FAKE_PLUGIN_VERSION", "0.1.0+codex.test")
     source = os.environ["TELEGRAM_BRIDGE_REPO_ROOT"] + "/plugins/telegram-bridge"
-    print(json.dumps({"installed": [{"pluginId": "telegram-bridge@telegram-bridge-repo", "version": version, "installed": True, "enabled": True, "source": {"source": "local", "path": source}}], "available": []}))
+    print(json.dumps({"installed": [{"pluginId": "telegram-bridge@nextster", "version": version, "installed": True, "enabled": True, "source": {"source": "local", "path": source}}], "available": []}))
 else:
     print("unsupported fake codex args: " + repr(args), file=sys.stderr)
     raise SystemExit(2)

@@ -11,7 +11,7 @@ import tempfile
 import tomllib
 
 PLUGIN_NAME = "telegram-bridge"
-PLUGIN_ID = "telegram-bridge@telegram-bridge-repo"
+PLUGIN_ID = "telegram-bridge@nextster"
 WORKER_LABEL = "dev.nextster.telegram-bridge.codex-worker"
 
 

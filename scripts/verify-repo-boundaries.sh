@@ -18,7 +18,7 @@ skill = (plugin_root / "skills/telegram-bridge/SKILL.md").read_text()
 agent = (plugin_root / "skills/telegram-bridge/agents/openai.yaml").read_text()
 env_example = (root / ".env.example").read_text()
 
-assert marketplace["name"] == "telegram-bridge-repo"
+assert marketplace["name"] == "nextster"
 entries = [entry for entry in marketplace["plugins"] if entry.get("name") == "telegram-bridge"]
 assert len(entries) == 1
 assert entries[0]["source"] == {"source": "local", "path": "./plugins/telegram-bridge"}

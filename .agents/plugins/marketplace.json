@@ -1,7 +1,7 @@
 {
-  "name": "telegram-bridge-repo",
+  "name": "nextster",
   "interface": {
-    "displayName": "Telegram Bridge Repository"
+    "displayName": "Nextster"
   },
   "plugins": [
     {

@@ -6,6 +6,7 @@ PLUGIN_NAME="telegram-bridge"
 PLUGIN_ROOT="${ROOT}/plugins/${PLUGIN_NAME}"
 MARKETPLACE_FILE="${ROOT}/.agents/plugins/marketplace.json"
 CODEX_HOME="${CODEX_HOME:-${HOME}/.codex}"
+SHARED_MARKETPLACE_ROOT="${NEXTSTER_MARKETPLACE_DIR:-${CODEX_HOME}/marketplaces/nextster}"
 CODEX_BIN="${CODEX_BIN:-codex}"
 PLUGIN_CREATOR_ROOT="${PLUGIN_CREATOR_ROOT:-${CODEX_HOME}/skills/.system/plugin-creator}"
 SKILL_CREATOR_ROOT="${SKILL_CREATOR_ROOT:-${CODEX_HOME}/skills/.system/skill-creator}"
@@ -69,7 +70,7 @@ raise SystemExit(0 if any(item.get("pluginId") == selector and item.get("install
 verify_repo_plugin_available() {
   local name expected_path
   name="$(marketplace_name)"
-  expected_path="$(cd "${PLUGIN_ROOT}" && pwd -P)"
+  expected_path="$(cd "${SHARED_MARKETPLACE_ROOT}/plugins/${PLUGIN_NAME}" && pwd -P)"
   "${CODEX_BIN}" plugin list --marketplace "${name}" --available --json | python3 -c '
 import json, os, sys
 selector, expected_path = sys.argv[1:]
@@ -84,7 +85,7 @@ if len(matches) != 1 or os.path.realpath(matches[0].get("source", {}).get("path"
 verify_repo_plugin_installed() {
   local name expected_path
   name="$(marketplace_name)"
-  expected_path="$(cd "${PLUGIN_ROOT}" && pwd -P)"
+  expected_path="$(cd "${SHARED_MARKETPLACE_ROOT}/plugins/${PLUGIN_NAME}" && pwd -P)"
   "${CODEX_BIN}" plugin list --marketplace "${name}" --json | python3 -c '
 import json, os, sys
 selector, expected_path = sys.argv[1:]
@@ -102,13 +103,20 @@ ensure_marketplace() {
   local name registered_root
   name="$(marketplace_name)"
   registered_root="$(registered_marketplace_root "${name}")"
+  if [[ -n "${registered_root}" ]] && \
+     [[ "$(cd "${registered_root}" && pwd -P)" == "$(cd "${ROOT}" && pwd -P)" ]]; then
+    "${CODEX_BIN}" plugin remove "${PLUGIN_NAME}@telegram-bridge-repo" --json >/dev/null 2>&1 || true
+    "${CODEX_BIN}" plugin marketplace remove telegram-bridge-repo --json >/dev/null 2>&1 || true
+    "${CODEX_BIN}" plugin marketplace remove "${name}" --json >/dev/null 2>&1 || true
+    registered_root=""
+  fi
   if [[ -z "${registered_root}" ]]; then
-    "${CODEX_BIN}" plugin marketplace add "${ROOT}"
+    "${CODEX_BIN}" plugin marketplace add "${SHARED_MARKETPLACE_ROOT}"
     return
   fi
-  if [[ "$(cd "${registered_root}" && pwd -P)" != "$(cd "${ROOT}" && pwd -P)" ]]; then
+  if [[ "$(cd "${registered_root}" && pwd -P)" != "$(cd "${SHARED_MARKETPLACE_ROOT}" && pwd -P)" ]]; then
     printf 'marketplace %s already points to %s, expected %s\n' \
-      "${name}" "${registered_root}" "${ROOT}" >&2
+      "${name}" "${registered_root}" "${SHARED_MARKETPLACE_ROOT}" >&2
     exit 1
   fi
 }
@@ -116,9 +124,12 @@ ensure_marketplace() {
 install_plugin() {
   local name
   validate
+  python3 "${ROOT}/scripts/sync-nextster-marketplace.py" >/dev/null
   ensure_marketplace
   verify_repo_plugin_available
   name="$(marketplace_name)"
+  "${CODEX_BIN}" plugin remove "${PLUGIN_NAME}@telegram-bridge-repo" --json >/dev/null 2>&1 || true
+  "${CODEX_BIN}" plugin marketplace remove telegram-bridge-repo --json >/dev/null 2>&1 || true
   "${CODEX_BIN}" plugin add "${PLUGIN_NAME}@${name}"
   verify_repo_plugin_installed
 }

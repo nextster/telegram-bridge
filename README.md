@@ -174,9 +174,10 @@ No tools for sending, editing, forwarding, or deleting messages are exposed.
 
 ### Codex plugin
 
-The canonical Codex plugin source and its marketplace manifest are tracked in
+The canonical Codex plugin source and its marketplace entry are tracked in
 this repository under `plugins/telegram-bridge` and `.agents/plugins/marketplace.json`.
-Install it from the repository marketplace with:
+The install command syncs that source into the shared Nextster marketplace at
+`~/.codex/marketplaces/nextster` without replacing other Nextster plugins:
 
 ```sh
 scripts/codex-plugin.sh install
