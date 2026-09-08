@@ -9,12 +9,13 @@ import (
 )
 
 type Config struct {
-	Addr          string
-	DBPath        string
-	SessionPath   string
-	PublicBaseURL string
-	MCPToken      string
-	WorkerToken   string
+	Addr                string
+	DBPath              string
+	SessionPath         string
+	PublicBaseURL       string
+	MCPToken            string
+	WorkerToken         string
+	NotificationChatIDs []int64
 
 	BotToken        string
 	BotAdminChatIDs []int64
@@ -63,6 +64,16 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.BotAdminChatIDs = adminChatIDs
+	notificationChatIDs, err := parseInt64List(envFirst("TELEGRAM_BRIDGE_NOTIFICATION_CHAT_IDS"))
+	if err != nil {
+		return Config{}, fmt.Errorf("invalid TELEGRAM_BRIDGE_NOTIFICATION_CHAT_IDS")
+	}
+	for _, id := range notificationChatIDs {
+		if id >= 0 || id < -1997852516352 || id == -1000000000000 {
+			return Config{}, fmt.Errorf("TELEGRAM_BRIDGE_NOTIFICATION_CHAT_IDS must contain only Bot API group IDs")
+		}
+	}
+	cfg.NotificationChatIDs = notificationChatIDs
 
 	return cfg, nil
 }

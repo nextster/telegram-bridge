@@ -139,7 +139,11 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /login/restart", s.loginRestart)
 	mux.HandleFunc("GET /healthz", s.healthz)
 	if s.cfg.HasMCP() && s.monitor != nil {
-		mux.Handle("/mcp", mcpserver.New(s.monitor, s.cfg.MCPToken))
+		var notifications *notify.Notifications
+		if sender, ok := s.notifier.(notify.NotificationSender); ok && s.store != nil && len(s.cfg.NotificationChatIDs) > 0 {
+			notifications = notify.NewNotifications(s.store, sender, s.cfg.NotificationChatIDs)
+		}
+		mux.Handle("/mcp", mcpserver.New(s.monitor, s.cfg.MCPToken, notifications))
 		log.Print("MCP endpoint enabled at /mcp")
 	}
 	if s.cfg.HasWorkerAPI() {

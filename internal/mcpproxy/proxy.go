@@ -72,8 +72,8 @@ func listAllTools(ctx context.Context, remote *mcp.ClientSession) ([]*mcp.Tool, 
 			return nil, fmt.Errorf("list Telegram Bridge MCP tools: %w", err)
 		}
 		for _, tool := range result.Tools {
-			if tool.Annotations == nil || !tool.Annotations.ReadOnlyHint {
-				return nil, fmt.Errorf("refusing non-read-only MCP tool %q", tool.Name)
+			if tool.Annotations == nil || (!tool.Annotations.ReadOnlyHint && (tool.Name != "telegram_send_notification" || !tool.Annotations.IdempotentHint)) {
+				return nil, fmt.Errorf("refusing unsupported MCP write tool %q", tool.Name)
 			}
 		}
 		tools = append(tools, result.Tools...)

@@ -10,13 +10,16 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/nextster/telegram-bridge/internal/db"
 	"github.com/nextster/telegram-bridge/internal/monitor"
+	"github.com/nextster/telegram-bridge/internal/notify"
 )
 
 type Server struct {
-	monitor *monitor.Service
-	token   string
-	handler http.Handler
+	monitor       *monitor.Service
+	token         string
+	handler       http.Handler
+	notifications *notify.Notifications
 }
 
 type listDialogsInput struct {
@@ -47,8 +50,8 @@ type getHistoryInput struct {
 	OffsetID int    `json:"offset_id,omitempty" jsonschema:"Return messages older than this message ID; omit for latest messages"`
 }
 
-func New(service *monitor.Service, token string) *Server {
-	server := &Server{monitor: service, token: strings.TrimSpace(token)}
+func New(service *monitor.Service, token string, notifications *notify.Notifications) *Server {
+	server := &Server{monitor: service, token: strings.TrimSpace(token), notifications: notifications}
 	mcpServer := mcp.NewServer(&mcp.Implementation{Name: "telegram-bridge", Version: "1.0.0"}, nil)
 	mcp.AddTool(mcpServer, &mcp.Tool{
 		Name:        "telegram_list_dialogs",
@@ -65,9 +68,26 @@ func New(service *monitor.Service, token string) *Server {
 		Description: "Read recent or paginated message history from one Telegram chat belonging to the logged-in account. Read-only.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, server.getHistory)
-	streamable := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return mcpServer }, &mcp.StreamableHTTPOptions{Stateless: true})
+	if notifications != nil {
+		mcp.AddTool(mcpServer, &mcp.Tool{
+			Name:        "telegram_send_notification",
+			Description: "Send an explicitly authorized plain-text notification using the bridge bot to an operator-allowlisted group. Reuse event_id and identical text on retries. Has external side effects.",
+			Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, IdempotentHint: true, DestructiveHint: new(bool)},
+			InputSchema: map[string]any{"type": "object", "additionalProperties": false, "required": []string{"chat", "event_id", "text"}, "properties": map[string]any{
+				"chat":     map[string]any{"type": "string", "pattern": `^(channel|chat):[1-9][0-9]{0,11}$`},
+				"event_id": map[string]any{"type": "string", "pattern": `^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`},
+				"text":     map[string]any{"type": "string", "minLength": 1, "maxLength": 4096},
+			}},
+		}, server.sendNotification)
+	}
+	streamable := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return mcpServer }, &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true})
 	server.handler = server.authenticate(streamable)
 	return server
+}
+
+func (s *Server) sendNotification(ctx context.Context, _ *mcp.CallToolRequest, input notify.NotificationInput) (*mcp.CallToolResult, db.NotificationReceipt, error) {
+	receipt, err := s.notifications.Send(ctx, input)
+	return nil, receipt, err
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -103,7 +123,7 @@ func (s *Server) getHistory(ctx context.Context, _ *mcp.CallToolRequest, input g
 func (s *Server) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		provided := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if provided == r.Header.Get("Authorization") || subtle.ConstantTimeCompare([]byte(provided), []byte(s.token)) != 1 {
+		if s.token == "" || provided == r.Header.Get("Authorization") || subtle.ConstantTimeCompare([]byte(provided), []byte(s.token)) != 1 {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="telegram-bridge-mcp"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
