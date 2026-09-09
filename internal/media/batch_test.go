@@ -237,12 +237,15 @@ func TestParallelWorkersShareBudget(t *testing.T) {
 	}
 	runPool(t, s)
 	batch, err = s.WaitBatch(context.Background(), batch, 5*time.Second)
-	if err != nil || !batch.Settled || batch.AllSucceeded || p.calls.Load() != 2 {
+	if err != nil || batch.Settled || !batch.TimedOut || batch.AllSucceeded || p.calls.Load() != 2 {
 		t.Fatalf("shared budget failed: calls=%d err=%v", p.calls.Load(), err)
 	}
 	failed := 0
 	for _, item := range batch.Items {
 		if item.Job.ErrorCode == "budget_exceeded" {
+			if item.Job.Status != "budget_wait" || item.Job.Attempts != 0 || item.Job.ProviderAttempts != 0 || item.Job.NextAttemptAt == nil {
+				t.Fatal("budget wait consumed attempt or hid next window")
+			}
 			failed++
 		}
 	}

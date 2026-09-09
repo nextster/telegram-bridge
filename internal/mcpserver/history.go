@@ -63,6 +63,9 @@ func (s *Server) getHistory(ctx context.Context, _ *mcp.CallToolRequest, in getH
 		switch message.MediaKind {
 		case "voice", "video_note", "photo", "image":
 			refs = append(refs, media.Reference{Chat: message.Chat.Key, MessageID: message.ID})
+		case "", "text", "web_page":
+		default:
+			out.SkippedMedia = append(out.SkippedMedia, skippedMedia{Chat: message.Chat.Key, MessageID: message.ID, Kind: message.MediaKind, Reason: "unsupported_attachment"})
 		}
 	}
 	batch := media.Batch{Items: []media.BatchItem{}, Settled: true, AllSucceeded: true}

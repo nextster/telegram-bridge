@@ -44,11 +44,20 @@ func (p *OpenRouter) Recognize(ctx context.Context, operation string, options Op
 		}
 	} else if operation == "image" {
 		path = "/chat/completions"
+		prompt := imagePrompt
+		if options.DescriptionLanguage == "source" {
+			prompt += " Write description in the dominant language of the legible text in the image; use English when there is no identifiable text language. Never translate ocr_text."
+		} else if options.DescriptionLanguage != "" {
+			if !languagePattern.MatchString(options.DescriptionLanguage) {
+				return Result{}, Fail("invalid_description_language")
+			}
+			prompt += " Write description in language code " + options.DescriptionLanguage + ". Never translate ocr_text."
+		}
 		body = map[string]any{
 			"model": options.Model, "stream": false, "temperature": 0, "max_tokens": 8192,
 			"provider": map[string]any{"require_parameters": true, "allow_fallbacks": false},
 			"messages": []any{
-				map[string]any{"role": "system", "content": imagePrompt},
+				map[string]any{"role": "system", "content": prompt},
 				map[string]any{"role": "user", "content": []any{
 					map[string]string{"type": "text", "text": "Return the scene description and extracted text in separate fields."},
 					map[string]any{"type": "image_url", "image_url": map[string]string{"url": "data:" + prepared.MIME + ";base64," + encoded}},
@@ -79,12 +88,23 @@ func (p *OpenRouter) Recognize(ctx context.Context, operation string, options Op
 		return Result{}, &Fault{Code: "provider_outcome_unknown", Uncertain: true}
 	}
 	defer response.Body.Close()
+	metadata := &ProviderAttempt{RequestID: safeRequestID(response.Header.Get("X-Generation-Id")), HTTPStatus: response.StatusCode}
+	incomplete := func(code, reason string) (Result, error) {
+		metadata.FailureReason = reason
+		return Result{}, &Fault{Code: code, Uncertain: true, Provider: metadata}
+	}
 	if response.StatusCode != http.StatusOK {
-		return Result{}, providerHTTPError(response)
+		f := fault(providerHTTPError(response))
+		f.Provider = metadata
+		return Result{}, f
 	}
 	raw, err := io.ReadAll(io.LimitReader(response.Body, (1<<20)+1))
-	if err != nil || len(raw) > 1<<20 {
-		return Result{}, &Fault{Code: "provider_response_incomplete", Uncertain: true}
+	metadata.ResponseBytes = len(raw)
+	if len(raw) > 1<<20 {
+		return incomplete("provider_response_incomplete", "response_size_limit")
+	}
+	if err != nil {
+		return incomplete("provider_response_incomplete", "response_read_error")
 	}
 	var envelope struct {
 		Text      *string `json:"text"`
@@ -104,20 +124,24 @@ func (p *OpenRouter) Recognize(ctx context.Context, operation string, options Op
 			} `json:"message"`
 		} `json:"choices"`
 	}
-	if json.Unmarshal(raw, &envelope) != nil || (len(envelope.Error) > 0 && string(envelope.Error) != "null") {
-		return Result{}, &Fault{Code: "provider_invalid_response", Uncertain: true}
+	if json.Unmarshal(raw, &envelope) != nil {
+		return incomplete("provider_invalid_response", "invalid_json")
 	}
-	result := Result{Languages: []string{}, LanguageSource: "unavailable", CostUSD: envelope.Usage.Cost}
+	if metadata.RequestID == "" {
+		metadata.RequestID = safeRequestID(envelope.ID)
+	}
+	result := Result{Operation: operation, Languages: []string{}, LanguageSource: "unavailable", CostUSD: envelope.Usage.Cost}
 	if result.CostUSD != nil && (*result.CostUSD < 0 || *result.CostUSD > 1_000_000 || math.IsNaN(*result.CostUSD) || math.IsInf(*result.CostUSD, 0)) {
-		return Result{}, &Fault{Code: "provider_invalid_usage", Uncertain: true}
+		return incomplete("provider_invalid_usage", "invalid_cost")
 	}
-	result.ProviderRequestID = safeRequestID(response.Header.Get("X-Generation-Id"))
-	if result.ProviderRequestID == "" {
-		result.ProviderRequestID = safeRequestID(envelope.ID)
+	metadata.CostUSD = result.CostUSD
+	result.ProviderRequestID = metadata.RequestID
+	if len(envelope.Error) > 0 && string(envelope.Error) != "null" {
+		return incomplete("provider_invalid_response", "embedded_error")
 	}
 	if operation == "transcription" {
 		if envelope.Text == nil || len(*envelope.Text) > 256<<10 {
-			return Result{}, &Fault{Code: "provider_missing_transcript", Uncertain: true}
+			return incomplete("provider_missing_transcript", "missing_or_oversized_transcript")
 		}
 		result.Text = *envelope.Text
 		for _, language := range envelope.Languages {
@@ -128,13 +152,24 @@ func (p *OpenRouter) Recognize(ctx context.Context, operation string, options Op
 		if len(result.Languages) > 0 {
 			result.LanguageSource = "provider"
 		}
+		if len(result.Languages) == 1 {
+			result.Language = &result.Languages[0]
+		}
 		return result, nil
 	}
+	if len(envelope.Choices) == 1 {
+		switch reason := envelope.Choices[0].FinishReason; reason {
+		case "stop", "length", "content_filter", "tool_calls", "error":
+			metadata.FinishReason = reason
+		default:
+			metadata.FinishReason = "unknown"
+		}
+	}
 	if len(envelope.Choices) != 1 || envelope.Choices[0].Message.Content == nil || envelope.Choices[0].Message.Refusal != nil {
-		return Result{}, Fail("provider_refused_or_missing_result")
+		return incomplete("provider_refused_or_missing_result", "missing_content_or_refusal")
 	}
 	if envelope.Choices[0].FinishReason != "stop" {
-		return Result{}, Fail("provider_output_incomplete")
+		return incomplete("provider_output_incomplete", "non_stop_finish")
 	}
 	var image struct {
 		Description *string   `json:"description"`
@@ -144,12 +179,23 @@ func (p *OpenRouter) Recognize(ctx context.Context, operation string, options Op
 	decoder := json.NewDecoder(strings.NewReader(*envelope.Choices[0].Message.Content))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&image) != nil || image.Description == nil || image.OCRText == nil || image.Languages == nil || decoder.Decode(&struct{}{}) != io.EOF {
-		return Result{}, Fail("provider_invalid_image_result")
+		return incomplete("provider_invalid_image_result", "invalid_structured_output")
 	}
 	if len(*image.Description) > 64<<10 || len(*image.OCRText) > 256<<10 || len(*image.Languages) > 16 {
-		return Result{}, Fail("provider_output_limit")
+		return incomplete("provider_output_limit", "result_size_limit")
 	}
 	result.Description, result.OCRText, result.Languages, result.LanguageSource = *image.Description, *image.OCRText, *image.Languages, "provider"
+	for _, code := range result.Languages {
+		if !languagePattern.MatchString(code) {
+			return incomplete("provider_invalid_image_result", "invalid_language_code")
+		}
+	}
+	if len(result.Languages) == 0 {
+		result.LanguageSource = "unavailable"
+	}
+	if len(result.Languages) == 1 {
+		result.Language = &result.Languages[0]
+	}
 	return result, nil
 }
 

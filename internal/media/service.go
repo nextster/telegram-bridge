@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -76,6 +77,10 @@ func New(cfg config.MediaConfig, store *db.Store, source Source) (*Service, erro
 		root.Close()
 		return nil, err
 	}
+	if err := s.store.ReconcileMediaCosts(context.Background()); err != nil {
+		root.Close()
+		return nil, err
+	}
 	return s, nil
 }
 func (s *Service) Close() error { return s.root.Close() }
@@ -122,7 +127,7 @@ func (s *Service) enqueue(ctx context.Context, a Attachment, operation string, o
 	if err := s.checkAttachment(a, operation); err != nil {
 		return Job{}, err
 	}
-	p := jobPayload{Operation: operation, Source: a, Settings: options, Revision: pipelineVersion + ":" + s.cfg.CacheRevision}
+	p := jobPayload{Operation: operation, Source: a, Settings: options, Revision: s.revision(options)}
 	// Source display metadata is not part of the key: an author rename, caption
 	// edit or refreshed file reference must not trigger a second paid recognition.
 	key := Digest([]any{a.AccountID, a.Chat, a.MessageID, a.Fingerprint, operation, options, p.Revision})
@@ -165,9 +170,31 @@ func decodeJob(j db.MediaJob) (Job, error) {
 		return Job{}, Fail("invalid_job_state")
 	}
 	out := Job{ID: j.ID, Operation: p.Operation, Status: j.Status, ErrorCode: j.ErrorCode, Attempts: j.Attempts, ProviderAttempts: j.ProviderAttempts, CreatedAt: time.Unix(j.CreatedAt, 0).UTC(), UpdatedAt: time.Unix(j.UpdatedAt, 0).UTC(), Source: p.Source, Settings: p.Settings, SHA256: p.SHA256, Duration: p.Duration}
+	// Historical HTTP-200 validation failures also require charge reconciliation.
+	// Project the same state without rewriting or requeueing their stored jobs.
+	if j.Status == "failed" && j.ProviderAttempts > 0 {
+		switch j.ErrorCode {
+		case "provider_output_incomplete", "provider_refused_or_missing_result", "provider_invalid_image_result", "provider_output_limit":
+			out.Status = "uncertain"
+		}
+	}
+	if j.ResultMeta != "" && j.Status != "completed" {
+		var meta failureMeta
+		if json.Unmarshal([]byte(j.ResultMeta), &meta) != nil {
+			return Job{}, Fail("invalid_result_state")
+		}
+		out.Provider, out.Budget = meta.Provider, meta.Budget
+	}
 	if j.Status == "retry_wait" {
 		at := time.Unix(j.RetryAt, 0).UTC()
 		out.NextAttemptAt = &at
+		if j.ErrorCode == "budget_exceeded" {
+			out.Status = "budget_wait"
+			if j.RetryAt == math.MaxInt64 {
+				out.Status = "budget_blocked"
+				out.NextAttemptAt = nil
+			}
+		}
 	}
 	if j.Status == "completed" {
 		var result Result
@@ -175,6 +202,12 @@ func decodeJob(j db.MediaJob) (Job, error) {
 			return Job{}, Fail("invalid_result_state")
 		}
 		result.Text, result.Description, result.OCRText = j.Transcript, j.ImageDescription, j.ImageText
+		result.Operation = p.Operation
+		result.Language = nil
+		if result.LanguageSource == "provider" && len(result.Languages) == 1 && languagePattern.MatchString(result.Languages[0]) {
+			language := result.Languages[0]
+			result.Language = &language
+		}
 		out.Result = &result
 	}
 	return out, nil
@@ -270,7 +303,7 @@ func (s *Service) runOne(ctx context.Context) (bool, error) {
 	data, _ := json.Marshal(p)
 	j.Payload = string(data)
 	// 0.006 USD/minute reserved for audio (published price is 0.0045),
-	// 0.02 USD for one bounded image completion. Keep failed reservations too.
+	// 0.02 USD for one bounded image completion. Settle known actual costs.
 	reserve := int64(20_000)
 	if p.Operation == "transcription" {
 		reserve = int64(math.Ceil(prepared.Duration)) * 100
@@ -278,7 +311,7 @@ func (s *Service) runOne(ctx context.Context) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return true, s.finishError(j, Retry("interrupted_before_submission", time.Second))
 	}
-	if p.Revision != pipelineVersion+":"+s.cfg.CacheRevision {
+	if p.Revision != s.revision(p.Settings) {
 		return true, s.finishError(j, Fail("configuration_changed"))
 	}
 	if err := s.waitForProvider(ctx); err != nil {
@@ -288,8 +321,12 @@ func (s *Service) runOne(ctx context.Context) (bool, error) {
 		return true, s.finishError(j, Fail("telegram_account_changed"))
 	}
 	err = s.store.ReserveMedia(ctx, j.ID, j.Payload, reserve, s.cfg.DailyBudgetMicros, s.cfg.TotalBudgetMicros, s.now())
-	if errors.Is(err, db.ErrMediaBudget) {
-		return true, s.finishError(j, Fail("budget_exceeded"))
+	var budget *db.MediaBudget
+	if errors.As(err, &budget) {
+		saveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		slog.Info("media budget reservation refused", "job_id", j.ID, "error_code", "budget_exceeded", "scope", budget.Scope, "required_microusd", budget.Required, "daily_used_microusd", budget.DailyUsed, "total_used_microusd", budget.TotalUsed)
+		return true, s.store.DeferMediaBudget(saveCtx, j.ID, budget, s.now())
 	}
 	if err != nil {
 		return true, err
@@ -305,12 +342,12 @@ func (s *Service) runOne(ctx context.Context) (bool, error) {
 	j.ResultMeta = string(meta)
 	saveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	var cost *int64
 	if result.CostUSD != nil {
-		if err := s.store.RecordMediaCost(saveCtx, j.ID, int64(math.Ceil(*result.CostUSD*1_000_000))); err != nil {
-			return true, err
-		}
+		micros := int64(math.Ceil(*result.CostUSD * 1_000_000))
+		cost = &micros
 	}
-	return true, s.store.FinishMedia(saveCtx, j)
+	return true, s.store.FinishMediaWithCost(saveCtx, j, cost)
 }
 
 func (s *Service) finishError(j db.MediaJob, err error) error {
@@ -327,7 +364,25 @@ func (s *Service) finishError(j db.MediaJob, err error) error {
 	}
 	saveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return s.store.FinishMedia(saveCtx, j)
+	var cost *int64
+	if f.Provider != nil {
+		meta, _ := json.Marshal(failureMeta{Provider: f.Provider})
+		j.ResultMeta = string(meta)
+		if f.Provider.CostUSD != nil {
+			micros := int64(math.Ceil(*f.Provider.CostUSD * 1_000_000))
+			cost = &micros
+		}
+		slog.Info("media provider result requires review", "job_id", j.ID, "error_code", f.Code, "http_status", f.Provider.HTTPStatus, "finish_reason", f.Provider.FinishReason, "failure_reason", f.Provider.FailureReason)
+	}
+	return s.store.FinishMediaWithCost(saveCtx, j, cost)
+}
+
+func (s *Service) revision(options Options) string {
+	revision := pipelineVersion + ":" + s.cfg.CacheRevision
+	if options.DescriptionLanguage != "" {
+		revision += ":image-description-language-v1"
+	}
+	return revision
 }
 
 func (s *Service) waitForProvider(ctx context.Context) error {

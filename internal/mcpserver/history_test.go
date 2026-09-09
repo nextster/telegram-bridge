@@ -108,6 +108,9 @@ func TestHistoryPaidBoundaryAndRangeValidation(t *testing.T) {
 	if out.Messages[0].ReplyToID != 9 || out.NextOffsetID != 10 || !out.HasMore {
 		t.Fatal("source/pagination lost")
 	}
+	if len(out.SkippedMedia) != 1 || out.SkippedMedia[0].MessageID != 13 || out.SkippedMedia[0].Kind != "document" || out.SkippedMedia[0].Reason != "unsupported_attachment" {
+		t.Fatal("unsupported attachment silently skipped")
+	}
 	reader.mu.Lock()
 	opts := reader.opts
 	reader.mu.Unlock()
@@ -221,5 +224,21 @@ func TestHistoryWaitTimeoutLeavesDurableJobs(t *testing.T) {
 		if err != nil || j.Status != "queued" || j.ProviderAttempts != 0 {
 			t.Fatal("waiter timeout changed durable job")
 		}
+	}
+}
+
+func TestHistoryReportsUnsupportedVideoButNotLinkPreview(t *testing.T) {
+	s, _, reader := historyFixture(t)
+	reader.page.Messages = nil
+	for i, kind := range []string{"video", "unsupported", "web_page", "text"} {
+		reader.page.Messages = append(reader.page.Messages, monitor.TelegramMessage{ID: i + 1, Chat: monitor.TelegramPeer{Key: "chat:1"}, MediaKind: kind})
+	}
+	zero := 0
+	_, out, err := s.getHistory(context.Background(), nil, getHistoryInput{Chat: "chat:1", MinDate: "2023-01-01", ProcessMedia: true, ConfirmPaid: true, WaitSeconds: &zero})
+	if err != nil || out.Media == nil || len(out.Media.Items) != 0 || len(out.SkippedMedia) != 2 {
+		t.Fatal("unsupported scope hidden or queued", err)
+	}
+	if out.SkippedMedia[0].Kind != "video" || out.SkippedMedia[1].Kind != "unsupported" {
+		t.Fatal("link previews treated as media files")
 	}
 }

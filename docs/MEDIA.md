@@ -36,8 +36,12 @@ $0.0045/minute. The bridge conservatively reserves $0.006/minute, rounded up to 
 whole second. Model availability, prices, hint forwarding, and actual language
 fields must still be checked in the authorized cloud smoke test. OpenRouter's
 normalized STT response may omit detected languages: the result then explicitly
-returns `languages: []`, `language_source: unavailable`. Hints are never relabeled
-as detections.
+returns `language: null`, `languages: []`, `language_source: unavailable`.
+`language` is set only when exactly one provider-detected code is available.
+Hints are never relabeled as detections. No text-based guess, second AI call,
+or change to the existing STT request is made. OpenRouter's documented JSON STT
+response promises text/usage, not detected language; generic `verbose_json`
+examples for other models do not establish support for `openai/gpt-transcribe`.
 
 Images use private base64 data, following
 [OpenRouter image inputs](https://openrouter.ai/docs/guides/overview/multimodal/image-understanding),
@@ -48,6 +52,14 @@ OCR are stored in **separate SQLite columns** (`image_description`, `image_text`
 not concatenated into one text field. Speech uses a third column, `transcript`.
 Truncated, refused, malformed, or schema-incomplete responses are not reported
 as completed results. Image requests have 8192 output tokens and reserve $0.02.
+
+An explicit image setting `description_language: "ru"` (ISO code), or `"source"`
+(dominant language of visible text; English if unknown), controls only the
+description. OCR remains verbatim in the source language. Omission preserves
+the exact legacy prompt and cache key; its description language is unspecified.
+The option and its conditional `image-description-language-v1` prompt revision
+participate in the cache key. Do not add it to existing jobs merely to retry.
+Cached descriptions are never silently translated or invalidated.
 
 ## MCP workflow
 
@@ -143,7 +155,8 @@ repeating it queues the remainder while reusing those already saved.
 ## Durability and duplicate charges
 
 `media_jobs` holds durable identity, state, options, and results. `media_charges`
-holds budget reservations. `media_files` tracks expiring originals. These tables
+holds original per-submission reservations; `media_charge_settlements` holds
+verified costs for those attempts, including zero. `media_files` tracks expiring originals. These tables
 are additive migrations; existing Telegram/session tables are untouched.
 
 Cache identity includes authorized account, chat/message ID, immutable Telegram
@@ -166,15 +179,36 @@ change that requires fresh results, never as an automatic retry mechanism.
 | `preparing` | Downloading, probing, or converting on Fly |
 | `submitting` | Budget and submission intent committed before calling OpenRouter |
 | `retry_wait` | Safe transient failure; next attempt time is returned |
+| `budget_wait` | No submission; waits for released reservations or next UTC day |
+| `budget_blocked` | No submission; lifetime limit or single request exceeds a cap; no daily automatic reset |
 | `completed` | Full validated result committed |
 | `failed` | Unsupported media, limits, rejected request, or exhausted retries |
 | `uncertain` | Provider may have charged; result was not safely obtained |
 
-There are at most three attempts per job. Telegram transient errors and explicit
+There are at most three failure attempts per job; budget deferrals do not consume
+an attempt. Both budget states include `budget` with scope, required reservation,
+used amounts and limits in USD millionths; daily waits include `next_attempt_at`.
+They are not completed/failed: batches have `settled: false` and may time out.
+Internally both use `retry_wait` plus `budget_exceeded`, preserving the DB CHECK
+constraint and old-binary compatibility. Blocked jobs remain within queue caps.
+
+Telegram transient errors and explicit
 OpenRouter HTTP 429 rejections use bounded attempts and respect retry/flood-wait
 delays. Access errors, insufficient credits, and malformed requests fail without
 automatic retries. Network errors, ambiguous HTTP errors, and lost submission
-responses become `uncertain`.
+responses become `uncertain`. Unusable HTTP-200 outputs (truncated, refused or
+invalid structured image output) also become `uncertain`, not retryable failures.
+Historical paid image validation failures are projected as `uncertain` on reads
+without rewriting or restarting them. Both statuses were already terminal to
+the old worker; absence of an automatic retry was deliberate, not a missed retry.
+
+An unsuccessful provider attempt exposes optional `job.provider` metadata:
+request ID, HTTP status, allowlisted finish/failure reason, received byte count
+and validated cost when available. It never exposes partial text or raw bodies.
+`provider_output_incomplete` means a parsed completion did not finish with `stop`;
+`provider_response_incomplete` means a body read error or the 1 MiB envelope cap.
+`failure_reason` distinguishes those causes for new attempts. Known costs are
+settled even when the recognition output is unusable.
 
 An OpenRouter 429 persists a shared cooldown: other workers stop claiming new
 jobs and already prepared jobs wait before submission. Requests already in flight
@@ -212,11 +246,45 @@ The worker pool overlaps cloud requests while keeping local preparation serial;
 Fly stays at 512 MB, with no extra Machines. It does not add inference requests
 for the same source/settings or change models, token limits, or reservations.
 
-Budget reservations are committed atomically before paid calls and retained for
-failed/uncertain attempts. Reported costs larger than the reservation increase
-the ledger; lower costs do not free it. This is a conservative application budget,
-not a guarantee against future provider pricing changes. Use a dedicated capped
-OpenRouter key for the service and recheck prices before increasing limits.
+Budget reservations are committed atomically immediately before paid calls,
+not at enqueue. Effective usage sums each attempt's verified cost, or its full
+reservation when cost is unknown. Settlement can reduce a reservation or record
+a higher actual cost. Amounts round upward to USD millionths; zero is valid.
+The daily window is UTC and uses the submission's original day, including when
+settlement arrives the next day. Lifetime usage includes all days and attempts.
+An actual price above the reserve is accounted for but cannot be prevented after
+submission; these caps do not guarantee against future provider price changes.
+
+Startup backfills only the last attempt of completed legacy jobs with validated
+stored `cost_usd`. Unknown prior attempts and incomplete responses retain their
+reserves. Original reservation rows remain intact for audit/rollback. Settlement
+wakes existing budget waiters; daily exhaustion otherwise waits until UTC
+midnight. Historical `failed/budget_exceeded` jobs are not automatically requeued.
+Neither free result reads nor reconciliation create new paid jobs. Limits, key,
+models, concurrency, and cache settings are unchanged by this accounting fix.
+
+## Result shape and unsupported attachments
+
+Speech results contain `text` (including a valid empty string), not `description`
+or `ocr_text`. Image results contain `description` and `ocr_text` (including
+empty strings), not `text`. Common language/cost/request metadata remains shared;
+storage already used separate columns. Existing cached results get this
+operation-specific projection without inference or cache invalidation.
+
+Paid history returns `skipped_media` with chat/message ID, kind and
+`reason: unsupported_attachment` for attachment kinds outside voice, video note,
+photo and supported image document (text and link previews are excluded). These are not counted as successfully
+recognized; `media.all_succeeded` covers only selected supported media.
+Ordinary history remains free and unchanged. Direct batch calls still return
+per-item `unsupported_attachment` errors.
+
+Ordinary videos, animated files, generic audio documents, stickers and arbitrary
+documents are not enabled by this change. Supporting ordinary video audio would
+require explicit Telegram video classification, refreshed download identity,
+allowlisted demuxing and a verified audio stream, actual duration <=600 seconds,
+original size <=20 MiB, normalized upload <=8 MiB, and the same FFmpeg/download
+serialization and budgets. It must be a separately authorized extension of
+paid-history scope, with silent/video-only and malformed-container tests.
 
 Originals expire after the configured TTL. Download access stops at expiry even
 before deletion. A sweep runs every 15 minutes and before new downloads; startup

@@ -110,8 +110,12 @@ caches the unmodified Telegram file without paying an AI provider.
 - `keywords` (optional string array): at most 16, 80 UTF-8 bytes each, 512 bytes total. No control characters, angle brackets, or line breaks.
 - `languages` (optional string array): at most four language hints, e.g. `ru`, `en`. The provider validates supported codes.
 
-`telegram_analyze_image` additionally accepts `confirm_paid` and optional `model`
-(currently `openai/gpt-4.1-mini`). One call produces scene description and OCR;
+`telegram_analyze_image` additionally accepts `confirm_paid`, optional `model`
+(currently `openai/gpt-4.1-mini`) and, when exposed by the live schema,
+`description_language`: an ISO code or `source` (dominant visible-text language,
+English when unknown). Omission preserves the legacy prompt/cache. Changing the
+option creates a distinct paid job; it does not rewrite an existing result.
+One call produces scene description and OCR;
 these are stored in distinct database columns. There is no text-model rewrite
 of a voice transcript.
 
@@ -120,30 +124,41 @@ Both start tools return a durable job. `telegram_get_transcription` and
 reads never enqueue/retry or call a provider, even when processing is disabled.
 
 Job fields: `job_id`, `operation`, `status`, `error_code`, `attempts`,
-`provider_attempts`, `next_attempt_at` (retry wait only), `created_at`,
+`provider_attempts`, `next_attempt_at` (retry or daily budget wait), `created_at`,
 `updated_at`, `source`, `settings`, original-file `sha256`, measured
 `duration_seconds`, and `result` after completion. Source metadata includes
 `account_id`, `chat`, `message_id`, author, original UTC date, channel message
 link when available, and optional reply/topic identifiers.
 
 Result fields: `text` (speech), `description` (image scene), `ocr_text` (visible
-image text), `languages`, `language_source`, optional `provider_request_id`,
-and optional `cost_usd`. Fields not used by an operation are empty strings.
-OpenRouter may omit language detection for STT; this returns an empty array
-and `unavailable`, never a guessed value.
+image text), `language`, `languages`, `language_source`, optional `provider_request_id`,
+and optional `cost_usd`. Fields not used by an operation are omitted; old servers
+return empty strings instead. Valid empty speech/OCR fields remain present.
+`language` is null unless exactly one provider-detected code is available.
+OpenRouter may omit language detection for STT; this returns null, an empty array
+and `unavailable`, never a guessed value or a language hint.
 
 Statuses: `queued`, `preparing`, `submitting`, `retry_wait`, `completed`, `failed`,
-`uncertain`. `preparing` downloads and normalizes/probes media. `submitting`
+`uncertain`, `budget_wait`, `budget_blocked`. `preparing` downloads and normalizes/probes media. `submitting`
 marks a committed budget reservation before the paid request. At most three
 attempts are allowed; only Telegram transient errors and explicit HTTP 429
 responses are retried. Network loss, ambiguous provider errors, and interrupted
 submissions become `uncertain` and are never automatically recharged.
+Unusable HTTP-200 responses also require reconciliation. Optional `job.provider`
+retains request ID, HTTP status, finish/failure reason, received byte count and
+known cost; never raw or partial output. Old errors may have no such metadata.
+
+Budget states do not consume failure attempts. `job.budget` reports scope
+(`daily`, `total`, `request`), required/used/limit amounts in USD millionths.
+Daily waits resume on released reservations or UTC midnight; total/request
+blocks have no automatic daily reset. Both remain unsettled in batch responses.
+Do not reset old failed jobs or submit changed settings to evade these states.
 
 Defaults: three provider requests at a time (configurable 1..3), serial Telegram
 downloads/FFmpeg, 100 pending jobs, 1,000 retained jobs,
 20 MiB originals, 600 seconds including normalized audio padding, 8 MiB image
 uploads, 20 million pixels / 8192 per side, 200 MiB file cache, 24-hour original
-retention, $1 daily and $5 lifetime reservation budgets. Transcripts and image
+retention, $1 daily and $5 lifetime budgets (known costs plus unresolved reserves). Transcripts and image
 outputs persist with their deduplication records. Changed media, operation,
 model, normalized hints, or administrator cache revision create a new key.
 
@@ -154,7 +169,7 @@ model, normalized hints, or administrator cache revision create a new key.
 - `items` (required array, 1..100): `{chat, message_id}` references. Attachment kinds are resolved by the server; duplicates share a job while preserving input order.
 - `confirm_paid` (required boolean): true only for an explicitly authorized batch scope.
 - `audio` (optional object): `model`, `keywords`, `languages` with the same bounds as single transcription. Reuse identical settings to reuse the cache.
-- `image` (optional object): `model` only; image hints are rejected.
+- `image` (optional object): `model` and `description_language`; speech hints are rejected. Omit the language option when reusing legacy jobs.
 - `wait_seconds` (optional integer, 0..480): default 480, zero only enqueues.
 
 `telegram_get_media_batch` inputs: `items` (1..100 `{chat, message_id, job_id}`
@@ -170,3 +185,8 @@ Jobs and results persist independently of MCP request lifetimes. Partial batches
 overlapping histories, single calls, and concurrent retries reuse the same unique
 job key and atomic claim. An HTTP 429 persists a shared cooldown across the worker
 pool. Cost reservations remain atomic/shared, with no per-worker budget increase.
+
+Paid history additionally returns `skipped_media` for non-text attachments outside
+the supported voice/video-note/photo/image kinds. Each entry has `chat`,
+`message_id`, `kind`, `reason: unsupported_attachment`. Ordinary videos remain
+unsupported; batch success never establishes that skipped media were recognized.

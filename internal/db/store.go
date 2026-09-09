@@ -163,6 +163,9 @@ var schema = []string{
 		id INTEGER PRIMARY KEY, job_id TEXT NOT NULL REFERENCES media_jobs(id), day TEXT NOT NULL, amount INTEGER NOT NULL CHECK(amount>0)
 	)`,
 	`CREATE INDEX IF NOT EXISTS media_charge_day ON media_charges(day)`,
+	`CREATE TABLE IF NOT EXISTS media_charge_settlements (
+		charge_id INTEGER PRIMARY KEY REFERENCES media_charges(id), amount INTEGER NOT NULL CHECK(amount>=0)
+	)`,
 	`CREATE TABLE IF NOT EXISTS media_files (
 		id TEXT PRIMARY KEY, account_id INTEGER NOT NULL, chat TEXT NOT NULL, message_id INTEGER NOT NULL,
 		fingerprint TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL, mime TEXT NOT NULL, expires_at INTEGER NOT NULL

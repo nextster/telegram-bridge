@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/nextster/telegram-bridge/internal/db"
 )
 
 const pipelineVersion = "openrouter-media-v1-mp3-48k"
@@ -42,36 +44,79 @@ type Source interface {
 }
 
 type Options struct {
-	Model     string   `json:"model,omitempty"`
-	Keywords  []string `json:"keywords,omitempty"`
-	Languages []string `json:"languages,omitempty"`
+	Model               string   `json:"model,omitempty"`
+	Keywords            []string `json:"keywords,omitempty"`
+	Languages           []string `json:"languages,omitempty"`
+	DescriptionLanguage string   `json:"description_language,omitempty" jsonschema:"Image only: ISO language code or source (dominant visible-text language, English if unknown); omitted preserves legacy prompt/cache"`
 }
 
 type Result struct {
-	Text              string   `json:"text"`
-	Description       string   `json:"description"`
-	OCRText           string   `json:"ocr_text"`
+	Operation         string   `json:"-"`
+	Text              string   `json:"text,omitempty"`
+	Description       string   `json:"description,omitempty"`
+	OCRText           string   `json:"ocr_text,omitempty"`
+	Language          *string  `json:"language" jsonschema:"Single provider-detected language; null when absent, unknown, or multilingual; never inferred from hints"`
 	Languages         []string `json:"languages"`
 	LanguageSource    string   `json:"language_source"`
 	ProviderRequestID string   `json:"provider_request_id,omitempty"`
 	CostUSD           *float64 `json:"cost_usd,omitempty"`
 }
 
+// Emit empty valid transcripts/OCR, but not fields belonging to another media
+// operation. The Go value remains shared for storage and provider plumbing.
+func (r Result) MarshalJSON() ([]byte, error) {
+	type alias Result
+	b, err := json.Marshal(alias(r))
+	if err != nil {
+		return nil, err
+	}
+	var fields map[string]json.RawMessage
+	if err = json.Unmarshal(b, &fields); err != nil {
+		return nil, err
+	}
+	if r.Operation == "image" {
+		delete(fields, "text")
+		fields["description"], _ = json.Marshal(r.Description)
+		fields["ocr_text"], _ = json.Marshal(r.OCRText)
+	} else if r.Operation == "transcription" {
+		delete(fields, "description")
+		delete(fields, "ocr_text")
+		fields["text"], _ = json.Marshal(r.Text)
+	}
+	return json.Marshal(fields)
+}
+
+type ProviderAttempt struct {
+	RequestID     string   `json:"request_id,omitempty"`
+	HTTPStatus    int      `json:"http_status,omitempty"`
+	FinishReason  string   `json:"finish_reason,omitempty"`
+	ResponseBytes int      `json:"response_bytes,omitempty"`
+	FailureReason string   `json:"failure_reason,omitempty"`
+	CostUSD       *float64 `json:"cost_usd,omitempty"`
+}
+
+type failureMeta struct {
+	Provider *ProviderAttempt `json:"provider,omitempty"`
+	Budget   *db.MediaBudget  `json:"budget,omitempty"`
+}
+
 type Job struct {
-	ID               string     `json:"job_id"`
-	Operation        string     `json:"operation"`
-	Status           string     `json:"status"`
-	ErrorCode        string     `json:"error_code,omitempty"`
-	Attempts         int        `json:"attempts"`
-	ProviderAttempts int        `json:"provider_attempts"`
-	NextAttemptAt    *time.Time `json:"next_attempt_at,omitempty"`
-	CreatedAt        time.Time  `json:"created_at"`
-	UpdatedAt        time.Time  `json:"updated_at"`
-	Source           Attachment `json:"source"`
-	Settings         Options    `json:"settings"`
-	SHA256           string     `json:"sha256,omitempty"`
-	Duration         float64    `json:"duration_seconds"`
-	Result           *Result    `json:"result,omitempty"`
+	ID               string           `json:"job_id"`
+	Operation        string           `json:"operation"`
+	Status           string           `json:"status"`
+	ErrorCode        string           `json:"error_code,omitempty"`
+	Attempts         int              `json:"attempts"`
+	ProviderAttempts int              `json:"provider_attempts"`
+	NextAttemptAt    *time.Time       `json:"next_attempt_at,omitempty"`
+	CreatedAt        time.Time        `json:"created_at"`
+	UpdatedAt        time.Time        `json:"updated_at"`
+	Source           Attachment       `json:"source"`
+	Settings         Options          `json:"settings"`
+	SHA256           string           `json:"sha256,omitempty"`
+	Duration         float64          `json:"duration_seconds"`
+	Result           *Result          `json:"result,omitempty"`
+	Provider         *ProviderAttempt `json:"provider,omitempty" jsonschema:"Allowlisted metadata from an unusable provider response; not a recognition result"`
+	Budget           *db.MediaBudget  `json:"budget,omitempty"`
 }
 
 // Faults expose only stable codes, never upstream bodies or private media.
@@ -79,6 +124,7 @@ type Fault struct {
 	Code       string
 	RetryAfter time.Duration
 	Uncertain  bool
+	Provider   *ProviderAttempt
 }
 
 func (e *Fault) Error() string                     { return e.Code }
@@ -114,6 +160,9 @@ func normalizeOptions(o Options, model, operation string) (Options, error) {
 	}
 	if operation == "image" && (len(o.Keywords) > 0 || len(o.Languages) > 0) {
 		return o, Fail("image_hints_not_supported")
+	}
+	if o.DescriptionLanguage != "" && (operation != "image" || (o.DescriptionLanguage != "source" && !languagePattern.MatchString(o.DescriptionLanguage))) {
+		return o, Fail("invalid_description_language")
 	}
 	if len(o.Keywords) > 16 || len(o.Languages) > 4 {
 		return o, Fail("too_many_hints")

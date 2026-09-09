@@ -60,7 +60,7 @@ type getHistoryInput struct {
 	ConfirmPaid  bool          `json:"confirm_paid,omitempty" jsonschema:"Must be true to authorize paid recognition in this date-bounded history page"`
 	WaitSeconds  *int          `json:"wait_seconds,omitempty" jsonschema:"Processing wait timeout, 0..480 seconds; default 480. Pending jobs continue after timeout"`
 	Audio        media.Options `json:"audio,omitempty" jsonschema:"Optional speech model and bounded spelling/language hints; part of the cache identity"`
-	Image        media.Options `json:"image,omitempty" jsonschema:"Optional image model; no image hints supported"`
+	Image        media.Options `json:"image,omitempty" jsonschema:"Optional image model and description_language; part of cache identity"`
 }
 
 type historyOutput struct {
@@ -70,6 +70,14 @@ type historyOutput struct {
 	MinDate      string                    `json:"min_date,omitempty"`
 	MaxDate      string                    `json:"max_date,omitempty"`
 	Media        *media.Batch              `json:"media,omitempty"`
+	SkippedMedia []skippedMedia            `json:"skipped_media,omitempty" jsonschema:"Attachments not eligible for recognition; never submitted or silently counted as successes"`
+}
+
+type skippedMedia struct {
+	Chat      string `json:"chat"`
+	MessageID int    `json:"message_id"`
+	Kind      string `json:"kind"`
+	Reason    string `json:"reason"`
 }
 
 type Options struct {

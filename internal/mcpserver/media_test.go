@@ -149,6 +149,9 @@ func TestMediaMCPToolsSchemasAndExplicitStart(t *testing.T) {
 			if schema.Properties["url"] != nil || schema.Properties["path"] != nil {
 				t.Fatal("arbitrary file input exposed")
 			}
+			if tool.Name == "telegram_analyze_image" && schema.Properties["description_language"] == nil {
+				t.Fatal("image language setting missing from live schema")
+			}
 		}
 	}
 	call := func(name string, args map[string]any) *mcp.CallToolResult {
@@ -210,5 +213,78 @@ func TestMediaMCPToolsSchemasAndExplicitStart(t *testing.T) {
 	}
 	if !call("telegram_get_media_batch", map[string]any{"items": []map[string]any{{"chat": "channel:2", "message_id": 7, "job_id": id}}}).IsError {
 		t.Fatal("batch status crossed chat boundary")
+	}
+}
+
+func TestCompletedMediaMCPUsesOperationSpecificResult(t *testing.T) {
+	s, store, _ := historyFixture(t)
+	server := httptest.NewServer(s)
+	defer server.Close()
+	ctx := context.Background()
+	audio, err := s.media.Start(ctx, "chat:1", 10, "transcription", media.Options{}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	image, err := s.media.Start(ctx, "chat:1", 12, "image", media.Options{DescriptionLanguage: "ru"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = completeHistoryJobs(ctx, store, 2); err != nil {
+		t.Fatal(err)
+	}
+	unknown, err := s.media.Start(ctx, "chat:1", 13, "transcription", media.Options{}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j, err := store.ClaimMedia(ctx, 1, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.ReserveMedia(ctx, j.ID, j.Payload, 100, 1000000, 5000000, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	j.Status = "completed"
+	j.ResultMeta = `{"languages":[],"language_source":"unavailable"}`
+	if err = store.FinishMedia(ctx, j); err != nil {
+		t.Fatal(err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "projection-test", Version: "1"}, nil)
+	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		r.Header.Set("Authorization", "Bearer secret")
+		return http.DefaultTransport.RoundTrip(r)
+	})}
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: server.URL + "/mcp", HTTPClient: httpClient, DisableStandaloneSSE: true}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	for _, j := range []media.Job{audio, image, unknown} {
+		name := "telegram_get_transcription"
+		if j.Operation == "image" {
+			name = "telegram_get_image_analysis"
+		}
+		r, err := session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: map[string]any{"chat": j.Source.Chat, "message_id": j.Source.MessageID, "job_id": j.ID}})
+		if err != nil || r.IsError {
+			t.Fatal("MCP output schema rejected projected result", err)
+		}
+		result := r.StructuredContent.(map[string]any)["result"].(map[string]any)
+		if j.ID == unknown.ID {
+			if language, present := result["language"]; !present || language != nil || result["text"] != "" {
+				t.Fatal("MCP lost null language or empty transcript")
+			}
+			continue
+		}
+		if result["language"] != "en" {
+			t.Fatal("language missing from MCP")
+		}
+		if j.Operation == "transcription" {
+			if result["text"] != "spoken words" || result["description"] != nil || result["ocr_text"] != nil {
+				t.Fatal("MCP speech has image fields")
+			}
+		} else {
+			if result["text"] != nil || result["description"] != "scene" || result["ocr_text"] != "visible text" {
+				t.Fatal("MCP image projection wrong")
+			}
+		}
 	}
 }

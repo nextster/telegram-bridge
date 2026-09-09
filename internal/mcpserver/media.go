@@ -24,10 +24,11 @@ type transcribeInput struct {
 	Languages   []string `json:"languages,omitempty" jsonschema:"Up to 4 expected language codes; hints do not replace detected language metadata"`
 }
 type imageInput struct {
-	Chat        string `json:"chat" jsonschema:"Exact chat key returned by Telegram Bridge"`
-	MessageID   int    `json:"message_id" jsonschema:"Exact photo or image-document message ID"`
-	ConfirmPaid bool   `json:"confirm_paid" jsonschema:"Must be true only after the user explicitly requested paid cloud processing of this image"`
-	Model       string `json:"model,omitempty" jsonschema:"Optional model; currently openai/gpt-4.1-mini via OpenRouter"`
+	Chat                string `json:"chat" jsonschema:"Exact chat key returned by Telegram Bridge"`
+	MessageID           int    `json:"message_id" jsonschema:"Exact photo or image-document message ID"`
+	ConfirmPaid         bool   `json:"confirm_paid" jsonschema:"Must be true only after the user explicitly requested paid cloud processing of this image"`
+	Model               string `json:"model,omitempty" jsonschema:"Optional model; currently openai/gpt-4.1-mini via OpenRouter"`
+	DescriptionLanguage string `json:"description_language,omitempty" jsonschema:"ISO language code or source (visible text language, English if unknown); omission preserves legacy prompt/cache. Changing this creates a distinct paid job"`
 }
 type mediaResultInput struct {
 	Chat      string `json:"chat" jsonschema:"Original chat key"`
@@ -39,7 +40,7 @@ type mediaBatchInput struct {
 	Items       []media.Reference `json:"items" jsonschema:"1..100 exact chat/message references; duplicates reuse a single job"`
 	ConfirmPaid bool              `json:"confirm_paid" jsonschema:"Must be true after explicit authorization for all supplied media"`
 	Audio       media.Options     `json:"audio,omitempty" jsonschema:"Optional speech model, keywords, and languages"`
-	Image       media.Options     `json:"image,omitempty" jsonschema:"Optional image model; no hints supported"`
+	Image       media.Options     `json:"image,omitempty" jsonschema:"Optional image model and description_language; no speech hints"`
 	WaitSeconds *int              `json:"wait_seconds,omitempty" jsonschema:"0..480 seconds to wait, default 480; zero queues without waiting"`
 }
 
@@ -102,7 +103,7 @@ func (s *Server) transcribeMedia(ctx context.Context, _ *mcp.CallToolRequest, in
 	return nil, j, err
 }
 func (s *Server) analyzeImage(ctx context.Context, _ *mcp.CallToolRequest, in imageInput) (*mcp.CallToolResult, media.Job, error) {
-	j, err := s.media.Start(ctx, in.Chat, in.MessageID, "image", media.Options{Model: in.Model}, in.ConfirmPaid)
+	j, err := s.media.Start(ctx, in.Chat, in.MessageID, "image", media.Options{Model: in.Model, DescriptionLanguage: in.DescriptionLanguage}, in.ConfirmPaid)
 	return nil, j, err
 }
 func (s *Server) getTranscription(ctx context.Context, _ *mcp.CallToolRequest, in mediaResultInput) (*mcp.CallToolResult, media.Job, error) {
