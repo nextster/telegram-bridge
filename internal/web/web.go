@@ -53,6 +53,9 @@ type dashboardData struct {
 }
 
 func New(cfg config.Config, store *db.Store, monitorService *monitor.Service, notifier notify.SystemNotifier, codexNotifier CodexNotifier) (*Server, error) {
+	if err := cfg.ValidateNotifications(); err != nil {
+		return nil, err
+	}
 	if notifier == nil {
 		notifier = notify.Nop{}
 	}
@@ -141,6 +144,11 @@ func (s *Server) routes() http.Handler {
 	if s.cfg.HasMCP() && s.monitor != nil {
 		mux.Handle("/mcp", mcpserver.New(s.monitor, s.cfg.MCPToken))
 		log.Print("MCP endpoint enabled at /mcp")
+	}
+	if s.cfg.HasNotificationAPI() && s.monitor != nil && s.store != nil {
+		notifications := notify.NewNotifications(s.store, s.monitor, s.cfg.NotificationChatIDs)
+		mux.Handle("POST /notifications/v1/messages", notify.NewHTTPHandler(notifications, s.cfg.NotificationToken))
+		log.Print("Notification API enabled at /notifications/v1/messages")
 	}
 	if s.cfg.HasWorkerAPI() {
 		mux.HandleFunc("POST /worker/v1/jobs/claim", s.requireWorker(s.claimCodexJob))

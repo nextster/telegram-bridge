@@ -151,6 +151,18 @@ The old SSH path is still available:
 fly ssh console -C "telegram-bridge login"
 ```
 
+## HTTP notification API
+
+`POST /notifications/v1/messages` sends authorized notifications through the
+already-logged-in personal Telegram account. It uses a dedicated
+`TELEGRAM_BRIDGE_NOTIFICATION_TOKEN` and a server-side group allowlist
+(`TELEGRAM_BRIDGE_NOTIFICATION_CHAT_IDS`). The notification token must differ
+from MCP and worker tokens. MCP remains read-only and exposes no send tool.
+
+The JSON request contains `chat`, `event_id` and `text`. SQLite receipts deduplicate
+an event across clients and server restarts. See [API setup and recovery](docs/NOTIFICATIONS.md)
+for activation, verification, security boundaries and rollback.
+
 ## MCP
 
 Set a dedicated bearer token to enable the Streamable HTTP endpoint at

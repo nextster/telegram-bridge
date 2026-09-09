@@ -1,6 +1,6 @@
 {
   "name": "telegram-bridge",
-  "version": "0.1.0+codex.20260825223010",
+  "version": "0.1.0+codex.20260909110828",
   "description": "Search and inspect the authenticated Telegram account through the read-only telegram-bridge MCP service.",
   "author": {
     "name": "Artem"
