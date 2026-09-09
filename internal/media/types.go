@@ -103,6 +103,9 @@ func Digest(value any) string {
 }
 
 func normalizeOptions(o Options, model, operation string) (Options, error) {
+	// Callers may share a batch's hints between concurrent requests.
+	o.Keywords = append([]string(nil), o.Keywords...)
+	o.Languages = append([]string(nil), o.Languages...)
 	if o.Model == "" {
 		o.Model = model
 	}

@@ -35,6 +35,19 @@ type mediaResultInput struct {
 	JobID     string `json:"job_id" jsonschema:"Job ID returned by the explicit processing tool"`
 }
 
+type mediaBatchInput struct {
+	Items       []media.Reference `json:"items" jsonschema:"1..100 exact chat/message references; duplicates reuse a single job"`
+	ConfirmPaid bool              `json:"confirm_paid" jsonschema:"Must be true after explicit authorization for all supplied media"`
+	Audio       media.Options     `json:"audio,omitempty" jsonschema:"Optional speech model, keywords, and languages"`
+	Image       media.Options     `json:"image,omitempty" jsonschema:"Optional image model; no hints supported"`
+	WaitSeconds *int              `json:"wait_seconds,omitempty" jsonschema:"0..480 seconds to wait, default 480; zero queues without waiting"`
+}
+
+type mediaBatchResultInput struct {
+	Items       []media.JobReference `json:"items" jsonschema:"1..100 original chat/message/job references from the batch response"`
+	WaitSeconds *int                 `json:"wait_seconds,omitempty" jsonschema:"0..480 seconds to wait for existing jobs; default zero"`
+}
+
 func (s *Server) addMediaTools(server *mcp.Server) {
 	read := &mcp.ToolAnnotations{ReadOnlyHint: true}
 	no := false
@@ -45,6 +58,32 @@ func (s *Server) addMediaTools(server *mcp.Server) {
 	mcp.AddTool(server, &mcp.Tool{Name: "telegram_get_transcription", Description: "Read a transcription job status and full result, with language, duration and original message metadata. No paid calls.", Annotations: read}, s.getTranscription)
 	mcp.AddTool(server, &mcp.Tool{Name: "telegram_analyze_image", Description: "Explicit PAID action: analyze an image through OpenRouter. Description and verbatim OCR are stored separately from one response. Requires confirm_paid=true. Reuses cached results.", Annotations: write}, s.analyzeImage)
 	mcp.AddTool(server, &mcp.Tool{Name: "telegram_get_image_analysis", Description: "Read image analysis status, scene description and separately stored OCR text. No paid calls.", Annotations: read}, s.getImageAnalysis)
+	mcp.AddTool(server, &mcp.Tool{Name: "telegram_process_media_batch", Description: "Explicit PAID action: queue 1..100 voice/video-note/image references and wait for all jobs. Shared cached jobs prevent duplicate charges across concurrent batches and history calls. Returns per-item errors and pending jobs on timeout.", Annotations: write}, s.processMediaBatch)
+	mcp.AddTool(server, &mcp.Tool{Name: "telegram_get_media_batch", Description: "Read or wait for existing media jobs together, without starting paid work. Preserve original chat/message/job references; pending jobs continue independently of this call.", Annotations: read}, s.getMediaBatch)
+}
+
+func (s *Server) processMediaBatch(ctx context.Context, _ *mcp.CallToolRequest, in mediaBatchInput) (*mcp.CallToolResult, media.Batch, error) {
+	wait, err := waitDuration(in.WaitSeconds, media.MaxWait)
+	if err != nil {
+		return nil, media.Batch{}, err
+	}
+	batch, err := s.media.StartBatch(ctx, in.Items, media.BatchOptions{Audio: in.Audio, Image: in.Image}, in.ConfirmPaid)
+	if err == nil {
+		batch, err = s.media.WaitBatch(ctx, batch, wait)
+	}
+	return nil, batch, err
+}
+
+func (s *Server) getMediaBatch(ctx context.Context, _ *mcp.CallToolRequest, in mediaBatchResultInput) (*mcp.CallToolResult, media.Batch, error) {
+	wait, err := waitDuration(in.WaitSeconds, 0)
+	if err != nil {
+		return nil, media.Batch{}, err
+	}
+	batch, err := s.media.GetBatch(ctx, in.Items)
+	if err == nil {
+		batch, err = s.media.WaitBatch(ctx, batch, wait)
+	}
+	return nil, batch, err
 }
 
 func (s *Server) getAttachment(ctx context.Context, _ *mcp.CallToolRequest, in attachmentInput) (*mcp.CallToolResult, media.Attachment, error) {

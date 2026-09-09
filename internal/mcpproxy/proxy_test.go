@@ -89,7 +89,7 @@ func TestProxyRejectsNonReadOnlyTool(t *testing.T) {
 func TestProxyAllowsOnlyNamedIdempotentMediaActions(t *testing.T) {
 	no := false
 	yes := true
-	for _, name := range []string{"telegram_download_attachment", "telegram_transcribe_media", "telegram_analyze_image"} {
+	for _, name := range []string{"telegram_download_attachment", "telegram_transcribe_media", "telegram_analyze_image", "telegram_process_media_batch"} {
 		tool := &mcp.Tool{Name: name, Annotations: &mcp.ToolAnnotations{IdempotentHint: true, DestructiveHint: &no}}
 		if !allowedTool(tool) {
 			t.Fatalf("explicit media action %s rejected", name)
@@ -106,5 +106,13 @@ func TestProxyAllowsOnlyNamedIdempotentMediaActions(t *testing.T) {
 	}
 	if allowedTool(&mcp.Tool{Name: "telegram_send_message", Annotations: &mcp.ToolAnnotations{IdempotentHint: true, DestructiveHint: &no}}) {
 		t.Fatal("send tool allowed")
+	}
+	history := &mcp.Tool{Name: "telegram_get_history", Annotations: &mcp.ToolAnnotations{DestructiveHint: &no}}
+	if !allowedTool(history) {
+		t.Fatal("explicit media history rejected")
+	}
+	history.Annotations.DestructiveHint = &yes
+	if allowedTool(history) {
+		t.Fatal("destructive history accepted")
 	}
 }

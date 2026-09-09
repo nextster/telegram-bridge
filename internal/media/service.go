@@ -8,7 +8,10 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/nextster/telegram-bridge/internal/config"
 	"github.com/nextster/telegram-bridge/internal/db"
@@ -34,6 +37,7 @@ type Service struct {
 	provider  Provider
 	root      *os.Root
 	files     chan struct{}
+	running   atomic.Bool
 	now       func() time.Time
 }
 
@@ -86,6 +90,9 @@ func (s *Service) Metadata(ctx context.Context, chat string, id int) (Attachment
 	if err != nil {
 		return Attachment{}, fault(err)
 	}
+	if a.Chat != chat || a.MessageID != id || a.AccountID != s.source.AccountID() {
+		return Attachment{}, Fail("source_changed")
+	}
 	return a, nil
 }
 
@@ -108,13 +115,17 @@ func (s *Service) Start(ctx context.Context, chat string, id int, operation stri
 	if err != nil {
 		return Job{}, err
 	}
+	return s.enqueue(ctx, a, operation, options)
+}
+
+func (s *Service) enqueue(ctx context.Context, a Attachment, operation string, options Options) (Job, error) {
 	if err := s.checkAttachment(a, operation); err != nil {
 		return Job{}, err
 	}
 	p := jobPayload{Operation: operation, Source: a, Settings: options, Revision: pipelineVersion + ":" + s.cfg.CacheRevision}
 	// Source display metadata is not part of the key: an author rename, caption
 	// edit or refreshed file reference must not trigger a second paid recognition.
-	key := Digest([]any{a.AccountID, chat, id, a.Fingerprint, operation, options, p.Revision})
+	key := Digest([]any{a.AccountID, a.Chat, a.MessageID, a.Fingerprint, operation, options, p.Revision})
 	if existing, err := s.store.MediaJob(ctx, key); err == nil {
 		return decodeJob(existing)
 	} else if !errors.Is(err, sql.ErrNoRows) {
@@ -124,7 +135,7 @@ func (s *Service) Start(ctx context.Context, chat string, id int, operation stri
 		return Job{}, Fail("cloud_processing_disabled")
 	}
 	payload, _ := json.Marshal(p)
-	j, err := s.store.EnqueueMedia(ctx, db.MediaJob{ID: key, AccountID: a.AccountID, Chat: chat, MessageID: id, CreatedAt: s.now().Unix(), Payload: string(payload)})
+	j, err := s.store.EnqueueMedia(ctx, db.MediaJob{ID: key, AccountID: a.AccountID, Chat: a.Chat, MessageID: a.MessageID, CreatedAt: s.now().Unix(), Payload: string(payload)})
 	if errors.Is(err, db.ErrMediaLimit) {
 		return Job{}, Fail("queue_or_result_limit")
 	}
@@ -188,18 +199,37 @@ func (s *Service) checkAttachment(a Attachment, operation string) error {
 	return nil
 }
 
-// Exactly one queue consumer lives in serve. It does not open a Telegram session.
+// One bounded worker pool lives in serve and shares the existing Telegram client.
 func (s *Service) Run(ctx context.Context) error {
+	if !s.running.CompareAndSwap(false, true) {
+		return Fail("media_worker_already_running")
+	}
+	defer s.running.Store(false)
+	group, ctx := errgroup.WithContext(ctx)
+	for range s.cfg.Concurrency {
+		group.Go(func() error { return s.runWorker(ctx) })
+	}
+	group.Go(func() error {
+		ticker := time.NewTicker(15 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-ticker.C:
+				if err := s.cleanup(ctx, false); err != nil && ctx.Err() == nil {
+					return err
+				}
+			}
+		}
+	})
+	return group.Wait()
+}
+
+func (s *Service) runWorker(ctx context.Context) error {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	nextCleanup := s.now().Add(15 * time.Minute)
 	for {
-		if !s.now().Before(nextCleanup) {
-			if err := s.cleanup(ctx, false); err != nil {
-				return err
-			}
-			nextCleanup = s.now().Add(15 * time.Minute)
-		}
 		if s.cfg.Enabled && s.source.AccountID() != 0 {
 			worked, err := s.runOne(ctx)
 			if err != nil && ctx.Err() == nil {
@@ -248,6 +278,9 @@ func (s *Service) runOne(ctx context.Context) (bool, error) {
 	if p.Revision != pipelineVersion+":"+s.cfg.CacheRevision {
 		return true, s.finishError(j, Fail("configuration_changed"))
 	}
+	if err := s.waitForProvider(ctx); err != nil {
+		return true, s.finishError(j, err)
+	}
 	if s.source.AccountID() != p.Source.AccountID {
 		return true, s.finishError(j, Fail("telegram_account_changed"))
 	}
@@ -286,9 +319,32 @@ func (s *Service) finishError(j db.MediaJob, err error) error {
 		j.Status = "retry_wait"
 		j.RetryAt = s.now().Add(max(f.RetryAfter, time.Duration(j.Attempts*j.Attempts)*time.Second)).Unix()
 	}
+	if f.Code == "openrouter_rate_limited" {
+		j.RetryAt = s.now().Add(max(f.RetryAfter, time.Duration(j.Attempts*j.Attempts)*time.Second)).Unix()
+	}
 	saveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return s.store.FinishMedia(saveCtx, j)
+}
+
+func (s *Service) waitForProvider(ctx context.Context) error {
+	for {
+		until, err := s.store.MediaCooldown(ctx)
+		if err != nil {
+			return Fail("storage_unavailable")
+		}
+		delay := time.Unix(until, 0).Sub(s.now())
+		if delay <= 0 {
+			return nil
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return Retry("interrupted_before_submission", time.Second)
+		case <-timer.C:
+		}
+	}
 }
 
 func (s *Service) prepare(ctx context.Context, a Attachment, operation string) (Prepared, string, error) {

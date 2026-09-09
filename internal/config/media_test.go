@@ -13,6 +13,7 @@ func TestMediaConfigFailsClosed(t *testing.T) {
 	}
 	c.APIKey = "fake"
 	for _, mutate := range []func(*MediaConfig){
+		func(c *MediaConfig) { c.Concurrency = 0 }, func(c *MediaConfig) { c.Concurrency = 4 },
 		func(c *MediaConfig) { c.MaxBytes = 25_000_000 }, func(c *MediaConfig) { c.MaxSeconds = 601 },
 		func(c *MediaConfig) { c.RetentionHours = 0 }, func(c *MediaConfig) { c.DailyBudgetMicros = 0 },
 		func(c *MediaConfig) { c.TotalBudgetMicros = 1 }, func(c *MediaConfig) { c.AudioModel = "unapproved/model" },
@@ -29,11 +30,12 @@ func TestMediaConfigFailsClosed(t *testing.T) {
 func TestMediaConfigurationUsesOpenRouterSecret(t *testing.T) {
 	t.Setenv("OPENROUTER_API_KEY", "secret-fixture")
 	t.Setenv("TELEGRAM_BRIDGE_MEDIA_ENABLED", "true")
+	t.Setenv("TELEGRAM_BRIDGE_MEDIA_CONCURRENCY", "2")
 	c, err := loadMediaConfig("/data/test.db")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.APIKey != "secret-fixture" || c.Directory != "/data/media" || c.AudioModel != "openai/gpt-transcribe" {
+	if c.APIKey != "secret-fixture" || c.Directory != "/data/media" || c.AudioModel != "openai/gpt-transcribe" || c.Concurrency != 2 {
 		t.Fatal("wrong media configuration")
 	}
 	t.Setenv("TELEGRAM_BRIDGE_MEDIA_MAX_BYTES", "secret-not-an-integer")

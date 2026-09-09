@@ -92,8 +92,12 @@ func allowedTool(tool *mcp.Tool) bool {
 		return true
 	}
 	switch tool.Name {
-	case "telegram_download_attachment", "telegram_transcribe_media", "telegram_analyze_image":
+	case "telegram_download_attachment", "telegram_transcribe_media", "telegram_analyze_image", "telegram_process_media_batch":
 		return tool.Annotations.IdempotentHint && tool.Annotations.DestructiveHint != nil && !*tool.Annotations.DestructiveHint
+	case "telegram_get_history":
+		// History may explicitly enqueue media. Its date window can include new
+		// messages on a repeat, so the whole read is not annotated idempotent.
+		return tool.Annotations.DestructiveHint != nil && !*tool.Annotations.DestructiveHint
 	default:
 		return false
 	}

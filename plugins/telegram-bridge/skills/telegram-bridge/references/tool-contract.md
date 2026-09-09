@@ -1,6 +1,6 @@
 # telegram-bridge MCP tool contract
 
-The server exposes three history/search tools and six media tools over Streamable HTTP at `https://telegram-bridge.fly.dev/mcp`. Authentication uses `Authorization: Bearer ...`; the plugin obtains that value from `TELEGRAM_BRIDGE_MCP_TOKEN`. Media tools appear after the new server is deployed. Start a new task after deployment to refresh MCP discovery.
+The server exposes three history/search tools and eight media tools over Streamable HTTP at `https://telegram-bridge.fly.dev/mcp`. Authentication uses `Authorization: Bearer ...`; the plugin obtains that value from `TELEGRAM_BRIDGE_MCP_TOKEN`. Media tools appear after the new server is deployed. Start a new task after deployment to refresh MCP discovery.
 
 ## `telegram_list_dialogs`
 
@@ -41,8 +41,25 @@ Inputs:
 - `chat` (required string): stable key returned by a dialog or message result.
 - `limit` (optional integer): 1 through 100.
 - `offset_id` (optional integer): paginate toward older messages.
+- `min_date` / `max_date` (optional strings): inclusive/exclusive date bounds in RFC3339 or `YYYY-MM-DD`.
+- `process_media` (optional boolean, default false): recognize all supported media in this returned page and wait for results.
+- `confirm_paid` (optional boolean): must be true for `process_media`, which also requires `min_date`.
+- `audio` / `image` (optional objects): same shared model/hint settings as the batch tool below.
+- `wait_seconds` (optional integer): 0..480, default 480 in processing mode.
 
 Use this for surrounding conversational context or recent-chat summaries. Use message search for discovery.
+
+Free history does not create jobs. Paid history returns `media.items` containing
+cached jobs/results or individual errors, linked by chat/message ID. It never
+replaces message captions with recognized text. `has_more` and `next_offset_id`
+describe older pages within the bounds; use `offset_id: next_offset_id` until
+`has_more` is false. Each page is at most 100 messages (default 30). Empty pages
+can still have a continuation cursor when Telegram returns only service events.
+If `max_date` is omitted in paid mode, the response pins it to the current second
+boundary: reuse it for subsequent pages/retries so new messages do not widen the
+scope. History is annotated non-read-only because of its optional paid mode;
+the whole moving-window history call is not annotated idempotent, but its media
+jobs are deduplicated with every other start path.
 
 ## Result fields and limits
 
@@ -56,7 +73,7 @@ Message results include:
 - `text`: message text or caption; it can be empty for media-only messages.
 - `reply_to_id`: replied-to message ID, omitted when this is not a normal message reply. The target may be outside the retrieved page and can rarely belong to another peer.
 - `topic_id`: classic forum topic root message ID, omitted outside those topics. Telegram's General topic may not be distinguishable from an ordinary message through this field.
-- `media_kind`: stable attachment category. Text-only messages use `text`; other current values are `photo`, `document`, `voice`, `audio`, `video_note`, `animation`, `video`, `sticker`, `custom_emoji`, `web_page`, `location`, `live_location`, `venue`, `contact`, `poll`, `dice`, `game`, `invoice`, `story`, `giveaway`, `giveaway_results`, `paid_media`, `todo`, `video_stream`, `unsupported`, or the forward-compatible fallback `media`.
+- `media_kind`: stable attachment category. Text-only messages use `text`; other current values are `photo`, `image` (JPEG/PNG/WebP documents), `document`, `voice`, `audio`, `video_note`, `animation`, `video`, `sticker`, `custom_emoji`, `web_page`, `location`, `live_location`, `venue`, `contact`, `poll`, `dice`, `game`, `invoice`, `story`, `giveaway`, `giveaway_results`, `paid_media`, `todo`, `video_stream`, `unsupported`, or the forward-compatible fallback `media`.
 - `outgoing`: true for messages sent by the authenticated account; omitted when false.
 
 All optional fields are absent rather than populated with placeholder zero values. Message results do not include a ready-made Telegram message URL, but a link can be derived for channel peers:
@@ -122,9 +139,34 @@ attempts are allowed; only Telegram transient errors and explicit HTTP 429
 responses are retried. Network loss, ambiguous provider errors, and interrupted
 submissions become `uncertain` and are never automatically recharged.
 
-Defaults: one paid job at a time, 100 pending jobs, 1,000 retained jobs,
+Defaults: three provider requests at a time (configurable 1..3), serial Telegram
+downloads/FFmpeg, 100 pending jobs, 1,000 retained jobs,
 20 MiB originals, 600 seconds including normalized audio padding, 8 MiB image
 uploads, 20 million pixels / 8192 per side, 200 MiB file cache, 24-hour original
 retention, $1 daily and $5 lifetime reservation budgets. Transcripts and image
 outputs persist with their deduplication records. Changed media, operation,
 model, normalized hints, or administrator cache revision create a new key.
+
+## Batch processing and waiting
+
+`telegram_process_media_batch` inputs:
+
+- `items` (required array, 1..100): `{chat, message_id}` references. Attachment kinds are resolved by the server; duplicates share a job while preserving input order.
+- `confirm_paid` (required boolean): true only for an explicitly authorized batch scope.
+- `audio` (optional object): `model`, `keywords`, `languages` with the same bounds as single transcription. Reuse identical settings to reuse the cache.
+- `image` (optional object): `model` only; image hints are rejected.
+- `wait_seconds` (optional integer, 0..480): default 480, zero only enqueues.
+
+`telegram_get_media_batch` inputs: `items` (1..100 `{chat, message_id, job_id}`
+references), optional `wait_seconds` (0..480, default zero). It only reads/waits;
+no new jobs or paid requests are started.
+
+Both return `items` with original `chat`, `message_id`, and either `job` or
+`error_code`. Invalid overall input fails before queuing; unsupported/inaccessible
+items do not hide other results. `settled` means no jobs remain pending, including
+terminal failures; `all_succeeded` means every item completed successfully;
+`timed_out` means the wait expired or was canceled while jobs were still pending.
+Jobs and results persist independently of MCP request lifetimes. Partial batches,
+overlapping histories, single calls, and concurrent retries reuse the same unique
+job key and atomic claim. An HTTP 429 persists a shared cooldown across the worker
+pool. Cost reservations remain atomic/shared, with no per-worker budget increase.

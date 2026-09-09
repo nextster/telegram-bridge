@@ -1,8 +1,9 @@
 # Cloud media recognition
 
 The existing `telegram-bridge serve` process downloads Telegram attachments
-through its live authorized gotd client. A single background consumer processes
-explicitly queued jobs on Fly. SQLite and originals live on the existing `/data`
+through its live authorized gotd client. One background worker pool processes
+explicitly queued jobs on Fly, with up to three concurrent provider requests.
+SQLite and originals live on the existing `/data`
 volume. No Mac process, Telegram Desktop, second Telegram session, or local
 inference model is involved. FFmpeg performs only media probing/conversion.
 
@@ -80,6 +81,65 @@ compressed the image before Bridge receives it.
 The full MCP schema and status contract is in the plugin's
 [tool contract](../plugins/telegram-bridge/skills/telegram-bridge/references/tool-contract.md).
 
+### Batch and media-aware history
+
+`telegram_process_media_batch` accepts `items: [{chat, message_id}, ...]` (1..100),
+`confirm_paid: true`, optional `audio`/`image` settings, and `wait_seconds`.
+Voice, video notes, and image kinds are selected from authenticated Telegram
+metadata, never a caller URL or file path. Repeated items preserve input order
+but share one job. One bad/unsupported attachment gets an item-level error and
+does not hide the remaining results. Invalid references/settings or a batch
+larger than 100 are rejected before anything is queued.
+
+`telegram_get_history` now accepts inclusive `min_date`, exclusive `max_date`,
+and an explicit `process_media: true, confirm_paid: true` mode. This mode requires
+`min_date`, queues every supported attachment **in the returned history page**,
+and waits for their results. Ordinary history/search still never sends media to
+OpenRouter. A processing request covering the chat/date scope authorizes the
+page's media; separate calls/confirmation for each attachment are unnecessary.
+
+For example (IDs are illustrative):
+
+```json
+{
+  "chat": "channel:123",
+  "min_date": "2026-09-01T00:00:00+04:00",
+  "max_date": "2026-09-09T00:00:00+04:00",
+  "limit": 100,
+  "process_media": true,
+  "confirm_paid": true,
+  "audio": {"keywords": ["Realize", "тема", "подтема", "таймлайн"]}
+}
+```
+
+History remains bounded to 100 messages per page. `has_more` and
+`next_offset_id` describe older pages within the same date range, including
+pages containing only service messages. Repeat with `offset_id: next_offset_id`
+until `has_more: false` for complete range coverage. Reuse the returned
+`max_date`; when omitted on the first paid request it is pinned to the current
+second boundary. Otherwise a later read may legitimately include new messages.
+Media results are in `media.items`, each linked by `chat`/`message_id` and carrying
+the complete job/source metadata. Message captions are not replaced by transcripts.
+Image documents now have `media_kind: image`; stickers and unsupported formats
+remain excluded from recognition.
+
+Batch/history waiting defaults to 480 seconds, configurable per call from 0 to
+480. Zero queues without waiting. `telegram_get_media_batch` accepts
+`items: [{chat, message_id, job_id}, ...]` and optionally waits without enqueuing
+anything (default wait zero). Batch output preserves per-item job/error details:
+`settled` means every item is terminal, `all_succeeded` means every item completed
+successfully, and `timed_out` means the wait ended with pending work. Terminal
+failures/uncertain submissions do not cause infinite waits or imply success.
+`settled` applies only to those items, not to unread history pages.
+
+HTTP/client timeout, disconnection, or cancellation stops only the wait. Queued
+jobs remain on Fly. Resume via the batch result tool or repeat the same request
+with the same bounds/settings; neither creates another paid job. Single starts,
+overlapping batches, and history share the same database uniqueness constraint
+and atomic job claim. No separate Telegram client or request-owned worker is
+created. A canceled batch during metadata lookup may have queued only some items;
+repeating it queues the remainder while reusing those already saved.
+
 ## Durability and duplicate charges
 
 `media_jobs` holds durable identity, state, options, and results. `media_charges`
@@ -116,6 +176,11 @@ delays. Access errors, insufficient credits, and malformed requests fail without
 automatic retries. Network errors, ambiguous HTTP errors, and lost submission
 responses become `uncertain`.
 
+An OpenRouter 429 persists a shared cooldown: other workers stop claiming new
+jobs and already prepared jobs wait before submission. Requests already in flight
+may finish. This follows the provider's [retry/backoff guidance](https://openrouter.ai/docs/api/reference/limits)
+without switching models, adding fallback calls, or increasing the spending cap.
+
 Restart recovery requeues interrupted preparation (unless attempts are exhausted)
 and marks interrupted submission `uncertain`. Completed results survive restart.
 No documented cross-provider STT idempotency contract is assumed. This avoids
@@ -127,7 +192,9 @@ Use the saved provider request ID when available to reconcile provider records.
 
 | Setting | Default / hard boundary |
 | --- | --- |
-| Paid concurrency | One consumer inside `serve` |
+| `TELEGRAM_BRIDGE_MEDIA_CONCURRENCY` | 3 provider requests / configurable 1..3 |
+| Download and FFmpeg concurrency | One preparation at a time |
+| Batch and history wait | 480 seconds / configurable 0..480 per call |
 | Queue | 100 active jobs; 1000 retained job records |
 | `TELEGRAM_BRIDGE_MEDIA_MAX_BYTES` | 20 MiB / at most 24,000,000 bytes |
 | `TELEGRAM_BRIDGE_MEDIA_MAX_SECONDS` | 600 seconds / at most 600, including MP3 padding |
@@ -141,6 +208,9 @@ The file quota reserves room for normalization. Downloads are serialized, and
 both Telegram-declared and actually written sizes are bounded. FFprobe and
 FFmpeg have timeouts, restricted demuxers/protocols, one encoder thread, and a
 hard duration bound. Video notes contribute only their audio stream to STT.
+The worker pool overlaps cloud requests while keeping local preparation serial;
+Fly stays at 512 MB, with no extra Machines. It does not add inference requests
+for the same source/settings or change models, token limits, or reservations.
 
 Budget reservations are committed atomically before paid calls and retained for
 failed/uncertain attempts. Reported costs larger than the reservation increase
@@ -192,7 +262,7 @@ Fly memory setting becomes 512 MB. Use the regular Dockerfile/deploy path.
    fly deploy --app telegram-bridge --config fly.toml --ha=false --strategy immediate
    ```
 
-5. Verify `/healthz`, MCP authorization, all nine discovered tools, original
+5. Verify `/healthz`, MCP authorization, all eleven discovered tools, original
    download authorization, and `ffmpeg`/`ffprobe` in the running image. Set
    `TELEGRAM_BRIDGE_MEDIA_ENABLED=true` through an approved Fly config/secret
    update only when the paid smoke test is authorized. Restart/new MCP task
@@ -202,6 +272,10 @@ Fly memory setting becomes 512 MB. Use the regular Dockerfile/deploy path.
    transcription, and poll the full text through MCP. Verify IDs, author/date,
    reply link, measured duration, provider/model and language provenance. Repeat
    the same request and verify the job ID and provider-attempt count do not change.
+   Exercise concurrent single/batch/history requests for that same source and
+   settings; check that they reuse the same result. Then test a small mixed-media
+   batch and a date-bounded history page with `process_media: true`, including
+   duplicate calls and bounded waiting, within the separately approved scope.
 7. After that successful check, enumerate the authorized `<prefix>` chats, paginate
    their histories, deduplicate `(chat.key, message.id)`, and queue discovered
    `voice`/`video_note` messages within the configured budget. Persist the inventory
@@ -237,5 +311,8 @@ temporary SQLite databases, generated audio/video, and synthetic images.
 These checks cover authorization, bounded inputs/downloads, hints, rate limits,
 provider failures and redaction, no redirects, structured output, separate image
 storage, deduplication, budgets, account isolation, restart recovery, and cleanup.
+Concurrent tests cover the three-request ceiling, shared budgets/cooldown,
+duplicate batches/single/history calls, canceled waiters, pending/failed items,
+and date/pagination boundaries. They do not benchmark live provider throughput.
 They do **not** establish deployed availability, live hint/language forwarding,
 real recognition accuracy, provider charges, or the completed `<prefix>` batch.

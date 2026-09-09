@@ -116,16 +116,19 @@ func TestMediaMCPToolsSchemasAndExplicitStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(listed.Tools) != 9 {
+	if len(listed.Tools) != 11 {
 		t.Fatalf("got %d tools", len(listed.Tools))
 	}
 	for _, tool := range listed.Tools {
-		if tool.Name == "telegram_transcribe_media" || tool.Name == "telegram_analyze_image" || tool.Name == "telegram_download_attachment" {
+		if tool.Name == "telegram_get_history" && (tool.Annotations == nil || tool.Annotations.ReadOnlyHint || tool.Annotations.DestructiveHint == nil || *tool.Annotations.DestructiveHint) {
+			t.Fatal("paid-capable history incorrectly annotated")
+		}
+		if tool.Name == "telegram_transcribe_media" || tool.Name == "telegram_analyze_image" || tool.Name == "telegram_download_attachment" || tool.Name == "telegram_process_media_batch" {
 			if tool.Annotations == nil || tool.Annotations.ReadOnlyHint || !tool.Annotations.IdempotentHint || tool.Annotations.DestructiveHint == nil || *tool.Annotations.DestructiveHint {
 				t.Fatal("wrong media side-effect annotation")
 			}
 		}
-		if tool.Name == "telegram_analyze_image" || tool.Name == "telegram_transcribe_media" {
+		if tool.Name == "telegram_analyze_image" || tool.Name == "telegram_transcribe_media" || tool.Name == "telegram_process_media_batch" {
 			raw, _ := json.Marshal(tool.InputSchema)
 			var schema struct {
 				Required   []string       `json:"required"`
@@ -186,5 +189,26 @@ func TestMediaMCPToolsSchemasAndExplicitStart(t *testing.T) {
 	}
 	if !call("telegram_download_attachment", map[string]any{"chat": "channel:1", "message_id": 7, "path": "/etc/passwd"}).IsError {
 		t.Fatal("unknown path input accepted")
+	}
+	batchArgs := map[string]any{"items": []map[string]any{{"chat": "channel:1", "message_id": 7}, {"chat": "channel:1", "message_id": 7}}, "confirm_paid": false, "wait_seconds": 0}
+	if !call("telegram_process_media_batch", batchArgs).IsError {
+		t.Fatal("implicit paid batch accepted")
+	}
+	batchArgs["confirm_paid"] = true
+	batchCall := call("telegram_process_media_batch", batchArgs)
+	if batchCall.IsError {
+		t.Fatal("batch MCP failed")
+	}
+	batchItems := batchCall.StructuredContent.(map[string]any)["items"].([]any)
+	for _, item := range batchItems {
+		if item.(map[string]any)["job"].(map[string]any)["job_id"] != id {
+			t.Fatal("MCP batch did not reuse single job")
+		}
+	}
+	if call("telegram_get_media_batch", map[string]any{"items": []map[string]any{{"chat": "channel:1", "message_id": 7, "job_id": id}}}).IsError {
+		t.Fatal("batch status MCP failed")
+	}
+	if !call("telegram_get_media_batch", map[string]any{"items": []map[string]any{{"chat": "channel:2", "message_id": 7, "job_id": id}}}).IsError {
+		t.Fatal("batch status crossed chat boundary")
 	}
 }

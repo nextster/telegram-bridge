@@ -122,7 +122,7 @@ func attachmentFromMessage(accountID int64, source TelegramMessage, msg *tg.Mess
 				a.Duration = v.Duration
 			}
 		}
-		a.Supported = a.Kind == "voice" || a.Kind == "video_note" || (a.Kind == "document" && (a.MIME == "image/jpeg" || a.MIME == "image/png" || a.MIME == "image/webp"))
+		a.Supported = a.Kind == "voice" || a.Kind == "video_note" || ((a.Kind == "document" || a.Kind == "image") && (a.MIME == "image/jpeg" || a.MIME == "image/png" || a.MIME == "image/webp"))
 		if a.Supported && a.Kind == "document" {
 			a.Kind = "image"
 		}

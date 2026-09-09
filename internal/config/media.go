@@ -15,6 +15,7 @@ type MediaConfig struct {
 	AudioModel        string
 	ImageModel        string
 	CacheRevision     string
+	Concurrency       int
 	MaxBytes          int64
 	MaxSeconds        int
 	MaxDiskBytes      int64
@@ -28,7 +29,7 @@ func DefaultMediaConfig(dbPath string) MediaConfig {
 		Directory:  filepath.Join(filepath.Dir(dbPath), "media"),
 		AudioModel: "openai/gpt-transcribe", ImageModel: "openai/gpt-4.1-mini", CacheRevision: "1",
 		MaxBytes: 20 << 20, MaxSeconds: 600, MaxDiskBytes: 200 << 20, RetentionHours: 24,
-		DailyBudgetMicros: 1_000_000, TotalBudgetMicros: 5_000_000,
+		DailyBudgetMicros: 1_000_000, TotalBudgetMicros: 5_000_000, Concurrency: 3,
 	}
 }
 
@@ -67,6 +68,7 @@ func loadMediaConfig(dbPath string) (MediaConfig, error) {
 		}
 	}
 	for name, target := range map[string]*int{
+		"TELEGRAM_BRIDGE_MEDIA_CONCURRENCY":     &c.Concurrency,
 		"TELEGRAM_BRIDGE_MEDIA_MAX_SECONDS":     &c.MaxSeconds,
 		"TELEGRAM_BRIDGE_MEDIA_RETENTION_HOURS": &c.RetentionHours,
 	} {
@@ -82,6 +84,9 @@ func loadMediaConfig(dbPath string) (MediaConfig, error) {
 }
 
 func (c MediaConfig) Validate() error {
+	if c.Concurrency < 1 || c.Concurrency > 3 {
+		return fmt.Errorf("media concurrency must be 1..3")
+	}
 	if c.Enabled && strings.TrimSpace(c.APIKey) == "" {
 		return fmt.Errorf("media processing requires OPENROUTER_API_KEY")
 	}

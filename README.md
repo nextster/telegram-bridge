@@ -178,11 +178,11 @@ The MCP server reuses the live gotd client inside `telegram-bridge serve`, so it
 not create a second Telegram session or require another login. Clients must
 send `Authorization: Bearer <token>` on every request.
 
-Available read-only tools:
+History and search tools:
 
 - `telegram_list_dialogs` lists recent dialogs and returns stable chat keys.
 - `telegram_search_messages` searches globally or within one returned chat key.
-- `telegram_get_history` reads and paginates a chat's message history.
+- `telegram_get_history` reads date-bounded/paginated history; explicit `process_media: true` with `confirm_paid: true` queues and waits for supported media in the returned page.
 
 Media tools (available when the user API and MCP are configured):
 
@@ -192,10 +192,15 @@ Media tools (available when the user API and MCP are configured):
 - `telegram_get_transcription` reads its status and full cached result.
 - `telegram_analyze_image` explicitly queues paid image description and OCR.
 - `telegram_get_image_analysis` reads both separately stored image outputs.
+- `telegram_process_media_batch` queues up to 100 mixed-media references in one explicitly paid call and waits for shared cached jobs.
+- `telegram_get_media_batch` reads/waits for multiple existing jobs without new paid work.
 
 Cloud processing is disabled by default. It runs in the existing Fly `serve`
 process using OpenRouter, SQLite, and FFmpeg; the Mac worker, Telegram Desktop,
-and local inference models are not involved. History reads never enqueue media.
+and local inference models are not involved. Ordinary history reads never enqueue
+media; only the explicit paid history mode does. Up to three provider requests run
+concurrently with shared persistent deduplication and unchanged spending limits.
+History remains paginated; timeout returns pending jobs, never a false completion.
 See [media API, limits, deployment, and rollback](docs/MEDIA.md).
 
 No tools for sending, editing, forwarding, or deleting messages are exposed.
@@ -231,8 +236,9 @@ scripts/codex-plugin.sh dev:status
 
 The dev override uses a stable bootstrap under `$CODEX_HOME/telegram-bridge-dev`
 and runs the MCP adapter from this checkout. The adapter proxies the production
-HTTP MCP and never opens the Telegram session. It permits the three named,
-idempotent media actions in addition to read-only tools. The normal workflow is:
+HTTP MCP and never opens the Telegram session. It permits the named, idempotent
+media actions and non-destructive media-aware history in addition to read-only
+tools. The normal workflow is:
 edit → `scripts/check.sh` → open a new Codex task. Tool names and schemas are
 fixed during MCP initialization, so an already-open task does not reload them.
 

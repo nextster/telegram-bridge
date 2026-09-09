@@ -62,8 +62,17 @@ func (s *Store) EnqueueMedia(ctx context.Context, j MediaJob) (MediaJob, error) 
 
 func (s *Store) ClaimMedia(ctx context.Context, accountID int64, now time.Time) (MediaJob, error) {
 	return scanMediaJob(s.db.QueryRowContext(ctx, `UPDATE media_jobs SET status='preparing', attempts=attempts+1, updated_at=?
-		WHERE id=(SELECT id FROM media_jobs WHERE account_id=? AND status IN ('queued','retry_wait') AND retry_at<=? ORDER BY created_at,id LIMIT 1)
-		RETURNING `+mediaColumns, now.Unix(), accountID, now.Unix()))
+		WHERE id=(SELECT id FROM media_jobs WHERE account_id=? AND status IN ('queued','retry_wait') AND retry_at<=?
+		AND NOT EXISTS(SELECT 1 FROM media_jobs WHERE error_code='openrouter_rate_limited' AND retry_at>?)
+		ORDER BY created_at,id LIMIT 1)
+		RETURNING `+mediaColumns, now.Unix(), accountID, now.Unix(), now.Unix()))
+}
+
+// A persisted 429 pauses every worker, including after restart.
+func (s *Store) MediaCooldown(ctx context.Context) (int64, error) {
+	var until int64
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(retry_at),0) FROM media_jobs WHERE error_code='openrouter_rate_limited'`).Scan(&until)
+	return until, err
 }
 
 func (s *Store) RecoverMedia(ctx context.Context, now time.Time) error {
