@@ -11,6 +11,28 @@ import (
 
 type batchSource struct{ downloads atomic.Int32 }
 
+type interruptedProcessor struct{ cancel context.CancelFunc }
+
+func (p interruptedProcessor) Prepare(context.Context, string, string, Attachment, int) (Prepared, error) {
+	p.cancel()
+	return Prepared{}, Fail("invalid_media")
+}
+
+func TestInterruptedPreparationRemainsRetryable(t *testing.T) {
+	s, _, provider := testService(t)
+	j := startTestJob(t, s, "transcription", Options{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.processor = interruptedProcessor{cancel: cancel}
+	if worked, err := s.runOne(ctx); !worked || err != nil {
+		t.Fatalf("interrupted preparation: %v", err)
+	}
+	got := getTestJob(t, s, j.ID)
+	if got.Status != "retry_wait" || got.ErrorCode != "interrupted_before_submission" || provider.calls != 0 {
+		t.Fatal("shutdown turned unpaid preparation into a terminal failure")
+	}
+}
+
 func (s *batchSource) AccountID() int64 { return 1 }
 func (s *batchSource) Attachment(_ context.Context, chat string, id int) (Attachment, error) {
 	kind := "voice"
@@ -250,7 +272,7 @@ func TestRateLimitPausesOtherJobsAndSurvivesRecovery(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := s.waitForProvider(ctx); err == nil {
+	if err := s.waitForProvider(ctx); err == nil || fault(err).RetryAfter == 0 {
 		t.Fatal("cancelled provider wait ignored")
 	}
 	next := s.now().Add(time.Minute)

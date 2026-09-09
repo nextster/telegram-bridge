@@ -261,6 +261,9 @@ func (s *Service) runOne(ctx context.Context) (bool, error) {
 	}
 	prepared, sha, err := s.prepare(ctx, p.Source, p.Operation)
 	if err != nil {
+		if ctx.Err() != nil {
+			return true, s.finishError(j, Retry("interrupted_before_submission", time.Second))
+		}
 		return true, s.finishError(j, err)
 	}
 	p.SHA256, p.Duration = sha, prepared.Duration
@@ -331,6 +334,9 @@ func (s *Service) waitForProvider(ctx context.Context) error {
 	for {
 		until, err := s.store.MediaCooldown(ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				return Retry("interrupted_before_submission", time.Second)
+			}
 			return Fail("storage_unavailable")
 		}
 		delay := time.Unix(until, 0).Sub(s.now())
