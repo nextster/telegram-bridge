@@ -11,7 +11,7 @@ type NotificationReceipt struct {
 }
 
 // ReserveNotification commits intent before the remote side effect. A pending
-// row is never automatically replayed because Bot API has no idempotency key.
+// row is never automatically replayed after uncertain remote delivery.
 func (s *Store) ReserveNotification(ctx context.Context, chatID int64, eventID, digest string) (NotificationReceipt, bool, error) {
 	result, err := s.db.ExecContext(ctx, `INSERT INTO notification_receipts
 		(chat_id, event_id, digest, status, created_at) VALUES (?, ?, ?, 'pending', CURRENT_TIMESTAMP)

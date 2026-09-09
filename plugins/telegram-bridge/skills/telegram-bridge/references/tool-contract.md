@@ -71,7 +71,7 @@ The MCP surface can send only the notifications described below. It cannot edit,
 
 ## `telegram_send_notification`
 
-Present only when a bridge bot and `TELEGRAM_BRIDGE_NOTIFICATION_CHAT_IDS` are configured. This is a write tool (`readOnlyHint=false`, `idempotentHint=true`) and uses the existing bot identity. The same authenticated MCP token can send to operator-allowlisted groups.
+Present only when a configured user session and `TELEGRAM_BRIDGE_NOTIFICATION_CHAT_IDS` are configured. This is a write tool (`readOnlyHint=false`, `idempotentHint=true`) and uses the already-authorized personal account. The same authenticated MCP token can send to operator-allowlisted groups.
 
 - `chat`: a resolved `chat:<id>` or `channel:<id>` group key. Private-user destinations, broadcast channels and non-allowlisted groups are rejected.
 - `event_id`: 1-128 ASCII letters/digits/dots/underscores/colons/hyphens, beginning with a letter or digit; stable for one logical event.

@@ -109,7 +109,7 @@ func TestParseDate(t *testing.T) {
 type notificationSender struct{ sends atomic.Int32 }
 
 func (*notificationSender) CheckNotificationChat(context.Context, int64) error { return nil }
-func (s *notificationSender) SendNotification(context.Context, int64, string) (int, error) {
+func (s *notificationSender) SendNotification(context.Context, int64, string, string) (int, error) {
 	s.sends.Add(1)
 	return 42, nil
 }

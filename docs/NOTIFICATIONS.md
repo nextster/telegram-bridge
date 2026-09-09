@@ -1,15 +1,15 @@
 # Notification service
 
 The optional `telegram_send_notification` MCP tool sends plain text through the
-existing bridge bot to operator-allowlisted Telegram groups. It reuses `/mcp` and
+already-authorized Telegram account to operator-allowlisted Telegram groups. It reuses `/mcp` and
 its bearer authentication. Enabling notifications grants holders of
-`TELEGRAM_BRIDGE_MCP_TOKEN` this write capability for those groups. No new bot,
-Telegram login, polling loop or public webhook is needed.
+`TELEGRAM_BRIDGE_MCP_TOKEN` this write capability for those groups. No bot membership, new Telegram login, polling loop or public webhook is needed.
 
 ## Enable and verify
 
 1. Resolve the target with `telegram_list_dialogs` and confirm its group type.
-   Add the existing bridge bot to that group and allow it to send messages.
+   The authorized account must belong to that group and be able to send messages.
+   A bot does not need to be present.
 2. Configure `TELEGRAM_BRIDGE_NOTIFICATION_CHAT_IDS` on the server as a
    comma-separated list of negative Bot API group IDs. Leave it empty to keep
    MCP read-only. A basic `chat:123` maps to `-123`; a supergroup `channel:123`
@@ -22,7 +22,7 @@ Telegram login, polling loop or public webhook is needed.
 4. Check `/healthz`, confirm an unauthenticated `/mcp` request returns 401, and
    initialize an authenticated MCP client. `tools/list` must show
    `telegram_send_notification` with `readOnlyHint=false`, `idempotentHint=true`
-   and `destructiveHint=false`. Without a bot or allowlist, it must be absent.
+   and `destructiveHint=false`. Without a user API configuration or allowlist, it must be absent.
 5. Call the tool with an explicitly agreed test message and a unique event ID.
    Inspect the returned `message_id` in the intended group. Repeat the identical
    request and verify the same ID is returned without a second post. Verify a
@@ -55,15 +55,16 @@ status, creation time and returned message ID. Message bodies and bot credential
 are not stored in this table. Its primary key is `(chat_id, event_id)`.
 Receipts are retained to keep deduplication valid across restarts and callers.
 
-A `getChat` preflight verifies that the bot sees the exact destination as a group
-or supergroup. Failures before reservation are retryable. An atomic insertion
+A user-API preflight verifies that the account sees the exact destination as an
+active group or supergroup. Cached access hashes are scoped to that account. Failures before reservation are retryable. An atomic insertion
 reserves the event before sending, so concurrent callers cannot both send it.
 A confirmed response is stored as `sent`. An existing sent event returns its
 receipt; a changed text under the same event ID is rejected.
 
-Telegram [sendMessage](https://core.telegram.org/bots/api#sendmessage) has no
-idempotency key. The notification client deliberately bypasses the polling bot's
-retry wrapper and makes one bounded send attempt. Errors, response loss or a
+Delivery calls Telegram [messages.sendMessage](https://core.telegram.org/method/messages.sendMessage)
+through the live user client. A stable `random_id` derived from account/group/event
+identity protects transport retries, and supergroups explicitly use `send_as=self`.
+No second session is opened and no bot token is used. Errors, response loss or a
 process crash after reservation leave `pending`, which is treated as uncertain.
 A pending event is not automatically retried. An HTTP caller can safely repeat
 the same event, but must never invent a new ID to bypass pending protection.
@@ -82,7 +83,7 @@ the write tool. Older application versions ignore the additive receipts table;
 retain the table during rollback. The existing user session, monitor, watch rules,
 private-message archive and Codex worker do not change.
 
-The feature is inactive until the bot/allowlist are configured and the reviewed
+The feature is inactive until the user session/allowlist are configured and the reviewed
 server is deployed. Client projects must document that activation dependency.
 Tests use temporary databases and fake senders; they prove code behavior, not
 membership in a live group or production delivery.

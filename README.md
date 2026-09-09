@@ -6,7 +6,7 @@ Single-binary Telegram radar MVP:
 - Telegram bot via `telego`.
 - Telegram user API monitoring via `gotd/td`.
 - Mini App compatible web UI via `net/http` and `html/template`.
-- MCP search/history and opt-in, deduplicated group notifications through the existing bot.
+- MCP search/history and opt-in, deduplicated group notifications through the authorized user account.
 - Fly.io deployment with a persistent `/data` volume.
 
 All authored source and desired configuration live in this repository,
@@ -170,7 +170,7 @@ Available read-only tools:
 - `telegram_search_messages` searches globally or within one returned chat key.
 - `telegram_get_history` reads and paginates a chat's message history.
 
-`telegram_send_notification` is also exposed when the operator configures an allowed group list and the existing bot is available. It accepts a stable group key, an event ID and plain text. Notification writes use the same MCP bearer token and are limited to that allowlist; enabling this feature explicitly grants that token the notification capability. Other message edits, forwards and deletions remain unavailable.
+`telegram_send_notification` is also exposed when the operator configures an allowed group list and the user session is configured. It accepts a stable group key, an event ID and plain text. Notification writes use the same MCP bearer token and are limited to that allowlist; enabling this feature explicitly grants that token the notification capability. Other message edits, forwards and deletions remain unavailable.
 
 See [notification setup and recovery](docs/NOTIFICATIONS.md).
 

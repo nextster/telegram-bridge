@@ -16,7 +16,7 @@ import (
 
 type NotificationSender interface {
 	CheckNotificationChat(context.Context, int64) error
-	SendNotification(context.Context, int64, string) (int, error)
+	SendNotification(context.Context, int64, string, string) (int, error)
 }
 
 type NotificationInput struct {
@@ -60,7 +60,7 @@ func (n *Notifications) Send(ctx context.Context, input NotificationInput) (db.N
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if err := n.sender.CheckNotificationChat(ctx, chatID); err != nil {
-		return db.NotificationReceipt{}, errors.New("notification group is unavailable to the bridge bot")
+		return db.NotificationReceipt{}, errors.New("notification group is unavailable to the authorized account")
 	}
 	digest := fmt.Sprintf("%x", sha256.Sum256([]byte(input.Text)))
 	receipt, reserved, err := n.store.ReserveNotification(ctx, chatID, input.EventID, digest)
@@ -73,7 +73,7 @@ func (n *Notifications) Send(ctx context.Context, input NotificationInput) (db.N
 		}
 		return db.NotificationReceipt{}, errors.New("notification delivery is pending or uncertain; inspect the group before recovery")
 	}
-	messageID, err := n.sender.SendNotification(ctx, chatID, input.Text)
+	messageID, err := n.sender.SendNotification(ctx, chatID, input.Text, input.EventID)
 	if err != nil || messageID <= 0 {
 		return db.NotificationReceipt{}, errors.New("notification delivery is uncertain; no automatic retry; inspect the group")
 	}

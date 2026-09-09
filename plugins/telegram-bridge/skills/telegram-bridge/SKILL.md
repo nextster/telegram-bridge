@@ -50,6 +50,6 @@ Read `references/tool-contract.md` before constructing nontrivial date-bounded o
 - Do not edit, forward, or delete Telegram messages.
 - Send only explicitly requested notifications, only to a resolved group that the server operator has allowed. Never infer permission to send from a search or summarization task.
 - Use `telegram_send_notification` with `chat`, a stable `event_id`, and plain `text` (1-4096 UTF-16 code units). Reuse the same event ID and text on retries. Do not create a new event ID to bypass a pending or uncertain delivery; inspect the group first.
-- The notification sender is the existing bridge bot, not the authenticated personal account. Missing tool means notifications are disabled or the server/client needs an update; do not substitute a different sender.
+- The notification sender is the already-authorized personal Telegram account. Missing tool means notifications are disabled or the server/client needs an update; do not substitute a different sender.
 - Do not claim access to secret chats, locally deleted-only history, or deleted-message snapshots. Deletion snapshots currently feed bot alerts and are not exposed through MCP.
 - Do not use web search as a substitute for a requested Telegram search.

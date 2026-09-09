@@ -1,6 +1,6 @@
 {
   "name": "telegram-bridge",
-  "version": "0.1.0+codex.20260908184908",
+  "version": "0.1.0+codex.20260909105418",
   "description": "Search Telegram history and send authorized notifications to configured groups through Telegram Bridge.",
   "author": {
     "name": "Artem"

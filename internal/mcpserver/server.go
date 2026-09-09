@@ -71,7 +71,7 @@ func New(service *monitor.Service, token string, notifications *notify.Notificat
 	if notifications != nil {
 		mcp.AddTool(mcpServer, &mcp.Tool{
 			Name:        "telegram_send_notification",
-			Description: "Send an explicitly authorized plain-text notification using the bridge bot to an operator-allowlisted group. Reuse event_id and identical text on retries. Has external side effects.",
+			Description: "Send an explicitly authorized plain-text notification as the already-authorized Telegram user account to an operator-allowlisted group. Reuse event_id and identical text on retries. Has external side effects.",
 			Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, IdempotentHint: true, DestructiveHint: new(bool)},
 			InputSchema: map[string]any{"type": "object", "additionalProperties": false, "required": []string{"chat", "event_id", "text"}, "properties": map[string]any{
 				"chat":     map[string]any{"type": "string", "pattern": `^(channel|chat):[1-9][0-9]{0,11}$`},

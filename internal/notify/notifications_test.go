@@ -23,7 +23,7 @@ func (f *fakeSender) CheckNotificationChat(context.Context, int64) error {
 	}
 	return nil
 }
-func (f *fakeSender) SendNotification(context.Context, int64, string) (int, error) {
+func (f *fakeSender) SendNotification(context.Context, int64, string, string) (int, error) {
 	f.calls.Add(1)
 	if f.fail {
 		return 0, errors.New("private token")
