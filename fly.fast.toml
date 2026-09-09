@@ -10,6 +10,11 @@ primary_region = "fra"
   PORT = "8080"
   TELEGRAM_BRIDGE_DB = "/data/telegram-bridge.db"
   TELEGRAM_BRIDGE_SESSION = "/data/telegram.session"
+  TELEGRAM_BRIDGE_MEDIA_DIR = "/data/media"
+  TELEGRAM_BRIDGE_MEDIA_ENABLED = "false"
+  TELEGRAM_BRIDGE_MEDIA_CONCURRENCY = "3"
+  TELEGRAM_BRIDGE_MEDIA_DAILY_BUDGET_MICROUSD = "1000000"
+  TELEGRAM_BRIDGE_MEDIA_TOTAL_BUDGET_MICROUSD = "5000000"
 
 [mounts]
   source = "telegram_bridge_data"
@@ -18,7 +23,7 @@ primary_region = "fra"
 [[vm]]
   cpu_kind = "shared"
   cpus = 1
-  memory = "256mb"
+  memory = "512mb"
 
 [http_service]
   internal_port = 8080

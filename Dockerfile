@@ -15,7 +15,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 
 FROM alpine:3.22
 
-RUN adduser -D -H -u 10001 app
+RUN apk add --no-cache ca-certificates ffmpeg && adduser -D -H -u 10001 app
 WORKDIR /app
 COPY --from=build /out/telegram-bridge /usr/local/bin/telegram-bridge
 RUN mkdir -p /data && chown app:app /data

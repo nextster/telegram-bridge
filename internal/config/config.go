@@ -9,6 +9,7 @@ import (
 )
 
 type Config struct {
+	Media               MediaConfig
 	Addr                string
 	DBPath              string
 	SessionPath         string
@@ -77,6 +78,10 @@ func Load() (Config, error) {
 	}
 	cfg.NotificationChatIDs = notificationChatIDs
 	if err := cfg.ValidateNotifications(); err != nil {
+		return Config{}, err
+	}
+	cfg.Media, err = loadMediaConfig(cfg.DBPath)
+	if err != nil {
 		return Config{}, err
 	}
 

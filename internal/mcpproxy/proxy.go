@@ -72,8 +72,8 @@ func listAllTools(ctx context.Context, remote *mcp.ClientSession) ([]*mcp.Tool, 
 			return nil, fmt.Errorf("list Telegram Bridge MCP tools: %w", err)
 		}
 		for _, tool := range result.Tools {
-			if tool.Annotations == nil || !tool.Annotations.ReadOnlyHint {
-				return nil, fmt.Errorf("refusing non-read-only MCP tool %q", tool.Name)
+			if !allowedTool(tool) {
+				return nil, fmt.Errorf("refusing unapproved MCP action %q", tool.Name)
 			}
 		}
 		tools = append(tools, result.Tools...)
@@ -81,5 +81,24 @@ func listAllTools(ctx context.Context, remote *mcp.ClientSession) ([]*mcp.Tool, 
 			return tools, nil
 		}
 		cursor = result.NextCursor
+	}
+}
+
+func allowedTool(tool *mcp.Tool) bool {
+	if tool.Annotations == nil {
+		return false
+	}
+	if tool.Annotations.ReadOnlyHint {
+		return true
+	}
+	switch tool.Name {
+	case "telegram_download_attachment", "telegram_transcribe_media", "telegram_analyze_image", "telegram_process_media_batch":
+		return tool.Annotations.IdempotentHint && tool.Annotations.DestructiveHint != nil && !*tool.Annotations.DestructiveHint
+	case "telegram_get_history":
+		// History may explicitly enqueue media. Its date window can include new
+		// messages on a repeat, so the whole read is not annotated idempotent.
+		return tool.Annotations.DestructiveHint != nil && !*tool.Annotations.DestructiveHint
+	default:
+		return false
 	}
 }

@@ -20,6 +20,7 @@ import (
 	"github.com/nextster/telegram-bridge/internal/codexworker"
 	"github.com/nextster/telegram-bridge/internal/config"
 	"github.com/nextster/telegram-bridge/internal/db"
+	"github.com/nextster/telegram-bridge/internal/media"
 	"github.com/nextster/telegram-bridge/internal/monitor"
 	"github.com/nextster/telegram-bridge/internal/notify"
 	"github.com/nextster/telegram-bridge/internal/web"
@@ -222,6 +223,15 @@ func serve(ctx context.Context, cfg config.Config) error {
 	}
 
 	group, ctx := errgroup.WithContext(ctx)
+	if monitorService != nil && cfg.HasMCP() {
+		mediaService, err := media.New(cfg.Media, store, monitorService)
+		if err != nil {
+			return err
+		}
+		defer mediaService.Close()
+		webServer.SetMediaService(mediaService)
+		group.Go(func() error { return mediaService.Run(ctx) })
+	}
 	group.Go(func() error {
 		return webServer.Run(ctx)
 	})

@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
+command -v ffmpeg >/dev/null
+command -v ffprobe >/dev/null
 go test ./...
 go vet ./...
 python3 -m unittest discover -s scripts/tests -p 'test_*.py'

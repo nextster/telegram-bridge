@@ -1,7 +1,7 @@
 {
   "name": "telegram-bridge",
-  "version": "0.1.0+codex.20260909110828",
-  "description": "Search and inspect the authenticated Telegram account through the read-only telegram-bridge MCP service.",
+  "version": "0.1.0+codex.20260909210827",
+  "description": "Search Telegram, download private attachments, and explicitly request cloud transcription, image descriptions, and OCR.",
   "author": {
     "name": "Artem"
   },
@@ -18,7 +18,7 @@
   "interface": {
     "displayName": "Telegram Bridge",
     "shortDescription": "Search your Telegram chats from Codex",
-    "longDescription": "Search dialogs and messages, inspect recent history, and run date-bounded research against Artem's authenticated Telegram account through the read-only telegram-bridge MCP service.",
+    "longDescription": "Search dialogs and messages, inspect history, download authorized attachments, and explicitly process voice, video notes, and images through OpenRouter. Image descriptions and OCR are stored separately. Telegram messages are never modified by MCP.",
     "developerName": "Artem",
     "category": "Productivity",
     "capabilities": [

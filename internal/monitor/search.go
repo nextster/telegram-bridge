@@ -57,6 +57,14 @@ type HistoryOptions struct {
 	Chat     string
 	Limit    int
 	OffsetID int
+	MinDate  time.Time
+	MaxDate  time.Time
+}
+
+type HistoryPage struct {
+	Messages     []TelegramMessage `json:"messages"`
+	HasMore      bool              `json:"has_more"`
+	NextOffsetID int               `json:"next_offset_id,omitempty"`
 }
 
 type peerDirectory map[string]TelegramPeer
@@ -177,23 +185,71 @@ func (s *Service) SearchMessages(ctx context.Context, opts MessageSearchOptions)
 }
 
 func (s *Service) GetHistory(ctx context.Context, opts HistoryOptions) ([]TelegramMessage, error) {
+	page, err := s.GetHistoryPage(ctx, opts)
+	return page.Messages, err
+}
+
+func (s *Service) GetHistoryPage(ctx context.Context, opts HistoryOptions) (HistoryPage, error) {
+	if opts.OffsetID < 0 || (!opts.MinDate.IsZero() && !opts.MaxDate.IsZero() && !opts.MinDate.Before(opts.MaxDate)) {
+		return HistoryPage{}, errors.New("invalid history range")
+	}
 	api, userID, err := s.readyAPI()
 	if err != nil {
-		return nil, err
+		return HistoryPage{}, err
 	}
 	peer, err := s.resolvePeer(ctx, userID, opts.Chat)
 	if err != nil {
-		return nil, err
+		return HistoryPage{}, err
+	}
+	limit := normalizeLimit(opts.Limit, 30)
+	offsetDate := telegramDate(opts.MaxDate)
+	if opts.MaxDate.Nanosecond() != 0 {
+		offsetDate++
 	}
 	result, err := api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
-		Peer:     peer,
-		OffsetID: opts.OffsetID,
-		Limit:    normalizeLimit(opts.Limit, 30),
+		Peer: peer, OffsetID: opts.OffsetID, OffsetDate: offsetDate, Limit: limit,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("get Telegram history: %w", err)
+		return HistoryPage{}, fmt.Errorf("get Telegram history: %w", err)
 	}
-	return s.messagesFromResult(ctx, userID, result)
+	messages, err := s.messagesFromResult(ctx, userID, result)
+	if err != nil {
+		return HistoryPage{}, err
+	}
+	raw, _, _ := messageParts(result)
+	page := HistoryPage{Messages: make([]TelegramMessage, 0, len(messages)), HasMore: len(raw) >= limit}
+	// Service/empty messages also advance the cursor, even though they have no
+	// readable content. Otherwise a page of only service events can loop forever.
+	for _, item := range raw {
+		id, date := 0, time.Time{}
+		switch m := item.(type) {
+		case *tg.Message:
+			id, date = m.ID, unixTime(m.Date)
+		case *tg.MessageService:
+			id, date = m.ID, unixTime(m.Date)
+		case *tg.MessageEmpty:
+			id = m.ID
+		}
+		if id > 0 && (page.NextOffsetID == 0 || id < page.NextOffsetID) {
+			page.NextOffsetID = id
+		}
+		if !date.IsZero() && !opts.MinDate.IsZero() && date.Before(opts.MinDate) {
+			page.HasMore = false
+		}
+	}
+	for _, message := range messages {
+		if message.Chat.Key != opts.Chat || (opts.OffsetID > 0 && message.ID >= opts.OffsetID) || (!opts.MinDate.IsZero() && message.Date.Before(opts.MinDate)) || (!opts.MaxDate.IsZero() && !message.Date.Before(opts.MaxDate)) {
+			continue
+		}
+		page.Messages = append(page.Messages, message)
+	}
+	if page.NextOffsetID == 0 || (opts.OffsetID > 0 && page.NextOffsetID >= opts.OffsetID) {
+		page.HasMore = false
+	}
+	if !page.HasMore {
+		page.NextOffsetID = 0
+	}
+	return page, nil
 }
 
 func (s *Service) messagesFromResult(ctx context.Context, userID int64, result tg.MessagesMessagesClass) ([]TelegramMessage, error) {
@@ -324,9 +380,11 @@ func telegramDocumentKind(media *tg.MessageMediaDocument) string {
 	voice := media.GetVoice()
 	video := media.GetVideo()
 	audio := false
+	image := false
 
 	if documentClass, ok := media.GetDocument(); ok {
 		if document, ok := documentClass.(*tg.Document); ok {
+			image = document.MimeType == "image/jpeg" || document.MimeType == "image/png" || document.MimeType == "image/webp"
 			for _, attribute := range document.Attributes {
 				switch attribute := attribute.(type) {
 				case *tg.DocumentAttributeCustomEmoji:
@@ -367,6 +425,8 @@ func telegramDocumentKind(media *tg.MessageMediaDocument) string {
 		return "video"
 	case audio:
 		return "audio"
+	case image:
+		return "image"
 	default:
 		return "document"
 	}

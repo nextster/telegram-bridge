@@ -1,4 +1,6 @@
 .DS_Store
+.git/
+.context/
 .env
 .env.*
 data/
@@ -6,3 +8,5 @@ data/
 !.fly-build/telegram-bridge
 *.session
 *.db
+*.db-shm
+*.db-wal
