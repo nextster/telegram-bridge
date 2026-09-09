@@ -85,3 +85,26 @@ func TestProxyRejectsNonReadOnlyTool(t *testing.T) {
 		t.Fatal("New accepted a non-read-only remote tool")
 	}
 }
+
+func TestProxyAllowsOnlyNamedIdempotentMediaActions(t *testing.T) {
+	no := false
+	yes := true
+	for _, name := range []string{"telegram_download_attachment", "telegram_transcribe_media", "telegram_analyze_image"} {
+		tool := &mcp.Tool{Name: name, Annotations: &mcp.ToolAnnotations{IdempotentHint: true, DestructiveHint: &no}}
+		if !allowedTool(tool) {
+			t.Fatalf("explicit media action %s rejected", name)
+		}
+		tool.Annotations.DestructiveHint = &yes
+		if allowedTool(tool) {
+			t.Fatal("destructive annotation accepted")
+		}
+		tool.Annotations.DestructiveHint = &no
+		tool.Annotations.IdempotentHint = false
+		if allowedTool(tool) {
+			t.Fatal("non-idempotent action accepted")
+		}
+	}
+	if allowedTool(&mcp.Tool{Name: "telegram_send_message", Annotations: &mcp.ToolAnnotations{IdempotentHint: true, DestructiveHint: &no}}) {
+		t.Fatal("send tool allowed")
+	}
+}

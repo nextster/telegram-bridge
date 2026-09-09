@@ -6,7 +6,8 @@ Single-binary Telegram radar MVP:
 - Telegram bot via `telego`.
 - Telegram user API monitoring via `gotd/td`.
 - Mini App compatible web UI via `net/http` and `html/template`.
-- Read-only MCP access to the logged-in Telegram account.
+- MCP access to the logged-in Telegram account, with explicit cloud media processing.
+- OpenRouter voice/video-note transcription and separately stored image description/OCR.
 - Fly.io deployment with a persistent `/data` volume.
 
 All authored source and desired configuration live in this repository,
@@ -55,7 +56,7 @@ The CLI `login` command still works and stores the gotd user session in `data/te
 
 `/codex project :: prompt` creates, when needed, a private forum supergroup named `Codex · project`, adds it to the Telegram folder `Codex`, creates one forum topic per Codex task, and queues the prompt for a worker on the Mac. Further plain-text messages in that topic continue the same Codex task.
 
-The Fly app only stores the queue and Telegram/Codex identifiers. Codex runs locally through `codex app-server`, so project files and the Codex login stay on the Mac. The worker API uses `TELEGRAM_BRIDGE_WORKER_TOKEN`, separate from the read-only MCP token.
+For Codex execution, the Fly app stores the queue and Telegram/Codex identifiers. Codex runs locally through `codex app-server`, so project files and the Codex login stay on the Mac. The worker API uses `TELEGRAM_BRIDGE_WORKER_TOKEN`, separate from the MCP token. Cloud media recognition is independent of this Mac worker.
 
 Install or refresh the macOS LaunchAgent with one or more local project mappings:
 
@@ -157,7 +158,8 @@ fly ssh console -C "telegram-bridge login"
 already-logged-in personal Telegram account. It uses a dedicated
 `TELEGRAM_BRIDGE_NOTIFICATION_TOKEN` and a server-side group allowlist
 (`TELEGRAM_BRIDGE_NOTIFICATION_CHAT_IDS`). The notification token must differ
-from MCP and worker tokens. MCP remains read-only and exposes no send tool.
+from MCP and worker tokens. MCP exposes no send tool; its media recognition
+actions require explicit paid-processing requests.
 
 The JSON request contains `chat`, `event_id` and `text`. SQLite receipts deduplicate
 an event across clients and server restarts. See [API setup and recovery](docs/NOTIFICATIONS.md)
@@ -181,6 +183,20 @@ Available read-only tools:
 - `telegram_list_dialogs` lists recent dialogs and returns stable chat keys.
 - `telegram_search_messages` searches globally or within one returned chat key.
 - `telegram_get_history` reads and paginates a chat's message history.
+
+Media tools (available when the user API and MCP are configured):
+
+- `telegram_get_attachment` reads metadata without downloading or calling AI.
+- `telegram_download_attachment` caches an original and returns a bearer-protected download URL.
+- `telegram_transcribe_media` explicitly queues paid voice/video-note transcription.
+- `telegram_get_transcription` reads its status and full cached result.
+- `telegram_analyze_image` explicitly queues paid image description and OCR.
+- `telegram_get_image_analysis` reads both separately stored image outputs.
+
+Cloud processing is disabled by default. It runs in the existing Fly `serve`
+process using OpenRouter, SQLite, and FFmpeg; the Mac worker, Telegram Desktop,
+and local inference models are not involved. History reads never enqueue media.
+See [media API, limits, deployment, and rollback](docs/MEDIA.md).
 
 No tools for sending, editing, forwarding, or deleting messages are exposed.
 
@@ -215,7 +231,8 @@ scripts/codex-plugin.sh dev:status
 
 The dev override uses a stable bootstrap under `$CODEX_HOME/telegram-bridge-dev`
 and runs the MCP adapter from this checkout. The adapter proxies the production
-read-only HTTP MCP and never opens the Telegram session. The normal workflow is:
+HTTP MCP and never opens the Telegram session. It permits the three named,
+idempotent media actions in addition to read-only tools. The normal workflow is:
 edit → `scripts/check.sh` → open a new Codex task. Tool names and schemas are
 fixed during MCP initialization, so an already-open task does not reload them.
 

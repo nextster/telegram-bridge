@@ -1,12 +1,12 @@
 interface:
   display_name: "Telegram Bridge"
-  short_description: "Search and inspect your Telegram chats"
+  short_description: "Search Telegram and process requested media"
   default_prompt: "Use $telegram-bridge to search my Telegram chats for a recent conversation or listing."
 dependencies:
   tools:
     - type: "mcp"
       value: "telegram-bridge"
-      description: "Read-only access to the authenticated Telegram account"
+      description: "Telegram search, private downloads, and explicitly requested cloud recognition"
       transport: "streamable_http"
       url: "https://telegram-bridge.fly.dev/mcp"
 policy:

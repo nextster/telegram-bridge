@@ -1,6 +1,6 @@
 # telegram-bridge MCP tool contract
 
-The server exposes three read-only tools over Streamable HTTP at `https://telegram-bridge.fly.dev/mcp`. Authentication uses `Authorization: Bearer ...`; the plugin obtains that value from `TELEGRAM_BRIDGE_MCP_TOKEN`.
+The server exposes three history/search tools and six media tools over Streamable HTTP at `https://telegram-bridge.fly.dev/mcp`. Authentication uses `Authorization: Bearer ...`; the plugin obtains that value from `TELEGRAM_BRIDGE_MCP_TOKEN`. Media tools appear after the new server is deployed. Start a new task after deployment to refresh MCP discovery.
 
 ## `telegram_list_dialogs`
 
@@ -68,3 +68,63 @@ All optional fields are absent rather than populated with placeholder zero value
 Copy all path components exactly from the tool result. Do not derive them from titles, sender names, or guessed peer IDs.
 
 The MCP surface cannot send, edit, forward, or delete messages. It does not expose secret chats or the bot's deleted-message snapshot archive.
+
+## Media tools
+
+All media inputs require `chat` (the exact returned chat key) and `message_id`
+(a positive message ID). They do not accept arbitrary URLs, filenames, paths,
+Telegram session files, file references, or provider keys.
+
+`telegram_get_attachment` returns the attachment's `kind`, `mime_type`,
+`size_bytes`, Telegram-declared `duration_seconds`, `supported`, fingerprint,
+and source metadata. This is free of AI calls. Supported media: voice, video
+notes, photos, and JPEG/PNG/WebP image documents. Ordinary videos, audio files,
+stickers, ephemeral attachments, and other documents are not processed.
+
+`telegram_download_attachment` returns `file_id`, `download_url`, `sha256`,
+`size_bytes`, `mime_type`, `expires_at`, and `source`. GET/HEAD of the URL requires
+the same bearer token as MCP; there are no public/signed-token links. This
+caches the unmodified Telegram file without paying an AI provider.
+
+`telegram_transcribe_media` additionally accepts:
+
+- `confirm_paid` (required boolean): must be `true` after an explicit user request.
+- `model` (optional): currently `openai/gpt-transcribe`, via OpenRouter.
+- `keywords` (optional string array): at most 16, 80 UTF-8 bytes each, 512 bytes total. No control characters, angle brackets, or line breaks.
+- `languages` (optional string array): at most four language hints, e.g. `ru`, `en`. The provider validates supported codes.
+
+`telegram_analyze_image` additionally accepts `confirm_paid` and optional `model`
+(currently `openai/gpt-4.1-mini`). One call produces scene description and OCR;
+these are stored in distinct database columns. There is no text-model rewrite
+of a voice transcript.
+
+Both start tools return a durable job. `telegram_get_transcription` and
+`telegram_get_image_analysis` additionally require its `job_id`. These result
+reads never enqueue/retry or call a provider, even when processing is disabled.
+
+Job fields: `job_id`, `operation`, `status`, `error_code`, `attempts`,
+`provider_attempts`, `next_attempt_at` (retry wait only), `created_at`,
+`updated_at`, `source`, `settings`, original-file `sha256`, measured
+`duration_seconds`, and `result` after completion. Source metadata includes
+`account_id`, `chat`, `message_id`, author, original UTC date, channel message
+link when available, and optional reply/topic identifiers.
+
+Result fields: `text` (speech), `description` (image scene), `ocr_text` (visible
+image text), `languages`, `language_source`, optional `provider_request_id`,
+and optional `cost_usd`. Fields not used by an operation are empty strings.
+OpenRouter may omit language detection for STT; this returns an empty array
+and `unavailable`, never a guessed value.
+
+Statuses: `queued`, `preparing`, `submitting`, `retry_wait`, `completed`, `failed`,
+`uncertain`. `preparing` downloads and normalizes/probes media. `submitting`
+marks a committed budget reservation before the paid request. At most three
+attempts are allowed; only Telegram transient errors and explicit HTTP 429
+responses are retried. Network loss, ambiguous provider errors, and interrupted
+submissions become `uncertain` and are never automatically recharged.
+
+Defaults: one paid job at a time, 100 pending jobs, 1,000 retained jobs,
+20 MiB originals, 600 seconds including normalized audio padding, 8 MiB image
+uploads, 20 million pixels / 8192 per side, 200 MiB file cache, 24-hour original
+retention, $1 daily and $5 lifetime reservation budgets. Transcripts and image
+outputs persist with their deduplication records. Changed media, operation,
+model, normalized hints, or administrator cache revision create a new key.

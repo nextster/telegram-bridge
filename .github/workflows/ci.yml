@@ -16,6 +16,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Install media runtime for real conversion tests
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Verify service and repository-owned integration files
         env:
           SKIP_CODEX_PLUGIN_VALIDATE: "1"

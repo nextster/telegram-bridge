@@ -50,6 +50,7 @@ for name in (
     "TELEGRAM_BRIDGE_MCP_TOKEN",
     "TELEGRAM_BRIDGE_NOTIFICATION_TOKEN",
     "TELEGRAM_BRIDGE_NOTIFICATION_CHAT_IDS",
+    "OPENROUTER_API_KEY",
 ):
     assert re.search(rf"^{name}=$", env_example, re.MULTILINE), f"{name} must stay empty in .env.example"
 

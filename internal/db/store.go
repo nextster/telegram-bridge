@@ -150,6 +150,23 @@ func (s *Store) pingAndMigrate(ctx context.Context) error {
 }
 
 var schema = []string{
+	`CREATE TABLE IF NOT EXISTS media_jobs (
+		id TEXT PRIMARY KEY, account_id INTEGER NOT NULL, chat TEXT NOT NULL, message_id INTEGER NOT NULL,
+		status TEXT NOT NULL CHECK(status IN ('queued','preparing','submitting','retry_wait','completed','failed','uncertain')),
+		attempts INTEGER NOT NULL DEFAULT 0, provider_attempts INTEGER NOT NULL DEFAULT 0,
+		retry_at INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+		error_code TEXT NOT NULL DEFAULT '', payload TEXT NOT NULL,
+		transcript TEXT NOT NULL DEFAULT '', image_description TEXT NOT NULL DEFAULT '', image_text TEXT NOT NULL DEFAULT '', result_meta TEXT NOT NULL DEFAULT ''
+	)`,
+	`CREATE INDEX IF NOT EXISTS media_queue ON media_jobs(account_id,status,retry_at)`,
+	`CREATE TABLE IF NOT EXISTS media_charges (
+		id INTEGER PRIMARY KEY, job_id TEXT NOT NULL REFERENCES media_jobs(id), day TEXT NOT NULL, amount INTEGER NOT NULL CHECK(amount>0)
+	)`,
+	`CREATE INDEX IF NOT EXISTS media_charge_day ON media_charges(day)`,
+	`CREATE TABLE IF NOT EXISTS media_files (
+		id TEXT PRIMARY KEY, account_id INTEGER NOT NULL, chat TEXT NOT NULL, message_id INTEGER NOT NULL,
+		fingerprint TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL, mime TEXT NOT NULL, expires_at INTEGER NOT NULL
+	)`,
 	`CREATE TABLE IF NOT EXISTS notification_receipts (
 		chat_id INTEGER NOT NULL,
 		event_id TEXT NOT NULL,

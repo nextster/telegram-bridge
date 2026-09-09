@@ -19,6 +19,7 @@ import (
 	"github.com/nextster/telegram-bridge/internal/config"
 	"github.com/nextster/telegram-bridge/internal/db"
 	"github.com/nextster/telegram-bridge/internal/mcpserver"
+	"github.com/nextster/telegram-bridge/internal/media"
 	"github.com/nextster/telegram-bridge/internal/monitor"
 	"github.com/nextster/telegram-bridge/internal/notify"
 )
@@ -27,6 +28,7 @@ type Server struct {
 	cfg           config.Config
 	store         *db.Store
 	monitor       *monitor.Service
+	media         *media.Service
 	notifier      notify.SystemNotifier
 	template      *template.Template
 	loginTemplate *template.Template
@@ -127,6 +129,8 @@ func (s *Server) Run(ctx context.Context) error {
 	return err
 }
 
+func (s *Server) SetMediaService(service *media.Service) { s.media = service }
+
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.dashboardEntry)
@@ -142,7 +146,9 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /login/restart", s.loginRestart)
 	mux.HandleFunc("GET /healthz", s.healthz)
 	if s.cfg.HasMCP() && s.monitor != nil {
-		mux.Handle("/mcp", mcpserver.New(s.monitor, s.cfg.MCPToken))
+		mcpHandler := mcpserver.New(s.monitor, s.cfg.MCPToken, mcpserver.Options{Media: s.media, PublicURL: s.cfg.PublicBaseURL})
+		mux.Handle("/mcp", mcpHandler)
+		mux.Handle("/mcp/media/", mcpHandler)
 		log.Print("MCP endpoint enabled at /mcp")
 	}
 	if s.cfg.HasNotificationAPI() && s.monitor != nil && s.store != nil {

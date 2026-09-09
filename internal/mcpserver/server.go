@@ -10,13 +10,16 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/nextster/telegram-bridge/internal/media"
 	"github.com/nextster/telegram-bridge/internal/monitor"
 )
 
 type Server struct {
-	monitor *monitor.Service
-	token   string
-	handler http.Handler
+	monitor   *monitor.Service
+	media     *media.Service
+	publicURL string
+	token     string
+	handler   http.Handler
 }
 
 type listDialogsInput struct {
@@ -47,8 +50,17 @@ type getHistoryInput struct {
 	OffsetID int    `json:"offset_id,omitempty" jsonschema:"Return messages older than this message ID; omit for latest messages"`
 }
 
-func New(service *monitor.Service, token string) *Server {
+type Options struct {
+	Media     *media.Service
+	PublicURL string
+}
+
+func New(service *monitor.Service, token string, options ...Options) *Server {
 	server := &Server{monitor: service, token: strings.TrimSpace(token)}
+	if len(options) > 0 {
+		server.media = options[0].Media
+		server.publicURL = strings.TrimRight(options[0].PublicURL, "/")
+	}
 	mcpServer := mcp.NewServer(&mcp.Implementation{Name: "telegram-bridge", Version: "1.0.0"}, nil)
 	mcp.AddTool(mcpServer, &mcp.Tool{
 		Name:        "telegram_list_dialogs",
@@ -65,8 +77,14 @@ func New(service *monitor.Service, token string) *Server {
 		Description: "Read recent or paginated message history from one Telegram chat belonging to the logged-in account. Read-only.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, server.getHistory)
+	if server.media != nil {
+		server.addMediaTools(mcpServer)
+	}
 	streamable := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return mcpServer }, &mcp.StreamableHTTPOptions{Stateless: true})
-	server.handler = server.authenticate(streamable)
+	mux := http.NewServeMux()
+	mux.Handle("/", streamable)
+	mux.HandleFunc("/mcp/media/", server.downloadFile)
+	server.handler = server.authenticate(mux)
 	return server
 }
 
@@ -103,7 +121,7 @@ func (s *Server) getHistory(ctx context.Context, _ *mcp.CallToolRequest, input g
 func (s *Server) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		provided := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if provided == r.Header.Get("Authorization") || subtle.ConstantTimeCompare([]byte(provided), []byte(s.token)) != 1 {
+		if s.token == "" || provided == r.Header.Get("Authorization") || subtle.ConstantTimeCompare([]byte(provided), []byte(s.token)) != 1 {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="telegram-bridge-mcp"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
