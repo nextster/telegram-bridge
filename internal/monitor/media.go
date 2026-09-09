@@ -188,7 +188,10 @@ func (s *Service) Download(ctx context.Context, expected media.Attachment, outpu
 	if userID != expected.AccountID {
 		return media.Fail("telegram_account_changed")
 	}
-	_, err = downloader.NewDownloader().Download(api, location).WithVerify(true).Stream(ctx, output)
+	// Use the normal authenticated MTProto download path. An upfront optional
+	// getFileHashes request can reject a location that getFile can download.
+	// The media store independently verifies length and hashes all cached bytes.
+	_, err = downloader.NewDownloader().Download(api, location).Stream(ctx, output)
 	if tgerr.Is(err, "FILE_REFERENCE_EXPIRED", "FILE_REFERENCE_INVALID") {
 		return media.Retry("telegram_file_reference_expired", time.Second)
 	}
@@ -205,6 +208,14 @@ func mediaTelegramError(err error) error {
 	if rpc, ok := tgerr.As(err); ok {
 		if rpc.Code >= 500 {
 			return media.Retry("telegram_server_error", 15*time.Second)
+		}
+		switch rpc.Type {
+		case "LOCATION_INVALID":
+			return media.Fail("telegram_file_location_invalid")
+		case "FILE_ID_INVALID":
+			return media.Fail("telegram_file_id_invalid")
+		case "OFFSET_INVALID", "LIMIT_INVALID":
+			return media.Fail("telegram_download_range_invalid")
 		}
 		return media.Fail("telegram_access_or_message_error")
 	}

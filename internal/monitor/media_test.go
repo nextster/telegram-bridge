@@ -1,8 +1,10 @@
 package monitor
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
 	"time"
@@ -18,6 +20,8 @@ type mediaRPC struct {
 	message *tg.Message
 	err     error
 	calls   int
+	data    []byte
+	hashes  int
 }
 
 func (r *mediaRPC) Invoke(_ context.Context, input bin.Encoder, output bin.Decoder) error {
@@ -25,13 +29,48 @@ func (r *mediaRPC) Invoke(_ context.Context, input bin.Encoder, output bin.Decod
 	if r.err != nil {
 		return r.err
 	}
-	switch input.(type) {
+	switch request := input.(type) {
 	case *tg.MessagesGetMessagesRequest, *tg.ChannelsGetMessagesRequest:
 		output.(*tg.MessagesMessagesBox).Messages = &tg.MessagesMessages{Messages: []tg.MessageClass{r.message}}
+	case *tg.UploadGetFileHashesRequest:
+		r.hashes++
+		return &tgerr.Error{Code: 400, Type: "LOCATION_INVALID"}
+	case *tg.UploadGetFileRequest:
+		location, ok := request.Location.(*tg.InputDocumentFileLocation)
+		if !ok || location.ID != 123 || request.CDNSupported {
+			return errors.New("unexpected download location or CDN request")
+		}
+		start := min(request.Offset, int64(len(r.data)))
+		end := min(start+int64(request.Limit), int64(len(r.data)))
+		output.(*tg.UploadFileBox).File = &tg.UploadFile{Type: &tg.StorageFileMp3{}, Bytes: r.data[start:end]}
 	default:
 		return errors.New("unexpected RPC")
 	}
 	return nil
+}
+
+func TestDownloadDoesNotRequireOptionalServerHashes(t *testing.T) {
+	for _, size := range []int{107590, 600000} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			audio := &tg.DocumentAttributeAudio{Duration: 27}
+			audio.SetVoice(true)
+			rpc := &mediaRPC{data: bytes.Repeat([]byte("x"), size), message: &tg.Message{ID: 7, PeerID: &tg.PeerChat{ChatID: 9}, Media: &tg.MessageMediaDocument{Document: &tg.Document{ID: 123, Size: int64(size), MimeType: "audio/ogg", Attributes: []tg.DocumentAttributeClass{audio}}}}}
+			m := rpc.message.Media.(*tg.MessageMediaDocument)
+			m.SetDocument(m.Document)
+			s := &Service{cfg: config.Config{TelegramAPIID: 1, TelegramAPIHash: "fake"}, api: tg.NewClient(rpc), authorized: true, userID: 1}
+			a, err := s.Attachment(context.Background(), "chat:9", 7)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var output bytes.Buffer
+			if err := s.Download(context.Background(), a, &output); err != nil {
+				t.Fatal(err)
+			}
+			if rpc.hashes != 0 || !bytes.Equal(output.Bytes(), rpc.data) {
+				t.Fatal("download required optional hashes or changed original bytes")
+			}
+		})
+	}
 }
 
 func TestAttachmentMessageScopeAndUnavailableAccount(t *testing.T) {
