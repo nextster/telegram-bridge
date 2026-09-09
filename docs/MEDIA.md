@@ -267,6 +267,10 @@ Fly memory setting becomes 512 MB. Use the regular Dockerfile/deploy path.
    `TELEGRAM_BRIDGE_MEDIA_ENABLED=true` through an approved Fly config/secret
    update only when the paid smoke test is authorized. Restart/new MCP task
    discovery is required; an existing task does not acquire new schemas.
+   If this flag is stored in Fly Secrets, it overrides the value in `fly.toml`.
+   Apply staged secrets to the existing Machine before testing. Verify the live
+   OpenRouter key with `GET /api/v1/key`, including its spending cap, before the
+   first recognition call. Never log its value or copy surrounding UI text.
 6. For the requested smoke test, resolve an actual chat whose title starts with
    `<prefix>`, retrieve one voice message, download its original, submit one explicit
    transcription, and poll the full text through MCP. Verify IDs, author/date,
@@ -287,12 +291,20 @@ Fly memory setting becomes 512 MB. Use the regular Dockerfile/deploy path.
 
 Once queued, jobs run on Fly with the Mac off. Agent-driven discovery/export can
 be resumed separately using the durable job IDs. The single-voice smoke test and
-the `<prefix>` batch remain outstanding until deployment/paid processing is authorized.
+the `<prefix>` batch are separate live checks, not covered by local tests.
 
 ## Rollback
 
 Disable new paid processing with `TELEGRAM_BRIDGE_MEDIA_ENABLED=false`; already
 committed uncertain submissions must still be reconciled rather than replayed.
+When enabled through Fly Secrets, stage the disabling value there as well:
+
+```sh
+fly secrets set TELEGRAM_BRIDGE_MEDIA_ENABLED=false --stage --app telegram-bridge
+```
+
+Apply it with the existing-Machine deployment below; staging alone does not change
+the running process. Merely changing `fly.toml` cannot override an enabled secret.
 Deploy the recorded previous image with the recorded prior configuration and
 `--ha=false --strategy immediate`. Keep the existing volume, session, and new
 SQLite tables; the previous binary ignores the additive media tables. Do not
@@ -300,6 +312,11 @@ restore an older database over newly committed job/charge records, delete the
 session, or start a second session owner. A rollback to the old binary disables
 media endpoints; cached files remain private on disk. After fixing the issue,
 redeploying this version resumes safe queued work and preserves completed results.
+Retain the dedicated key's spending cap when enabling again. A confirmed HTTP
+401/403 rejection after a credential setup error can be reconciled by an operator
+after the key is repaired and verified, preserving the original job identity,
+attempt counts, and charge reservations. Never apply that procedure to uncertain
+submissions, completed jobs, or errors whose billing outcome is unknown.
 
 ## Verification boundary
 
