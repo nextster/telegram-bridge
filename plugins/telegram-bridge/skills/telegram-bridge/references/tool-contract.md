@@ -1,6 +1,6 @@
 # telegram-bridge MCP tool contract
 
-The server exposes three read-only tools and an operator-enabled notification tool over Streamable HTTP at `https://telegram-bridge.fly.dev/mcp`. Authentication uses `Authorization: Bearer ...`; the plugin obtains that value from `TELEGRAM_BRIDGE_MCP_TOKEN`.
+The server exposes three read-only tools over Streamable HTTP at `https://telegram-bridge.fly.dev/mcp`. Authentication uses `Authorization: Bearer ...`; the plugin obtains that value from `TELEGRAM_BRIDGE_MCP_TOKEN`.
 
 ## `telegram_list_dialogs`
 
@@ -67,14 +67,4 @@ All optional fields are absent rather than populated with placeholder zero value
 
 Copy all path components exactly from the tool result. Do not derive them from titles, sender names, or guessed peer IDs.
 
-The MCP surface can send only the notifications described below. It cannot edit, forward, or delete messages. It does not expose secret chats or the bot's deleted-message snapshot archive.
-
-## `telegram_send_notification`
-
-Present only when a configured user session and `TELEGRAM_BRIDGE_NOTIFICATION_CHAT_IDS` are configured. This is a write tool (`readOnlyHint=false`, `idempotentHint=true`) and uses the already-authorized personal account. The same authenticated MCP token can send to operator-allowlisted groups.
-
-- `chat`: a resolved `chat:<id>` or `channel:<id>` group key. Private-user destinations, broadcast channels and non-allowlisted groups are rejected.
-- `event_id`: 1-128 ASCII letters/digits/dots/underscores/colons/hyphens, beginning with a letter or digit; stable for one logical event.
-- `text`: plain text, 1-4096 UTF-16 code units, no parse mode or attachments.
-
-A confirmed response contains `status: sent` and `message_id`. SQLite receipts deduplicate the same group/event across clients and restarts. Reusing an event ID with different text is rejected. A pending or uncertain send cannot be automatically retried; inspect the group and recover the receipt before retrying. Never work around this protection with a new event ID.
+The MCP surface cannot send, edit, forward, or delete messages. It does not expose secret chats or the bot's deleted-message snapshot archive.

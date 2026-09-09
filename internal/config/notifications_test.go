@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestNotificationAllowlistConfiguration(t *testing.T) {
 	t.Setenv("TELEGRAM_API_ID", "")
@@ -20,5 +23,30 @@ func TestNotificationAllowlistConfiguration(t *testing.T) {
 		if _, err := Load(); err == nil {
 			t.Fatalf("accepted invalid allowlist %q", value)
 		}
+	}
+}
+
+func TestNotificationTokenMustBeIndependent(t *testing.T) {
+	token := strings.Repeat("n", 32)
+	for _, cfg := range []Config{
+		{NotificationToken: "short"},
+		{NotificationToken: token + " "},
+		{NotificationToken: token, MCPToken: token},
+		{NotificationToken: token, WorkerToken: token},
+	} {
+		if cfg.ValidateNotifications() == nil {
+			t.Fatal("accepted invalid or reused notification credential")
+		}
+		if cfg.HasNotificationAPI() {
+			t.Fatal("invalid credential enabled API")
+		}
+	}
+	cfg := Config{NotificationToken: token, MCPToken: "read", WorkerToken: "worker", NotificationChatIDs: []int64{-1001234567890}}
+	if cfg.ValidateNotifications() != nil || !cfg.HasNotificationAPI() {
+		t.Fatal("dedicated credential did not enable API")
+	}
+	cfg.NotificationToken = ""
+	if cfg.HasNotificationAPI() {
+		t.Fatal("missing token enabled API")
 	}
 }

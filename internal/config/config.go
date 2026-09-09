@@ -16,6 +16,7 @@ type Config struct {
 	MCPToken            string
 	WorkerToken         string
 	NotificationChatIDs []int64
+	NotificationToken   string
 
 	BotToken        string
 	BotAdminChatIDs []int64
@@ -30,13 +31,14 @@ func Load() (Config, error) {
 	loadDotenvFiles(".env.local", ".env")
 
 	cfg := Config{
-		Addr:          envFirst("TELEGRAM_BRIDGE_ADDR", "ADDR"),
-		DBPath:        envFirstDefault("TELEGRAM_BRIDGE_DB", "/data/telegram-bridge.db", "DB_PATH", "data/telegram-bridge.db"),
-		SessionPath:   envFirstDefault("TELEGRAM_BRIDGE_SESSION", "/data/telegram.session", "TG_SESSION_PATH", "data/telegram.session"),
-		PublicBaseURL: strings.TrimRight(envFirst("TELEGRAM_BRIDGE_PUBLIC_URL", "PUBLIC_BASE_URL"), "/"),
-		MCPToken:      envFirst("TELEGRAM_BRIDGE_MCP_TOKEN", "MCP_TOKEN"),
-		WorkerToken:   envFirst("TELEGRAM_BRIDGE_WORKER_TOKEN", "WORKER_TOKEN"),
-		BotToken:      envFirst("TELEGRAM_BOT_TOKEN", "BOT_TOKEN"),
+		Addr:              envFirst("TELEGRAM_BRIDGE_ADDR", "ADDR"),
+		DBPath:            envFirstDefault("TELEGRAM_BRIDGE_DB", "/data/telegram-bridge.db", "DB_PATH", "data/telegram-bridge.db"),
+		SessionPath:       envFirstDefault("TELEGRAM_BRIDGE_SESSION", "/data/telegram.session", "TG_SESSION_PATH", "data/telegram.session"),
+		PublicBaseURL:     strings.TrimRight(envFirst("TELEGRAM_BRIDGE_PUBLIC_URL", "PUBLIC_BASE_URL"), "/"),
+		MCPToken:          envFirst("TELEGRAM_BRIDGE_MCP_TOKEN", "MCP_TOKEN"),
+		WorkerToken:       envFirst("TELEGRAM_BRIDGE_WORKER_TOKEN", "WORKER_TOKEN"),
+		NotificationToken: envFirst("TELEGRAM_BRIDGE_NOTIFICATION_TOKEN"),
+		BotToken:          envFirst("TELEGRAM_BOT_TOKEN", "BOT_TOKEN"),
 		TelegramAPIHash: envFirst(
 			"TELEGRAM_API_HASH",
 			"TG_API_HASH",
@@ -74,6 +76,9 @@ func Load() (Config, error) {
 		}
 	}
 	cfg.NotificationChatIDs = notificationChatIDs
+	if err := cfg.ValidateNotifications(); err != nil {
+		return Config{}, err
+	}
 
 	return cfg, nil
 }
@@ -236,4 +241,21 @@ func parseInt64List(value string) ([]int64, error) {
 		out = append(out, parsed)
 	}
 	return out, nil
+}
+
+func (c Config) ValidateNotifications() error {
+	if c.NotificationToken == "" {
+		return nil
+	}
+	if len(c.NotificationToken) < 32 || strings.TrimSpace(c.NotificationToken) != c.NotificationToken {
+		return fmt.Errorf("TELEGRAM_BRIDGE_NOTIFICATION_TOKEN must be a dedicated random token of at least 32 characters without surrounding whitespace")
+	}
+	if c.NotificationToken == c.MCPToken || c.NotificationToken == c.WorkerToken {
+		return fmt.Errorf("notification token must differ from MCP and worker tokens")
+	}
+	return nil
+}
+
+func (c Config) HasNotificationAPI() bool {
+	return c.NotificationToken != "" && len(c.NotificationChatIDs) > 0 && c.ValidateNotifications() == nil
 }

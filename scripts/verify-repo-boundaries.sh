@@ -48,6 +48,8 @@ for name in (
     "TELEGRAM_PHONE",
     "TELEGRAM_PASSWORD",
     "TELEGRAM_BRIDGE_MCP_TOKEN",
+    "TELEGRAM_BRIDGE_NOTIFICATION_TOKEN",
+    "TELEGRAM_BRIDGE_NOTIFICATION_CHAT_IDS",
 ):
     assert re.search(rf"^{name}=$", env_example, re.MULTILINE), f"{name} must stay empty in .env.example"
 

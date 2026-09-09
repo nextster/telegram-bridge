@@ -20,9 +20,9 @@ type NotificationSender interface {
 }
 
 type NotificationInput struct {
-	Chat    string `json:"chat" jsonschema:"Stable group key returned by telegram_list_dialogs; must be enabled by the server operator"`
-	EventID string `json:"event_id" jsonschema:"Stable idempotency key, 1-128 ASCII letters, digits, dots, underscores, colons or hyphens. Reuse for retries of the same event"`
-	Text    string `json:"text" jsonschema:"Plain text notification, 1-4096 UTF-16 code units; no parse mode or attachments"`
+	Chat    string `json:"chat"`
+	EventID string `json:"event_id"`
+	Text    string `json:"text"`
 }
 
 type Notifications struct {

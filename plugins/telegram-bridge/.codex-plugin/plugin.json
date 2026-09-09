@@ -1,7 +1,7 @@
 {
   "name": "telegram-bridge",
-  "version": "0.1.0+codex.20260909105418",
-  "description": "Search Telegram history and send authorized notifications to configured groups through Telegram Bridge.",
+  "version": "0.1.0+codex.20260909110828",
+  "description": "Search and inspect the authenticated Telegram account through the read-only telegram-bridge MCP service.",
   "author": {
     "name": "Artem"
   },
@@ -18,19 +18,17 @@
   "interface": {
     "displayName": "Telegram Bridge",
     "shortDescription": "Search your Telegram chats from Codex",
-    "longDescription": "Search Telegram history and send authorized notifications to configured groups through Telegram Bridge.",
+    "longDescription": "Search dialogs and messages, inspect recent history, and run date-bounded research against Artem's authenticated Telegram account through the read-only telegram-bridge MCP service.",
     "developerName": "Artem",
     "category": "Productivity",
     "capabilities": [
-      "Read",
-      "Write"
+      "Read"
     ],
     "websiteURL": "https://telegram-bridge.fly.dev/",
     "defaultPrompt": [
       "Search my Telegram chats for a recent conversation.",
       "Find recent marketplace posts matching this item.",
-      "Summarize what this Telegram chat discussed.",
-      "Send an authorized release notification to my configured Telegram group."
+      "Summarize what this Telegram chat discussed."
     ]
   },
   "mcpServers": "./.mcp.json"

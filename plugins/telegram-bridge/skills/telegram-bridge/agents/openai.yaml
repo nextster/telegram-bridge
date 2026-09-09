@@ -6,7 +6,7 @@ dependencies:
   tools:
     - type: "mcp"
       value: "telegram-bridge"
-      description: "Telegram search and authorized group notifications"
+      description: "Read-only access to the authenticated Telegram account"
       transport: "streamable_http"
       url: "https://telegram-bridge.fly.dev/mcp"
 policy:
