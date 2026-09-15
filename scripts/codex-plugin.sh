@@ -6,7 +6,9 @@ PLUGIN_NAME="telegram-bridge"
 PLUGIN_ROOT="${ROOT}/plugins/${PLUGIN_NAME}"
 MARKETPLACE_FILE="${ROOT}/.agents/plugins/marketplace.json"
 CODEX_HOME="${CODEX_HOME:-${HOME}/.codex}"
-SHARED_MARKETPLACE_ROOT="${NEXTSTER_MARKETPLACE_DIR:-${CODEX_HOME}/marketplaces/nextster}"
+SHARED_MARKETPLACE_ROOT="${NEXTSTER_MARKETPLACE_DIR:-${HOME}/.agent-plugins/nextster}"
+LEGACY_MARKETPLACE_ROOT="${CODEX_HOME}/marketplaces/nextster"
+DETACHED_MARKETPLACE_ROOT=""
 CODEX_BIN="${CODEX_BIN:-codex}"
 PLUGIN_CREATOR_ROOT="${PLUGIN_CREATOR_ROOT:-${CODEX_HOME}/skills/.system/plugin-creator}"
 SKILL_CREATOR_ROOT="${SKILL_CREATOR_ROOT:-${CODEX_HOME}/skills/.system/skill-creator}"
@@ -52,9 +54,37 @@ validate() {
   python3 "${PLUGIN_CREATOR_ROOT}/scripts/validate_plugin.py" "${PLUGIN_ROOT}"
 }
 
+canonical_path() {
+  python3 -c 'import os, sys; print(os.path.realpath(os.path.expanduser(sys.argv[1])))' "$1"
+}
+
+has_marketplace_manifest() {
+  [[ -f "$1/.agents/plugins/marketplace.json" ]]
+}
+
+# Codex fails every listing once a registered root loses its manifest; its
+# error names that marketplace and root.
 registered_marketplace_root() {
-  local name="$1"
-  "${CODEX_BIN}" plugin marketplace list | awk -v name="${name}" '$1 == name { print $2; exit }'
+  local name="$1" output
+  if output="$("${CODEX_BIN}" plugin marketplace list --json 2>/dev/null)"; then
+    python3 -c '
+import json, sys
+name = sys.argv[1]
+roots = [item.get("root", "") for item in json.load(sys.stdin).get("marketplaces", []) if item.get("name") == name]
+print(roots[0] if roots else "")
+' "${name}" <<<"${output}"
+    return
+  fi
+  output="$("${CODEX_BIN}" plugin marketplace list --json 2>&1 >/dev/null || true)"
+  python3 -c '
+import re, sys
+name, output = sys.argv[1:]
+pattern = re.compile(rf"^- `{re.escape(name)}` at (.+): marketplace root does not contain a supported manifest$", re.MULTILINE)
+match = pattern.search(output)
+if not match:
+    raise SystemExit(output)
+print(match.group(1))
+' "${name}" "${output}"
 }
 
 plugin_is_installed() {
@@ -99,22 +129,51 @@ if not item.get("enabled") or os.path.realpath(item.get("source", {}).get("path"
 ' "${PLUGIN_NAME}@${name}" "${expected_path}"
 }
 
+# Detaches Codex from the legacy root, the repo root, or a root without a
+# manifest before the legacy directory moves. Codex keeps plugin enabled state
+# by marketplace name, so re-adding nextster at the new root keeps siblings.
+detach_marketplace() {
+  local name registered_root canonical_root
+  name="$(marketplace_name)"
+  registered_root="$(registered_marketplace_root "${name}")"
+  [[ -n "${registered_root}" ]] || return 0
+  canonical_root="$(canonical_path "${registered_root}")"
+  [[ "${canonical_root}" != "$(canonical_path "${SHARED_MARKETPLACE_ROOT}")" ]] || return 0
+  if [[ "${canonical_root}" != "$(canonical_path "${LEGACY_MARKETPLACE_ROOT}")" ]] && \
+     [[ "${canonical_root}" != "$(canonical_path "${ROOT}")" ]] && \
+     has_marketplace_manifest "${registered_root}"; then
+    printf 'marketplace %s already points to %s, expected %s\n' \
+      "${name}" "${registered_root}" "${SHARED_MARKETPLACE_ROOT}" >&2
+    exit 1
+  fi
+  "${CODEX_BIN}" plugin marketplace remove "${name}" --json >/dev/null
+  DETACHED_MARKETPLACE_ROOT="${registered_root}"
+}
+
+# Restores a registration detached by a run that fails before re-adding it.
+restore_marketplace() {
+  local status=$? candidate
+  if [[ ${status} -ne 0 && -n "${DETACHED_MARKETPLACE_ROOT}" ]]; then
+    for candidate in "${DETACHED_MARKETPLACE_ROOT}" "${SHARED_MARKETPLACE_ROOT}" "${LEGACY_MARKETPLACE_ROOT}"; do
+      if has_marketplace_manifest "${candidate}"; then
+        printf 'restoring marketplace registration at %s\n' "${candidate}" >&2
+        "${CODEX_BIN}" plugin marketplace add "${candidate}" >/dev/null 2>&1 || true
+        break
+      fi
+    done
+  fi
+}
+
 ensure_marketplace() {
   local name registered_root
   name="$(marketplace_name)"
   registered_root="$(registered_marketplace_root "${name}")"
-  if [[ -n "${registered_root}" ]] && \
-     [[ "$(cd "${registered_root}" && pwd -P)" == "$(cd "${ROOT}" && pwd -P)" ]]; then
-    "${CODEX_BIN}" plugin remove "${PLUGIN_NAME}@telegram-bridge-repo" --json >/dev/null 2>&1 || true
-    "${CODEX_BIN}" plugin marketplace remove telegram-bridge-repo --json >/dev/null 2>&1 || true
-    "${CODEX_BIN}" plugin marketplace remove "${name}" --json >/dev/null 2>&1 || true
-    registered_root=""
-  fi
   if [[ -z "${registered_root}" ]]; then
     "${CODEX_BIN}" plugin marketplace add "${SHARED_MARKETPLACE_ROOT}"
+    DETACHED_MARKETPLACE_ROOT=""
     return
   fi
-  if [[ "$(cd "${registered_root}" && pwd -P)" != "$(cd "${SHARED_MARKETPLACE_ROOT}" && pwd -P)" ]]; then
+  if [[ "$(canonical_path "${registered_root}")" != "$(canonical_path "${SHARED_MARKETPLACE_ROOT}")" ]]; then
     printf 'marketplace %s already points to %s, expected %s\n' \
       "${name}" "${registered_root}" "${SHARED_MARKETPLACE_ROOT}" >&2
     exit 1
@@ -124,7 +183,9 @@ ensure_marketplace() {
 install_plugin() {
   local name
   validate
-  python3 "${ROOT}/scripts/sync-nextster-marketplace.py" >/dev/null
+  trap restore_marketplace EXIT
+  detach_marketplace
+  python3 "${ROOT}/scripts/sync-nextster-marketplace.py" --migrate-from "${LEGACY_MARKETPLACE_ROOT}" >/dev/null
   ensure_marketplace
   verify_repo_plugin_available
   name="$(marketplace_name)"

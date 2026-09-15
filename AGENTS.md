@@ -37,7 +37,7 @@ scripts/check.sh
 
 The canonical plugin source is `plugins/telegram-bridge`, and its tracked
 Nextster marketplace entry is `.agents/plugins/marketplace.json`. Installation
-syncs the plugin into `~/.codex/marketplaces/nextster`; do not edit that generated
+syncs the plugin into `~/.agent-plugins/nextster`; do not edit that generated
 copy as an independent source.
 
 After plugin or skill changes, run:
