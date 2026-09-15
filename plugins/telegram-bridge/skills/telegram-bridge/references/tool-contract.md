@@ -1,6 +1,6 @@
 # telegram-bridge MCP tool contract
 
-The server exposes three history/search tools and eight media tools over Streamable HTTP at `https://telegram-bridge.fly.dev/mcp`. Authentication uses `Authorization: Bearer ...`; the plugin obtains that value from `TELEGRAM_BRIDGE_MCP_TOKEN`, a personal MCP token created on the telegram-bridge dashboard. Tools act only on the account that owns the token. Media tools appear after the new server is deployed. Start a new task after deployment to refresh MCP discovery.
+The server exposes three history/search tools and eight media tools over Streamable HTTP at `https://telegram-bridge.fly.dev/mcp`. Authentication uses OAuth: on first use Codex opens the Telegram sign-in (`codex mcp login telegram-bridge`). Tools act only on the Telegram account that signed in. Media tools appear after the new server is deployed. Start a new task after deployment to refresh MCP discovery.
 
 ## `telegram_list_dialogs`
 

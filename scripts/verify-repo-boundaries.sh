@@ -32,7 +32,6 @@ assert mcp == {
         "telegram-bridge": {
             "type": "http",
             "url": "https://telegram-bridge.fly.dev/mcp",
-            "bearer_token_env_var": "TELEGRAM_BRIDGE_MCP_TOKEN",
         }
     }
 }

@@ -49,8 +49,3 @@ scripts/codex-plugin.sh reload
 This validates the skill and plugin, refreshes the tracked cachebuster, syncs
 the shared Nextster marketplace, and reinstalls from it. Commit the resulting manifest
 version together with the plugin change.
-
-For uncommitted MCP adapter development, prefer `scripts/codex-plugin.sh
-dev:link`; then run `scripts/check.sh` and open a new task. Use `dev:status` to
-inspect drift and `dev:unlink` to return to the installed production plugin.
-This dev override must not replace the versioned production install flow.
