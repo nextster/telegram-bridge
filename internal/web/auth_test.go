@@ -33,7 +33,7 @@ func TestDashboardRequiresTelegramAdminSession(t *testing.T) {
 	}
 
 	cfg := config.Config{BotToken: "123456:test-token", PublicBaseURL: "http://example.test"}
-	server, err := New(cfg, store, nil, nil, nil)
+	server, err := New(cfg, store, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

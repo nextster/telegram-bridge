@@ -142,7 +142,7 @@ Usage: scripts/codex-plugin.sh <validate|install|reload|dev:link|dev:status|dev:
   install   Register the repo marketplace if needed and install its current version.
   reload    Refresh the tracked cachebuster, validate, and reinstall.
   dev:link  Point future MCP processes at this checkout without reinstalling the plugin.
-  dev:status Show the repo, installed plugin, effective MCP, worker, and drift.
+  dev:status Show the repo, installed plugin, effective MCP, and drift.
   dev:unlink Remove the dev override and return future tasks to the production plugin.
 EOF
 }

@@ -45,34 +45,11 @@ export TELEGRAM_PHONE="+15551234567"
 export TELEGRAM_PASSWORD="account-password"
 export TELEGRAM_BRIDGE_ADMIN_CHAT_IDS="123456789"
 export TELEGRAM_BRIDGE_MCP_TOKEN="a-long-random-bearer-token"
-export TELEGRAM_BRIDGE_WORKER_TOKEN="a-different-random-bearer-token"
 ```
 
 The bot can authorize the gotd user session with `/login`. The bot only asks for the Telegram phone number and then sends a short-lived site login link. Enter the Telegram login code and 2FA password on the HTTPS site, not in the bot chat: Telegram blocks code-based sign-in after a code is shared in a bot chat. If `TELEGRAM_BRIDGE_ADMIN_CHAT_IDS` is not set, the first chat that runs `/start` becomes the admin chat for MVP operations.
 
 The CLI `login` command still works and stores the gotd user session in `data/telegram.session` by default. On Fly.io it uses `/data/telegram.session`.
-
-## Telegram → Codex bridge
-
-`/codex project :: prompt` creates, when needed, a private forum supergroup named `Codex · project`, adds it to the Telegram folder `Codex`, creates one forum topic per Codex task, and queues the prompt for a worker on the Mac. Further plain-text messages in that topic continue the same Codex task.
-
-For Codex execution, the Fly app stores the queue and Telegram/Codex identifiers. Codex runs locally through `codex app-server`, so project files and the Codex login stay on the Mac. The worker API uses `TELEGRAM_BRIDGE_WORKER_TOKEN`, separate from the MCP token. Cloud media recognition is independent of this Mac worker.
-
-Install or refresh the macOS LaunchAgent with one or more local project mappings:
-
-```bash
-scripts/install-codex-worker.sh telegram-bridge=/path/to/telegram-bridge
-```
-
-The worker starts Codex with `workspace-write` and `approvalPolicy=never`: normal edits inside the selected project are possible, while permission escalation is unavailable from Telegram. Its log is `~/Library/Logs/telegram-bridge-worker.log`; the final Codex message is posted to the originating Telegram topic.
-
-Every 30 seconds the local worker reads the complete active and archived task lists from `codex app-server`. Existing active Codex tasks that were not created from Telegram are mirrored into the private `Codex · Active` forum, one topic per top-level task. The topic contains only the latest visible user or Codex message; changed mirror posts replace the previous mirror post and preserve common Markdown formatting. Codex user messages are sent through the authenticated Telegram user session, so they appear from the account rather than the bridge bot. A short neutral state is shown only when a task has no visible message. Sub-agent threads are not mirrored separately.
-
-Read state is mirrored in both directions. Bot replies naturally make their topic unread; opening the task in Codex marks the Telegram topic read, and reading the topic in Telegram clears the task's persisted unread marker in Codex. The Telegram user session reconciles the actual unread count of every mapped topic every 15 seconds, while the local worker consumes those receipts every 3 seconds. Codex does not expose this marker through `app-server`, so the worker updates the desktop app's `unread-thread-ids-by-host-v1` persisted atom in `$CODEX_HOME/.codex-global-state.json`. An already-running Codex window keeps its own in-memory copy until the app is reloaded; the persisted state is correct immediately and is applied by the UI on its next reload.
-
-A plain text post in a Codex forum's General topic is promoted into a new forum topic and queued as a Codex task. The original General post is removed after successful promotion. `Codex · Active` uses the only configured execution project automatically; when several projects exist, use `project :: task`.
-
-Archiving a mapped task in Codex deletes its Telegram forum topic and all messages in that topic. The project forum remains. This deletion is intentionally one-way: unarchiving the Codex task does not recreate the Telegram topic.
 
 ## Bot commands
 
@@ -86,6 +63,7 @@ Archiving a mapped task in Codex deletes its Telegram forum topic and all messag
 - `/login` authorizes Telegram user API monitoring.
 - `/loginstatus` shows user session status.
 - `/cancel` cancels an in-progress bot login.
+- `/connections` lists and revokes MCP clients connected through OAuth.
 
 ## Fly.io
 
@@ -158,7 +136,7 @@ fly ssh console -C "telegram-bridge login"
 already-logged-in personal Telegram account. It uses a dedicated
 `TELEGRAM_BRIDGE_NOTIFICATION_TOKEN` and a server-side group allowlist
 (`TELEGRAM_BRIDGE_NOTIFICATION_CHAT_IDS`). The notification token must differ
-from MCP and worker tokens. MCP exposes no send tool; its media recognition
+from the MCP token. MCP exposes no send tool; its media recognition
 actions require explicit paid-processing requests.
 
 The JSON request contains `chat`, `event_id` and `text`. SQLite receipts deduplicate
@@ -236,8 +214,8 @@ Media tools (available when the user API and MCP are configured):
 - `telegram_get_media_batch` reads/waits for multiple existing jobs without new paid work.
 
 Cloud processing is disabled by default. It runs in the existing Fly `serve`
-process using OpenRouter, SQLite, and FFmpeg; the Mac worker, Telegram Desktop,
-and local inference models are not involved. Ordinary history reads never enqueue
+process using OpenRouter, SQLite, and FFmpeg; Telegram Desktop and local
+inference models are not involved. Ordinary history reads never enqueue
 media; only the explicit paid history mode does. Up to three provider requests run
 concurrently with shared persistent deduplication and unchanged spending limits.
 History remains paginated; timeout returns pending jobs, never a false completion.
@@ -282,10 +260,7 @@ tools. The normal workflow is:
 edit → `scripts/check.sh` → open a new Codex task. Tool names and schemas are
 fixed during MCP initialization, so an already-open task does not reload them.
 
-MCP adapter changes need no reinstall or process restart. Changes to the local
-Codex worker are a separate cycle: rebuild and restart only that worker with
-`scripts/install-codex-worker.sh telegram-bridge=/path/to/telegram-bridge`.
-Return new tasks to the versioned production plugin with:
+MCP adapter changes need no reinstall or process restart. Return new tasks to the versioned production plugin with:
 
 ```sh
 scripts/codex-plugin.sh dev:unlink

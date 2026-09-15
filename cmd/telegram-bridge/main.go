@@ -12,12 +12,10 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
 	"golang.org/x/sync/errgroup"
 
 	"github.com/nextster/telegram-bridge/internal/bot"
-	"github.com/nextster/telegram-bridge/internal/codexworker"
 	"github.com/nextster/telegram-bridge/internal/config"
 	"github.com/nextster/telegram-bridge/internal/db"
 	"github.com/nextster/telegram-bridge/internal/media"
@@ -42,9 +40,6 @@ func run(args []string) error {
 	command, flagArgs := splitCommand(args)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if command == "worker" {
-		return runWorker(ctx, cfg, flagArgs)
-	}
 	fs := flag.NewFlagSet(command, flag.ExitOnError)
 	cfg.BindFlags(fs)
 	if err := fs.Parse(flagArgs); err != nil {
@@ -72,47 +67,6 @@ func run(args []string) error {
 	default:
 		return fmt.Errorf("unknown command %q", command)
 	}
-}
-
-type projectFlags []string
-
-func (p *projectFlags) String() string { return strings.Join(*p, ",") }
-func (p *projectFlags) Set(value string) error {
-	*p = append(*p, value)
-	return nil
-}
-
-func runWorker(ctx context.Context, cfg config.Config, args []string) error {
-	fs := flag.NewFlagSet("worker", flag.ContinueOnError)
-	var projects projectFlags
-	var workerID, codexBin string
-	var once bool
-	fs.Var(&projects, "project", "project mapping slug=/absolute/path (repeatable)")
-	fs.StringVar(&workerID, "worker-id", "", "stable worker name")
-	fs.StringVar(&codexBin, "codex-bin", "codex", "path to Codex CLI")
-	fs.BoolVar(&once, "once", false, "claim at most one job")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	parsed, err := codexworker.ParseProjects(projects)
-	if err != nil {
-		return err
-	}
-	worker, err := codexworker.New(codexworker.Config{
-		BaseURL: cfg.PublicBaseURL, Token: cfg.WorkerToken, WorkerID: workerID,
-		Projects: parsed, Poll: 3 * time.Second, CodexBin: codexBin,
-	})
-	if err != nil {
-		return err
-	}
-	if once {
-		claimed, err := worker.RunOnce(ctx)
-		if !claimed && err == nil {
-			fmt.Fprintln(os.Stdout, "No queued Codex jobs.")
-		}
-		return err
-	}
-	return worker.Run(ctx)
 }
 
 type ruleImport struct {
@@ -218,7 +172,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 		log.Print("telegram user API monitoring disabled: TELEGRAM_API_ID/TELEGRAM_API_HASH are not configured")
 	}
 
-	webServer, err := web.New(cfg, store, monitorService, systemNotifier, botService)
+	webServer, err := web.New(cfg, store, monitorService, systemNotifier)
 	if err != nil {
 		return err
 	}
@@ -285,7 +239,6 @@ Commands:
   login    Authorize Telegram user session for gotd
   migrate  Create or update SQLite schema
   rules-import  Import flexible watch rules from JSON on stdin
-  worker   Run the local Codex app-server worker
 
 Environment:
   TELEGRAM_BOT_TOKEN or BOT_TOKEN
@@ -294,6 +247,6 @@ Environment:
   TELEGRAM_PHONE or TG_PHONE
   TELEGRAM_PASSWORD or TG_PASSWORD
   TELEGRAM_BRIDGE_DB, TELEGRAM_BRIDGE_SESSION, TELEGRAM_BRIDGE_PUBLIC_URL,
-  TELEGRAM_BRIDGE_MCP_TOKEN, TELEGRAM_BRIDGE_OAUTH, TELEGRAM_BRIDGE_WORKER_TOKEN,
+  TELEGRAM_BRIDGE_MCP_TOKEN, TELEGRAM_BRIDGE_OAUTH,
   TELEGRAM_BRIDGE_NOTIFICATION_TOKEN, TELEGRAM_BRIDGE_NOTIFICATION_CHAT_IDS, PORT`)
 }

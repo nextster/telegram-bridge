@@ -32,7 +32,6 @@ func TestNotificationTokenMustBeIndependent(t *testing.T) {
 		{NotificationToken: "short"},
 		{NotificationToken: token + " "},
 		{NotificationToken: token, MCPToken: token},
-		{NotificationToken: token, WorkerToken: token},
 	} {
 		if cfg.ValidateNotifications() == nil {
 			t.Fatal("accepted invalid or reused notification credential")
@@ -41,7 +40,7 @@ func TestNotificationTokenMustBeIndependent(t *testing.T) {
 			t.Fatal("invalid credential enabled API")
 		}
 	}
-	cfg := Config{NotificationToken: token, MCPToken: "read", WorkerToken: "worker", NotificationChatIDs: []int64{-1001234567890}}
+	cfg := Config{NotificationToken: token, MCPToken: "read", NotificationChatIDs: []int64{-1001234567890}}
 	if cfg.ValidateNotifications() != nil || !cfg.HasNotificationAPI() {
 		t.Fatal("dedicated credential did not enable API")
 	}

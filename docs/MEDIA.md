@@ -357,7 +357,7 @@ Fly memory setting becomes 512 MB. Use the regular Dockerfile/deploy path.
    processed only within an explicitly requested image scope, not automatically
    as a side effect of this voice batch.
 
-Once queued, jobs run on Fly with the Mac off. Agent-driven discovery/export can
+Once queued, jobs run on Fly without any local process. Agent-driven discovery/export can
 be resumed separately using the durable job IDs. The single-voice smoke test and
 the `<prefix>` batch are separate live checks, not covered by local tests.
 

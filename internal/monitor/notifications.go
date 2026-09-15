@@ -95,3 +95,27 @@ func (s *Service) notificationPeer(ctx context.Context, api *tg.Client, userID, 
 	}
 	return nil, errors.New("destination is not an accessible group")
 }
+
+func sentMessageID(updates tg.UpdatesClass) int {
+	switch typed := updates.(type) {
+	case *tg.UpdateShortSentMessage:
+		return typed.ID
+	case *tg.Updates:
+		return sentMessageIDFromUpdates(typed.Updates)
+	case *tg.UpdatesCombined:
+		return sentMessageIDFromUpdates(typed.Updates)
+	}
+	return 0
+}
+
+func sentMessageIDFromUpdates(updates []tg.UpdateClass) int {
+	for _, update := range updates {
+		switch typed := update.(type) {
+		case *tg.UpdateNewMessage:
+			return typed.Message.GetID()
+		case *tg.UpdateNewChannelMessage:
+			return typed.Message.GetID()
+		}
+	}
+	return 0
+}

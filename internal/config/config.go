@@ -15,7 +15,6 @@ type Config struct {
 	SessionPath         string
 	PublicBaseURL       string
 	MCPToken            string
-	WorkerToken         string
 	NotificationChatIDs []int64
 	NotificationToken   string
 	// OAuthMode "on" enables OAuth for MCP clients; it is off by default.
@@ -40,7 +39,6 @@ func Load() (Config, error) {
 		SessionPath:       envFirstDefault("TELEGRAM_BRIDGE_SESSION", "/data/telegram.session", "TG_SESSION_PATH", "data/telegram.session"),
 		PublicBaseURL:     strings.TrimRight(envFirst("TELEGRAM_BRIDGE_PUBLIC_URL", "PUBLIC_BASE_URL"), "/"),
 		MCPToken:          envFirst("TELEGRAM_BRIDGE_MCP_TOKEN", "MCP_TOKEN"),
-		WorkerToken:       envFirst("TELEGRAM_BRIDGE_WORKER_TOKEN", "WORKER_TOKEN"),
 		NotificationToken: envFirst("TELEGRAM_BRIDGE_NOTIFICATION_TOKEN"),
 		OAuthMode:         strings.ToLower(strings.TrimSpace(envFirst("TELEGRAM_BRIDGE_OAUTH"))),
 		BotToken:          envFirst("TELEGRAM_BOT_TOKEN", "BOT_TOKEN"),
@@ -143,7 +141,6 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.SessionPath, "session", c.SessionPath, "gotd Telegram session file path")
 	fs.StringVar(&c.PublicBaseURL, "public-url", c.PublicBaseURL, "public HTTPS base URL for Telegram Mini App")
 	fs.StringVar(&c.MCPToken, "mcp-token", c.MCPToken, "bearer token protecting the MCP endpoint")
-	fs.StringVar(&c.WorkerToken, "worker-token", c.WorkerToken, "bearer token protecting the Codex worker API")
 	fs.StringVar(&c.BotToken, "bot-token", c.BotToken, "Telegram bot token")
 	fs.Func("admin-chat-ids", "comma-separated Telegram chat ids allowed to run bot admin commands", func(value string) error {
 		ids, err := parseInt64List(value)
@@ -184,10 +181,6 @@ func (c Config) HasMCP() bool {
 // is opt-in and needs the bot for approvals and a public URL for redirects.
 func (c Config) HasOAuth() bool {
 	return c.OAuthMode == "on" && c.HasBot() && c.PublicBaseURL != ""
-}
-
-func (c Config) HasWorkerAPI() bool {
-	return strings.TrimSpace(c.WorkerToken) != ""
 }
 
 func (c Config) ValidateLogin() error {
@@ -273,8 +266,8 @@ func (c Config) ValidateNotifications() error {
 	if len(c.NotificationToken) < 32 || strings.TrimSpace(c.NotificationToken) != c.NotificationToken {
 		return fmt.Errorf("TELEGRAM_BRIDGE_NOTIFICATION_TOKEN must be a dedicated random token of at least 32 characters without surrounding whitespace")
 	}
-	if c.NotificationToken == c.MCPToken || c.NotificationToken == c.WorkerToken {
-		return fmt.Errorf("notification token must differ from MCP and worker tokens")
+	if c.NotificationToken == c.MCPToken {
+		return fmt.Errorf("notification token must differ from the MCP token")
 	}
 	return nil
 }

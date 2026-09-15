@@ -8,7 +8,7 @@ session. MCP remains read-only and has no notification tool.
 
 Configure a dedicated random `TELEGRAM_BRIDGE_NOTIFICATION_TOKEN` (at least 32
 characters; generate with `openssl rand -hex 32`) in the server secret store and
-in the authorized caller's environment. Never reuse the MCP or worker token:
+in the authorized caller's environment. Never reuse the MCP token:
 configuration rejects equal values. Keep credentials out of Git, command-line
 arguments and logs. Requests require `Authorization: Bearer <notification-token>`
 over HTTPS. No cookie, MCP credential or Telegram session file is accepted as
@@ -95,6 +95,6 @@ they do not establish live membership or production delivery.
 
 Disable by removing `TELEGRAM_BRIDGE_NOTIFICATION_TOKEN` or clearing the allowlist
 and restarting. Older code ignores the additive receipt table; retain it for rollback
-and later reactivation. The existing session, monitor, watch rules and worker remain
+and later reactivation. The existing session, monitor and watch rules remain
 unchanged. Read-only plugin metadata should be refreshed with `scripts/codex-plugin.sh
 reload` after removing the earlier experimental MCP notification capability.
