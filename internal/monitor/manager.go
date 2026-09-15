@@ -502,7 +502,8 @@ func (m *Manager) logOutStoredSession(ctx context.Context, owner int64) {
 }
 
 // ImportLegacySession moves the single-account session file into the vault
-// under the account it belongs to. It returns that account's user ID.
+// under the account it belongs to and deletes the plaintext file. An
+// unauthorized session file is deleted too. It returns the account's user ID.
 func (m *Manager) ImportLegacySession(ctx context.Context) (int64, error) {
 	path := strings.TrimSpace(m.cfg.SessionPath)
 	if path == "" || !m.cfg.HasTelegramUserAPI() {
@@ -536,7 +537,12 @@ func (m *Manager) ImportLegacySession(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("check legacy telegram session: %w", err)
 	}
-	suffix := ".unauthorized"
+	return m.retireLegacySession(ctx, path, owner, memory)
+}
+
+// retireLegacySession saves an authorized legacy session for owner, then
+// deletes the file: it holds a working auth key in plaintext.
+func (m *Manager) retireLegacySession(ctx context.Context, path string, owner int64, memory *session.StorageMemory) (int64, error) {
 	if owner > 0 {
 		sessionData, err := memory.Bytes(nil)
 		if err != nil {
@@ -545,12 +551,11 @@ func (m *Manager) ImportLegacySession(ctx context.Context) (int64, error) {
 		if err := m.vault.Save(ctx, owner, sessionData); err != nil {
 			return 0, err
 		}
-		suffix = ".imported"
 	}
-	if err := os.Rename(path, path+suffix); err != nil {
-		return owner, fmt.Errorf("retire legacy telegram session file: %w", err)
+	if err := os.Remove(path); err != nil {
+		return owner, fmt.Errorf("delete legacy telegram session file: %w", err)
 	}
-	log.Printf("legacy telegram session file retired as %s%s (account %d)", path, suffix, owner)
+	log.Printf("legacy telegram session file %s imported for account %d and deleted", path, owner)
 	return owner, nil
 }
 

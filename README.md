@@ -136,8 +136,8 @@ Each user connects their account through the bot:
 ### Upgrading a single-account deployment
 
 On the first start of this version, an existing `TELEGRAM_BRIDGE_SESSION` file
-is encrypted into the database under the account it belongs to and renamed to
-`*.imported`. Existing rules, matches, sources and the deleted-message archive
+is encrypted into the database under the account it belongs to, and the
+plaintext file is deleted. Existing rules, matches, sources and the deleted-message archive
 are assigned to that account. `TELEGRAM_BRIDGE_MCP_TOKEN`,
 `TELEGRAM_BRIDGE_NOTIFICATION_TOKEN` and `TELEGRAM_BRIDGE_NOTIFICATION_CHAT_IDS`
 become that account's personal tokens and groups in the same run only; remove

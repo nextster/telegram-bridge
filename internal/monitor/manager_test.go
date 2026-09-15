@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/gotd/td/session"
@@ -76,6 +78,35 @@ func connectedTestAccount(store *db.Store, owner int64) *accountRuntime {
 		authorized: true,
 	}
 	return &accountRuntime{service: service, cancel: func() {}, done: make(chan struct{})}
+}
+
+func TestLegacySessionFileIsDeletedAfterImport(t *testing.T) {
+	ctx := context.Background()
+	store, vault := testVault(t)
+	manager := NewManager(config.Config{TelegramAPIID: 1, TelegramAPIHash: "fake"}, store, nil, vault)
+	for _, owner := range []int64{aliceID, 0} {
+		path := filepath.Join(t.TempDir(), "telegram.session")
+		if err := os.WriteFile(path, []byte(`{"auth_key":"legacy"}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		memory := &session.StorageMemory{}
+		if err := memory.StoreSession(ctx, []byte(`{"auth_key":"legacy"}`)); err != nil {
+			t.Fatal(err)
+		}
+		imported, err := manager.retireLegacySession(ctx, path, owner, memory)
+		if err != nil || imported != owner {
+			t.Fatalf("owner %d: imported=%d err=%v", owner, imported, err)
+		}
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("owner %d: legacy file still exists: %v", owner, err)
+		}
+		if matches, _ := filepath.Glob(path + "*"); len(matches) != 0 {
+			t.Fatalf("owner %d: leftover copies %v", owner, matches)
+		}
+	}
+	if data, err := vault.Load(ctx, aliceID); err != nil || string(data) != `{"auth_key":"legacy"}` {
+		t.Fatalf("imported session = %q, %v", data, err)
+	}
 }
 
 func TestRevokedRuntimeCannotDeleteASessionFromANewLogin(t *testing.T) {
