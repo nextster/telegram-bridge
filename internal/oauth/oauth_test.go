@@ -815,6 +815,19 @@ func TestSignInBindsTheRequestToTheBrowserThatOpenedIt(t *testing.T) {
 	}
 }
 
+func TestSignInAcceptsTheUserIDAsAString(t *testing.T) {
+	h := newHarness(t)
+	h.login.mutate = func(claims map[string]any) { claims["id"] = "777" }
+	requestID := h.openPage(h.authorizeURL(h.registerPublicClient(), strings.Repeat("v", 64)))
+	callback, _, _ := h.startSignIn(h.client, requestID, 777)
+	if status, _, body := h.browse(h.client, callback); status != http.StatusSeeOther {
+		t.Fatalf("callback status=%d body=%s", status, body)
+	}
+	if request, _, _ := h.store.GetOAuthRequest(context.Background(), requestID); request.BoundUserID != 777 {
+		t.Fatalf("bound user = %d", request.BoundUserID)
+	}
+}
+
 func TestSignInRejectsInvalidIDTokens(t *testing.T) {
 	for name, mutate := range map[string]func(map[string]any){
 		"wrong nonce":    func(claims map[string]any) { claims["nonce"] = "other" },
@@ -822,6 +835,8 @@ func TestSignInRejectsInvalidIDTokens(t *testing.T) {
 		"wrong issuer":   func(claims map[string]any) { claims["iss"] = "https://attacker.example" },
 		"expired":        func(claims map[string]any) { claims["exp"] = time.Now().Add(-time.Minute).Unix() },
 		"no user id":     func(claims map[string]any) { delete(claims, "id") },
+		"zero user id":   func(claims map[string]any) { claims["id"] = 0 },
+		"text user id":   func(claims map[string]any) { claims["id"] = "johndoe" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := newHarness(t)

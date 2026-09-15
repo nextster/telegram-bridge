@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -289,11 +290,44 @@ func (l *telegramLogin) userID(ctx context.Context, code, redirectURI, verifier,
 	}
 	// The numeric user ID is the "id" claim of the profile scope; "sub" is a
 	// different identifier.
-	var claims struct {
-		ID int64 `json:"id"`
+	var claims map[string]json.RawMessage
+	if err := idToken.Claims(&claims); err != nil {
+		return 0, fmt.Errorf("decode telegram id_token claims: %w", err)
 	}
-	if err := idToken.Claims(&claims); err != nil || claims.ID <= 0 {
-		return 0, errors.New("telegram id_token has no user id")
+	userID, ok := telegramUserID(claims["id"])
+	if !ok {
+		return 0, fmt.Errorf("telegram id_token has no user id; claims: %s", claimShape(claims))
 	}
-	return claims.ID, nil
+	return userID, nil
+}
+
+// telegramUserID accepts the user ID as a JSON number or a numeric string.
+func telegramUserID(raw json.RawMessage) (int64, bool) {
+	value := strings.Trim(strings.TrimSpace(string(raw)), `"`)
+	id, err := strconv.ParseInt(value, 10, 64)
+	return id, err == nil && id > 0
+}
+
+// claimShape lists claim names and JSON types without their values, so a
+// failed sign-in can be diagnosed without logging personal data.
+func claimShape(claims map[string]json.RawMessage) string {
+	shape := make([]string, 0, len(claims))
+	for name, raw := range claims {
+		kind := "null"
+		switch value := strings.TrimSpace(string(raw)); {
+		case strings.HasPrefix(value, `"`):
+			kind = "string"
+		case strings.HasPrefix(value, "{"):
+			kind = "object"
+		case strings.HasPrefix(value, "["):
+			kind = "array"
+		case value == "true" || value == "false":
+			kind = "bool"
+		case value != "null":
+			kind = "number"
+		}
+		shape = append(shape, name+":"+kind)
+	}
+	slices.Sort(shape)
+	return strings.Join(shape, ",")
 }
