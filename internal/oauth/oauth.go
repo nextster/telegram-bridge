@@ -87,8 +87,9 @@ type Approver interface {
 	// OAuthApprovalLink returns a link that opens the approval prompt for the
 	// request in the bot.
 	OAuthApprovalLink(ctx context.Context, requestID string) (string, error)
-	// OAuthConnectionRevoked tells the owner that a connection was cut off.
-	OAuthConnectionRevoked(ctx context.Context, clientName, reason string) error
+	// OAuthConnectionRevoked tells the user that one of their connections was
+	// cut off.
+	OAuthConnectionRevoked(ctx context.Context, userID int64, clientName, reason string) error
 }
 
 type Options struct {
@@ -154,16 +155,17 @@ func (s *Server) ResourceMetadataURL() string {
 	return s.issuer + "/.well-known/oauth-protected-resource/mcp"
 }
 
-// VerifyAccessToken reports whether token is a live OAuth access token.
-func (s *Server) VerifyAccessToken(ctx context.Context, token string) (bool, error) {
+// VerifyAccessToken resolves a live OAuth access token to the Telegram user
+// who approved it and the token's expiry.
+func (s *Server) VerifyAccessToken(ctx context.Context, token string) (int64, time.Time, bool, error) {
 	if !strings.HasPrefix(token, accessTokenPrefix) {
-		return false, nil
+		return 0, time.Time{}, false, nil
 	}
-	grant, _, ok, err := s.store.VerifyOAuthAccessToken(ctx, hashSecret(token), s.now())
-	if err != nil || !ok {
-		return false, err
+	grant, expires, ok, err := s.store.VerifyOAuthAccessToken(ctx, hashSecret(token), s.now())
+	if err != nil || !ok || grant.Resource != s.resource || grant.UserID <= 0 {
+		return 0, time.Time{}, false, err
 	}
-	return grant.Resource == s.resource, nil
+	return grant.UserID, expires, true, nil
 }
 
 func (s *Server) protectedResourceMetadata(resource string) http.HandlerFunc {
@@ -520,7 +522,7 @@ func (s *Server) refresh(w http.ResponseWriter, r *http.Request, client db.OAuth
 	if err != nil {
 		if errors.Is(err, db.ErrOAuthTokenReuse) {
 			log.Printf("oauth refresh token reuse revoked grant %s", grant.ID)
-			if alertErr := s.approver.OAuthConnectionRevoked(context.WithoutCancel(r.Context()), grant.ClientName, "старый refresh-токен использован повторно"); alertErr != nil {
+			if alertErr := s.approver.OAuthConnectionRevoked(context.WithoutCancel(r.Context()), grant.UserID, grant.ClientName, "старый refresh-токен использован повторно"); alertErr != nil {
 				log.Printf("oauth reuse alert failed: %v", alertErr)
 			}
 			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token was already used; the connection was revoked")

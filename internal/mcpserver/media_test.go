@@ -19,11 +19,14 @@ import (
 
 type mcpMediaSource struct{}
 
-func (mcpMediaSource) AccountID() int64 { return 1 }
-func (mcpMediaSource) Attachment(_ context.Context, chat string, id int) (media.Attachment, error) {
-	return media.Attachment{AccountID: 1, Chat: chat, MessageID: id, Kind: "voice", Size: 5, Duration: 1, Supported: true, Fingerprint: "stable", MIME: "audio/ogg", Date: time.Unix(1700000000, 0)}, nil
+func (mcpMediaSource) LiveAccounts() []int64 { return []int64{testUser} }
+func (mcpMediaSource) Attachment(_ context.Context, accountID int64, chat string, id int) (media.Attachment, error) {
+	if accountID != testUser {
+		return media.Attachment{}, media.Fail("telegram_account_unavailable")
+	}
+	return media.Attachment{AccountID: accountID, Chat: chat, MessageID: id, Kind: "voice", Size: 5, Duration: 1, Supported: true, Fingerprint: "stable", MIME: "audio/ogg", Date: time.Unix(1700000000, 0)}, nil
 }
-func (mcpMediaSource) Download(_ context.Context, _ media.Attachment, w io.Writer) error {
+func (mcpMediaSource) Download(_ context.Context, _ int64, _ media.Attachment, w io.Writer) error {
 	_, err := io.WriteString(w, "audio")
 	return err
 }
@@ -44,21 +47,25 @@ func mediaHTTPServer(t *testing.T) (*httptest.Server, *media.Service) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { service.Close() })
-	server := httptest.NewServer(New(nil, "test-token", Options{Media: service}))
+	server := httptest.NewServer(New(Options{
+		Media:       service,
+		VerifyToken: testVerifier(map[string]int64{"test-token": testUser, "secret": testUser, "other-user-token": 2}),
+		Accounts:    accountsFor(map[int64]Monitor{testUser: &historyReader{}}),
+	}))
 	t.Cleanup(server.Close)
 	return server, service
 }
 
 func TestMediaDownloadsRequireBearerOnEveryRequest(t *testing.T) {
 	server, service := mediaHTTPServer(t)
-	d, err := service.Download(context.Background(), "channel:1", 7)
+	d, err := service.Download(context.Background(), testUser, "channel:1", 7)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
 		token  string
 		status int
-	}{{"", 401}, {"wrong", 401}, {"test-token", 200}} {
+	}{{"", 401}, {"wrong", 401}, {"other-user-token", 404}, {"test-token", 200}} {
 		request, _ := http.NewRequest(http.MethodGet, server.URL+"/mcp/media/"+d.FileID, nil)
 		if tc.token != "" {
 			request.Header.Set("Authorization", "Bearer "+tc.token)
@@ -90,7 +97,7 @@ func TestMediaDownloadsRequireBearerOnEveryRequest(t *testing.T) {
 		r := httptest.NewRequest(http.MethodGet, "/mcp/media/"+d.FileID, nil)
 		r.Header.Set("Authorization", token)
 		w := httptest.NewRecorder()
-		New(nil, "").ServeHTTP(w, r)
+		New(Options{Media: service}).ServeHTTP(w, r)
 		if w.Code != 401 {
 			t.Fatal("empty configured token allowed access")
 		}
@@ -221,22 +228,22 @@ func TestCompletedMediaMCPUsesOperationSpecificResult(t *testing.T) {
 	server := httptest.NewServer(s)
 	defer server.Close()
 	ctx := context.Background()
-	audio, err := s.media.Start(ctx, "chat:1", 10, "transcription", media.Options{}, true)
+	audio, err := s.media.Start(ctx, testUser, "chat:1", 10, "transcription", media.Options{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	image, err := s.media.Start(ctx, "chat:1", 12, "image", media.Options{DescriptionLanguage: "ru"}, true)
+	image, err := s.media.Start(ctx, testUser, "chat:1", 12, "image", media.Options{DescriptionLanguage: "ru"}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err = completeHistoryJobs(ctx, store, 2); err != nil {
 		t.Fatal(err)
 	}
-	unknown, err := s.media.Start(ctx, "chat:1", 13, "transcription", media.Options{}, true)
+	unknown, err := s.media.Start(ctx, testUser, "chat:1", 13, "transcription", media.Options{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	j, err := store.ClaimMedia(ctx, 1, time.Now())
+	j, err := store.ClaimMedia(ctx, []int64{1}, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}

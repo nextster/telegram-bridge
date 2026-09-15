@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+const testOwner = int64(7)
+
 func TestOpenEnablesForeignKeysOnEveryPooledConnection(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(ctx, t.TempDir()+"/foreign-keys.db")
@@ -46,6 +48,7 @@ func TestGetEvent(t *testing.T) {
 	defer store.Close()
 
 	created, inserted, err := store.RecordEvent(ctx, Event{
+		OwnerUserID:    testOwner,
 		SourcePeerType: "channel",
 		SourcePeerID:   1000000001,
 		MessageID:      42,
@@ -60,7 +63,7 @@ func TestGetEvent(t *testing.T) {
 		t.Fatal("event was not inserted")
 	}
 
-	got, ok, err := store.GetEvent(ctx, created.ID)
+	got, ok, err := store.GetEvent(ctx, testOwner, created.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +74,7 @@ func TestGetEvent(t *testing.T) {
 		t.Fatalf("event = %+v", got)
 	}
 
-	if _, ok, err := store.GetEvent(ctx, created.ID+1); err != nil || ok {
+	if _, ok, err := store.GetEvent(ctx, testOwner, created.ID+1); err != nil || ok {
 		t.Fatalf("missing event ok=%v err=%v", ok, err)
 	}
 }
@@ -215,7 +218,7 @@ func TestPrivateArchivePruneProtectsPendingDeletion(t *testing.T) {
 	if err := store.RecordPrivateMessageDeletions(ctx, 100, []int{1}, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.PrunePrivateArchive(ctx, time.Unix(30, 0).UTC(), 1); err != nil {
+	if err := store.PrunePrivateArchive(ctx, 100, time.Unix(30, 0).UTC(), 1); err != nil {
 		t.Fatal(err)
 	}
 	stats, err := store.PrivateArchiveStats(ctx, 100)
@@ -232,7 +235,7 @@ func TestPrivateArchivePruneProtectsPendingDeletion(t *testing.T) {
 	if err := store.MarkPrivateDeletionNotified(ctx, 100, []int{1}, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.PrunePrivateArchive(ctx, time.Now().UTC(), 1); err != nil {
+	if err := store.PrunePrivateArchive(ctx, 100, time.Now().UTC(), 1); err != nil {
 		t.Fatal(err)
 	}
 	stats, err = store.PrivateArchiveStats(ctx, 100)
@@ -249,7 +252,7 @@ func TestWatchRuleRoundTrip(t *testing.T) {
 	}
 	defer store.Close()
 
-	rule, err := store.UpsertWatchRule(ctx, Keyword{
+	rule, err := store.UpsertWatchRule(ctx, testOwner, Keyword{
 		Phrase:              "repair stand",
 		AnyTerms:            []string{"workstand", "ремонтная стойка", "workstand"},
 		AllTerms:            []string{"bike"},
@@ -270,13 +273,13 @@ func TestWatchRuleRoundTrip(t *testing.T) {
 	}
 
 	event, inserted, err := store.RecordEvent(ctx, Event{
-		SourcePeerType: "channel", SourcePeerID: 42, MessageID: 7, Text: "bike workstand",
+		OwnerUserID: testOwner, SourcePeerType: "channel", SourcePeerID: 42, MessageID: 7, Text: "bike workstand",
 		Keyword: rule.Phrase, RuleID: rule.ID, MatchReason: "any: workstand; all: bike", MatchScore: 115,
 	})
 	if err != nil || !inserted {
 		t.Fatalf("record event: inserted=%v err=%v", inserted, err)
 	}
-	loaded, ok, err := store.GetEvent(ctx, event.ID)
+	loaded, ok, err := store.GetEvent(ctx, testOwner, event.ID)
 	if err != nil || !ok {
 		t.Fatalf("get event: ok=%v err=%v", ok, err)
 	}
@@ -293,23 +296,23 @@ func TestApplyWatchRulesIsAtomicAndPreservesUnrelatedRules(t *testing.T) {
 	}
 	defer store.Close()
 
-	if _, err := store.AddKeyword(ctx, "cargo"); err != nil {
+	if _, err := store.AddKeyword(ctx, testOwner, "cargo"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.AddKeyword(ctx, "кассета"); err != nil {
+	if _, err := store.AddKeyword(ctx, testOwner, "кассета"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.ApplyWatchRules(ctx, []Keyword{
+	if _, err := store.ApplyWatchRules(ctx, testOwner, []Keyword{
 		{Phrase: "exact cassette", AnyTerms: []string{"xg-1250"}},
 		{Phrase: "broken"},
 	}, []string{"кассета"}); err == nil {
 		t.Fatal("invalid batch succeeded")
 	}
-	if _, err := store.GetKeywordByPhrase(ctx, "кассета"); err != nil {
+	if _, err := store.GetKeywordByPhrase(ctx, testOwner, "кассета"); err != nil {
 		t.Fatalf("old rule disappeared after rejected batch: %v", err)
 	}
 
-	deleted, err := store.ApplyWatchRules(ctx, []Keyword{{
+	deleted, err := store.ApplyWatchRules(ctx, testOwner, []Keyword{{
 		Phrase:            "exact cassette",
 		AnyTerms:          []string{"cassette"},
 		RequiredAnyGroups: [][]string{{"xg-1250"}, {"10-36"}, {"xdr"}},
@@ -321,10 +324,10 @@ func TestApplyWatchRulesIsAtomicAndPreservesUnrelatedRules(t *testing.T) {
 	if deleted != 1 {
 		t.Fatalf("deleted = %d, want 1", deleted)
 	}
-	if _, err := store.GetKeywordByPhrase(ctx, "cargo"); err != nil {
+	if _, err := store.GetKeywordByPhrase(ctx, testOwner, "cargo"); err != nil {
 		t.Fatalf("unrelated rule was not preserved: %v", err)
 	}
-	if _, err := store.GetKeywordByPhrase(ctx, "exact cassette"); err != nil {
+	if _, err := store.GetKeywordByPhrase(ctx, testOwner, "exact cassette"); err != nil {
 		t.Fatalf("new rule missing: %v", err)
 	}
 }

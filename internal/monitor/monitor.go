@@ -1,19 +1,16 @@
 package monitor
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/telegram/updates"
@@ -34,11 +31,15 @@ type Handler struct {
 	deletionMu       sync.Mutex
 }
 
+// Service is the runtime of one Telegram account. Every Service serves exactly
+// one owner; the Manager routes requests to the Service of the caller.
 type Service struct {
 	cfg      config.Config
 	store    *db.Store
 	notifier notify.Notifier
 	handler  *Handler
+	owner    int64
+	storage  session.Storage
 
 	mu           sync.RWMutex
 	api          *tg.Client
@@ -47,7 +48,6 @@ type Service struct {
 	lastRunError string
 
 	backfillMu sync.Mutex
-	reloadCh   chan struct{}
 }
 
 type Status struct {
@@ -92,11 +92,15 @@ type LoginOptions struct {
 
 type LoginResult struct {
 	UserID            int64
-	SessionPath       string
 	AlreadyAuthorized bool
 }
 
-var errReloadRequested = errors.New("monitor reload requested")
+var (
+	// errSessionRevoked means Telegram no longer accepts the stored session.
+	errSessionRevoked = errors.New("telegram session is no longer authorized")
+	// errAccountMismatch means a stored session belongs to another account.
+	errAccountMismatch = errors.New("telegram session belongs to a different account")
+)
 
 const (
 	backfillPageDelay     = 1500 * time.Millisecond
@@ -119,41 +123,23 @@ func NewHandler(store *db.Store, notifier notify.Notifier) *Handler {
 	return &Handler{store: store, notifier: notifier, deletionNotifier: deletionNotifier}
 }
 
-func NewService(cfg config.Config, store *db.Store, notifier notify.Notifier) *Service {
+func newAccountService(cfg config.Config, store *db.Store, notifier notify.Notifier, owner int64, storage session.Storage) *Service {
 	handler := NewHandler(store, notifier)
+	handler.SetSelfUserID(owner)
 	return &Service{
 		cfg:      cfg,
 		store:    store,
 		notifier: notifier,
 		handler:  handler,
-		reloadCh: make(chan struct{}, 1),
+		owner:    owner,
+		storage:  storage,
 	}
 }
 
-func Run(ctx context.Context, cfg config.Config, store *db.Store, notifier notify.Notifier) error {
-	return NewService(cfg, store, notifier).Run(ctx)
-}
-
-func (s *Service) Run(ctx context.Context) error {
-	for {
-		err := s.runOnce(ctx)
-		if errors.Is(err, errReloadRequested) {
-			continue
-		}
-		return err
-	}
-}
-
+// runOnce connects the account and processes updates until ctx ends or the
+// connection fails.
 func (s *Service) runOnce(ctx context.Context) error {
 	cfg := s.cfg
-	if !cfg.HasTelegramUserAPI() {
-		log.Print("telegram user API monitoring disabled: TELEGRAM_API_ID/TELEGRAM_API_HASH are not configured")
-		<-ctx.Done()
-		return nil
-	}
-	if err := ensureParentDir(cfg.SessionPath); err != nil {
-		return err
-	}
 
 	manager := updates.New(updates.Config{
 		Handler:          s.handler,
@@ -162,8 +148,9 @@ func (s *Service) runOnce(ctx context.Context) error {
 		UserAccessHasher: s.store,
 	})
 	client := telegram.NewClient(cfg.TelegramAPIID, cfg.TelegramAPIHash, telegram.Options{
-		SessionStorage: &telegram.FileSessionStorage{Path: cfg.SessionPath},
+		SessionStorage: s.storage,
 		UpdateHandler:  manager,
+		Device:         clientDevice(),
 	})
 
 	return client.Run(ctx, func(ctx context.Context) error {
@@ -172,18 +159,16 @@ func (s *Service) runOnce(ctx context.Context) error {
 			return fmt.Errorf("check Telegram user auth status: %w", err)
 		}
 		if !status.Authorized || status.User == nil {
-			log.Print("telegram user API monitoring disabled: session is not authorized; run `telegram-bridge login` first")
 			s.setState(nil, 0, false, "")
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-s.reloadCh:
-				return errReloadRequested
-			}
+			return errSessionRevoked
+		}
+		if status.User.ID != s.owner {
+			s.setState(nil, 0, false, "")
+			return errAccountMismatch
 		}
 
 		s.setState(client.API(), status.User.ID, true, "")
-		s.handler.SetSelfUserID(status.User.ID)
+		defer s.setState(nil, 0, false, "")
 		log.Printf("telegram user monitoring started as user_id=%d", status.User.ID)
 		err = manager.Run(ctx, client.API(), status.User.ID, updates.AuthOptions{
 			OnStart: func(managerCtx context.Context) {
@@ -206,13 +191,6 @@ func (s *Service) runOnce(ctx context.Context) error {
 		}
 		return err
 	})
-}
-
-func (s *Service) Reload() {
-	select {
-	case s.reloadCh <- struct{}{}:
-	default:
-	}
 }
 
 func (s *Service) Status() Status {
@@ -247,6 +225,7 @@ func (s *Service) SyncDialogs(ctx context.Context) (int, error) {
 		if !ok {
 			continue
 		}
+		peer.OwnerUserID = userID
 		if err := s.store.UpsertMonitorPeer(ctx, peer); err != nil {
 			return count, err
 		}
@@ -271,7 +250,7 @@ func (s *Service) Backfill(ctx context.Context, days int) (BackfillResult, error
 		return BackfillResult{}, errors.New("days must be 365 or less")
 	}
 
-	api, _, err := s.readyAPI()
+	api, userID, err := s.readyAPI()
 	if err != nil {
 		return BackfillResult{}, err
 	}
@@ -279,7 +258,7 @@ func (s *Service) Backfill(ctx context.Context, days int) (BackfillResult, error
 	s.backfillMu.Lock()
 	defer s.backfillMu.Unlock()
 
-	peers, err := s.store.ListMonitorPeers(ctx, true)
+	peers, err := s.store.ListMonitorPeers(ctx, userID, true)
 	if err != nil {
 		return BackfillResult{}, err
 	}
@@ -296,7 +275,7 @@ func (s *Service) Backfill(ctx context.Context, days int) (BackfillResult, error
 		result.Scanned += peerResult.Scanned
 		result.Matched += peerResult.Matched
 		result.Inserted += peerResult.Inserted
-		if err := s.store.SetMonitorPeerBackfilled(ctx, peer.PeerType, peer.PeerID, time.Now().UTC()); err != nil {
+		if err := s.store.SetMonitorPeerBackfilled(ctx, userID, peer.PeerType, peer.PeerID, time.Now().UTC()); err != nil {
 			return result, err
 		}
 	}
@@ -414,7 +393,7 @@ func (s *Service) readyAPI() (*tg.Client, int64, error) {
 		return nil, 0, errors.New("telegram user API is not configured")
 	}
 	if !s.authorized || s.api == nil {
-		return nil, 0, errors.New("telegram user session is not authorized; run telegram-bridge login")
+		return nil, 0, errors.New("telegram account is not connected; send /login to the bot")
 	}
 	return s.api, s.userID, nil
 }
@@ -432,62 +411,6 @@ func (s *Service) setLastRunError(value string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.lastRunError = value
-}
-
-func (s *Service) LoginWithPrompts(ctx context.Context, opts LoginOptions) (LoginResult, error) {
-	cfg := s.cfg
-	if !cfg.HasTelegramUserAPI() {
-		return LoginResult{}, errors.New("telegram user API is not configured")
-	}
-	if opts.Prompt == nil {
-		return LoginResult{}, errors.New("login prompt is required")
-	}
-	if err := ensureParentDir(cfg.SessionPath); err != nil {
-		return LoginResult{}, err
-	}
-
-	client := telegram.NewClient(cfg.TelegramAPIID, cfg.TelegramAPIHash, telegram.Options{
-		SessionStorage: &telegram.FileSessionStorage{Path: cfg.SessionPath},
-	})
-
-	var result LoginResult
-	err := client.Run(ctx, func(ctx context.Context) error {
-		status, err := client.Auth().Status(ctx)
-		if err != nil {
-			return fmt.Errorf("check Telegram auth status: %w", err)
-		}
-		if status.Authorized {
-			result.SessionPath = cfg.SessionPath
-			result.AlreadyAuthorized = true
-			if status.User != nil {
-				result.UserID = status.User.ID
-			}
-			return nil
-		}
-
-		userAuth := &promptAuthenticator{
-			phone:  strings.TrimSpace(opts.Phone),
-			prompt: opts.Prompt,
-		}
-		if err := auth.NewFlow(userAuth, auth.SendCodeOptions{}).Run(ctx, client.Auth()); err != nil {
-			return fmt.Errorf("telegram login flow: %w", err)
-		}
-
-		status, err = client.Auth().Status(ctx)
-		if err != nil {
-			return fmt.Errorf("check Telegram auth status after login: %w", err)
-		}
-		result.SessionPath = cfg.SessionPath
-		if status.User != nil {
-			result.UserID = status.User.ID
-		}
-		return nil
-	})
-	if err != nil {
-		return LoginResult{}, err
-	}
-	s.Reload()
-	return result, nil
 }
 
 type promptAuthenticator struct {
@@ -528,61 +451,6 @@ func (a *promptAuthenticator) ask(ctx context.Context, kind LoginPromptKind, mes
 		return "", errors.New("empty login value")
 	}
 	return value, nil
-}
-
-func Login(ctx context.Context, cfg config.Config, in io.Reader, out io.Writer) error {
-	if err := cfg.ValidateLogin(); err != nil {
-		return err
-	}
-	if err := ensureParentDir(cfg.SessionPath); err != nil {
-		return err
-	}
-
-	client := telegram.NewClient(cfg.TelegramAPIID, cfg.TelegramAPIHash, telegram.Options{
-		SessionStorage: &telegram.FileSessionStorage{Path: cfg.SessionPath},
-	})
-
-	return client.Run(ctx, func(ctx context.Context) error {
-		status, err := client.Auth().Status(ctx)
-		if err != nil {
-			return fmt.Errorf("check Telegram auth status: %w", err)
-		}
-		if status.Authorized {
-			fmt.Fprintf(out, "Already authorized as user_id=%d\n", status.User.ID)
-			return nil
-		}
-
-		reader := bufio.NewReader(in)
-		codeAuth := auth.CodeAuthenticatorFunc(func(ctx context.Context, sentCode *tg.AuthSentCode) (string, error) {
-			fmt.Fprint(out, "Telegram code: ")
-			code, err := reader.ReadString('\n')
-			if err != nil {
-				return "", err
-			}
-			return strings.TrimSpace(code), nil
-		})
-
-		var userAuth auth.UserAuthenticator
-		if cfg.TelegramPassword != "" {
-			userAuth = auth.Constant(cfg.TelegramPhone, cfg.TelegramPassword, codeAuth)
-		} else {
-			userAuth = auth.CodeOnly(cfg.TelegramPhone, codeAuth)
-		}
-		if err := auth.NewFlow(userAuth, auth.SendCodeOptions{}).Run(ctx, client.Auth()); err != nil {
-			return fmt.Errorf("telegram login flow: %w", err)
-		}
-
-		status, err = client.Auth().Status(ctx)
-		if err != nil {
-			return fmt.Errorf("check Telegram auth status after login: %w", err)
-		}
-		if status.User != nil {
-			fmt.Fprintf(out, "Authorized as user_id=%d. Session saved to %s\n", status.User.ID, cfg.SessionPath)
-		} else {
-			fmt.Fprintf(out, "Authorized. Session saved to %s\n", cfg.SessionPath)
-		}
-		return nil
-	})
 }
 
 func (h *Handler) Handle(ctx context.Context, update tg.UpdatesClass) error {
@@ -672,17 +540,18 @@ func (h *Handler) processObserved(ctx context.Context, observed observedMessage,
 		return ProcessResult{}, err
 	}
 	observed.Text = strings.TrimSpace(observed.Text)
-	if observed.Text == "" {
+	owner := h.selfUserID.Load()
+	if observed.Text == "" || owner <= 0 {
 		return ProcessResult{}, nil
 	}
-	enabled, err := h.store.IsMonitorPeerEnabled(ctx, observed.SourcePeerType, observed.SourcePeerID)
+	enabled, err := h.store.IsMonitorPeerEnabled(ctx, owner, observed.SourcePeerType, observed.SourcePeerID)
 	if err != nil {
 		return ProcessResult{}, err
 	}
 	if !enabled {
 		return ProcessResult{}, nil
 	}
-	keywords, err := h.store.ListKeywords(ctx)
+	keywords, err := h.store.ListKeywords(ctx, owner)
 	if err != nil {
 		return ProcessResult{}, err
 	}
@@ -690,6 +559,7 @@ func (h *Handler) processObserved(ctx context.Context, observed observedMessage,
 	for _, matched := range match.Evaluate(observed.Text, observed.SourcePeerType, observed.SourcePeerID, keywords) {
 		keyword := matched.Keyword
 		event, inserted, err := h.store.RecordEvent(ctx, db.Event{
+			OwnerUserID:    owner,
 			SourcePeerType: observed.SourcePeerType,
 			SourcePeerID:   observed.SourcePeerID,
 			MessageID:      observed.MessageID,
@@ -755,17 +625,6 @@ func optionalUnixTime(seconds int) time.Time {
 		return time.Time{}
 	}
 	return time.Unix(int64(seconds), 0).UTC()
-}
-
-func ensureParentDir(path string) error {
-	if strings.TrimSpace(path) == "" {
-		return errors.New("path is empty")
-	}
-	dir := filepath.Dir(path)
-	if dir == "." || dir == "" {
-		return nil
-	}
-	return os.MkdirAll(dir, 0o755)
 }
 
 func chatsFromDialogs(dialogs tg.MessagesDialogsClass) []tg.ChatClass {

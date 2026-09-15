@@ -58,45 +58,33 @@ func (s *Service) OAuthApprovalLink(ctx context.Context, requestID string) (stri
 	return "https://t.me/" + username + "?start=" + oauthStartPrefix + requestID, nil
 }
 
-// OAuthConnectionRevoked notifies the account owner about a revoked connection.
-func (s *Service) OAuthConnectionRevoked(ctx context.Context, clientName, reason string) error {
-	owner := s.accountOwnerID()
-	if owner <= 0 {
-		return errors.New("Telegram account owner is unknown")
+// OAuthConnectionRevoked notifies a user that one of their connections was
+// revoked.
+func (s *Service) OAuthConnectionRevoked(ctx context.Context, userID int64, clientName, reason string) error {
+	if userID <= 0 {
+		return errors.New("connection owner is unknown")
 	}
-	return s.sendHTML(ctx, owner, fmt.Sprintf("⚠️ MCP-подключение %s отключено: %s.\nЕсли это были не вы, проверьте устройства и /connections.",
+	return s.sendHTML(ctx, userID, fmt.Sprintf("⚠️ MCP-подключение %s отключено: %s.\nЕсли это были не вы, проверьте устройства и /connections.",
 		codeHTML(clientName), html.EscapeString(reason)), nil)
 }
 
-// accountOwnerID is the Telegram user whose account the bridge exposes. Only
-// that user may approve or revoke MCP access.
-func (s *Service) accountOwnerID() int64 {
-	if s.ownerID != nil {
-		return s.ownerID()
+// canApproveOAuth requires a private chat and a connected Telegram account.
+// The approval grants access to that user's own account only.
+func (s *Service) canApproveOAuth(ctx context.Context, chatID, userID int64) (bool, error) {
+	if userID <= 0 || chatID != userID {
+		return false, nil
 	}
-	if s.monitorService == nil {
-		return 0
-	}
-	status := s.monitorService.Status()
-	if !status.Authorized {
-		return 0
-	}
-	return status.UserID
-}
-
-// isOAuthOwnerChat requires a private chat with the logged-in account owner.
-func (s *Service) isOAuthOwnerChat(chatID, userID int64) bool {
-	owner := s.accountOwnerID()
-	return owner > 0 && chatID == userID && userID == owner
+	return s.connected(ctx, userID)
 }
 
 func (s *Service) handleOAuthStart(ctx context.Context, message *telego.Message, requestID string) error {
-	var userID int64
-	if message.From != nil {
-		userID = message.From.ID
+	userID, _ := privateSender(message)
+	allowed, err := s.canApproveOAuth(ctx, message.Chat.ID, userID)
+	if err != nil {
+		return err
 	}
-	if !s.isOAuthOwnerChat(message.Chat.ID, userID) {
-		return s.reply(ctx, message.Chat.ID, "Подтвердить подключение может только владелец аккаунта Telegram, подключённого к мосту.", nil)
+	if !allowed {
+		return s.reply(ctx, message.Chat.ID, "Сначала подключите свой Telegram: /login. Доступ получит только ваш аккаунт.", nil)
 	}
 	request, found, err := s.store.GetOAuthRequest(ctx, requestID)
 	if err != nil {
@@ -121,14 +109,18 @@ func (s *Service) handleOAuthStart(ctx context.Context, message *telego.Message,
 		tu.InlineKeyboardRow(numbers...),
 		tu.InlineKeyboardRow(tu.InlineKeyboardButton("Отклонить").WithCallbackData(oauthCallbackPrefix+request.ID+":"+oauthDenyChoice)),
 	)
-	text := fmt.Sprintf("🔐 <b>Подключение к Telegram Bridge</b>\n\nКлиент: %s\nIP: %s\nБраузер: %s\n\nНажмите число со страницы подключения. Если вы её не открывали, нажмите «Отклонить».",
+	text := fmt.Sprintf("🔐 <b>Доступ к вашему Telegram через MCP</b>\n\nКлиент: %s\nIP: %s\nБраузер: %s\n\nНажмите число со страницы подключения. Если вы её не открывали сами, нажмите «Отклонить». Никогда не нажимайте число, которое вам прислал кто-то другой.",
 		codeHTML(clientName), codeHTML(request.ClientIP), codeHTML(request.UserAgent))
 	return s.sendHTML(ctx, message.Chat.ID, text, markup)
 }
 
-func (s *Service) handleOAuthCallback(ctx context.Context, query *telego.CallbackQuery, payload string) error {
-	if !s.isOAuthOwnerChat(callbackChatID(query), query.From.ID) {
-		return s.answerCallback(ctx, query.ID, "Подтвердить подключение может только владелец аккаунта.")
+func (s *Service) handleOAuthCallback(ctx context.Context, query *telego.CallbackQuery, userID int64, payload string) error {
+	allowed, err := s.canApproveOAuth(ctx, callbackChatID(query), userID)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return s.answerCallback(ctx, query.ID, "Сначала подключите свой Telegram: /login.")
 	}
 	requestID, choice, ok := strings.Cut(payload, ":")
 	if !ok || requestID == "" || choice == "" {
@@ -144,7 +136,7 @@ func (s *Service) handleOAuthCallback(ctx context.Context, query *telego.Callbac
 		return s.answerCallback(ctx, query.ID, "Запрос устарел.")
 	}
 	approve := choice != oauthDenyChoice && subtle.ConstantTimeCompare([]byte(choice), []byte(request.ApprovalCode)) == 1
-	_, changed, err := s.store.DecideOAuthRequest(ctx, request.ID, approve, query.From.ID, time.Now())
+	_, changed, err := s.store.DecideOAuthRequest(ctx, request.ID, approve, userID, time.Now())
 	if err != nil {
 		_ = s.answerCallback(ctx, query.ID, "Не удалось сохранить решение.")
 		return err
@@ -186,14 +178,11 @@ func (s *Service) finishOAuthPrompt(ctx context.Context, query *telego.CallbackQ
 }
 
 func (s *Service) handleConnections(ctx context.Context, message *telego.Message) error {
-	var userID int64
-	if message.From != nil {
-		userID = message.From.ID
+	userID, private := privateSender(message)
+	if !private {
+		return s.reply(ctx, message.Chat.ID, "MCP-подключения видны только в личном чате с ботом.", nil)
 	}
-	if !s.isOAuthOwnerChat(message.Chat.ID, userID) {
-		return s.reply(ctx, message.Chat.ID, "MCP-подключениями управляет только владелец аккаунта Telegram в личном чате с ботом.", nil)
-	}
-	grants, err := s.store.ListOAuthGrants(ctx)
+	grants, err := s.store.ListOAuthGrants(ctx, userID)
 	if err != nil {
 		return err
 	}
@@ -212,22 +201,19 @@ func (s *Service) handleConnections(ctx context.Context, message *telego.Message
 	return s.sendHTML(ctx, message.Chat.ID, strings.Join(lines, "\n"), tu.InlineKeyboard(rows...))
 }
 
-func (s *Service) handleOAuthRevokeCallback(ctx context.Context, query *telego.CallbackQuery, grantID string) error {
-	if !s.isOAuthOwnerChat(callbackChatID(query), query.From.ID) {
-		return s.answerCallback(ctx, query.ID, "Отключать подключения может только владелец аккаунта.")
-	}
-	grant, revoked, err := s.store.RevokeOAuthGrant(ctx, grantID, time.Now())
+func (s *Service) handleOAuthRevokeCallback(ctx context.Context, query *telego.CallbackQuery, userID int64, grantID string) error {
+	grant, revoked, err := s.store.RevokeOAuthGrant(ctx, userID, grantID, time.Now())
 	if err != nil {
 		_ = s.answerCallback(ctx, query.ID, "Не удалось отключить.")
 		return err
 	}
 	if !revoked {
-		return s.answerCallback(ctx, query.ID, "Подключение уже отключено.")
+		return s.answerCallback(ctx, query.ID, "Подключение не найдено или уже отключено.")
 	}
 	if err := s.answerCallback(ctx, query.ID, "Отключено."); err != nil {
 		log.Printf("answer OAuth revoke callback failed: %v", err)
 	}
-	return s.sendHTML(ctx, callbackChatID(query), "Отключено MCP-подключение "+codeHTML(grant.ClientName)+".", nil)
+	return s.sendHTML(ctx, userID, "Отключено MCP-подключение "+codeHTML(grant.ClientName)+".", nil)
 }
 
 func (s *Service) sendHTML(ctx context.Context, chatID int64, text string, markup telego.ReplyMarkup) error {

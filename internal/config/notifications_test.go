@@ -1,13 +1,15 @@
 package config
 
 import (
+	"bytes"
+	"encoding/base64"
+	"encoding/hex"
 	"strings"
 	"testing"
 )
 
-func TestNotificationAllowlistConfiguration(t *testing.T) {
+func TestLegacyNotificationAllowlistConfiguration(t *testing.T) {
 	t.Setenv("TELEGRAM_API_ID", "")
-	t.Setenv("TELEGRAM_BRIDGE_ADMIN_CHAT_IDS", "")
 	for _, value := range []string{"", "-1001234567890", "-123,-1001234567890"} {
 		t.Setenv("TELEGRAM_BRIDGE_NOTIFICATION_CHAT_IDS", value)
 		cfg, err := Load()
@@ -15,7 +17,7 @@ func TestNotificationAllowlistConfiguration(t *testing.T) {
 			t.Fatalf("valid allowlist: %v", err)
 		}
 		if value == "" && len(cfg.NotificationChatIDs) != 0 {
-			t.Fatal("default must disable notifications")
+			t.Fatal("default must not allow any group")
 		}
 	}
 	for _, value := range []string{"1234567890", "0", "-1000000000000", "-1997852516353", "bad"} {
@@ -26,7 +28,7 @@ func TestNotificationAllowlistConfiguration(t *testing.T) {
 	}
 }
 
-func TestNotificationTokenMustBeIndependent(t *testing.T) {
+func TestLegacyNotificationTokenMustBeIndependent(t *testing.T) {
 	token := strings.Repeat("n", 32)
 	for _, cfg := range []Config{
 		{NotificationToken: "short"},
@@ -36,16 +38,34 @@ func TestNotificationTokenMustBeIndependent(t *testing.T) {
 		if cfg.ValidateNotifications() == nil {
 			t.Fatal("accepted invalid or reused notification credential")
 		}
-		if cfg.HasNotificationAPI() {
-			t.Fatal("invalid credential enabled API")
+	}
+	if (Config{NotificationToken: token, MCPToken: "read"}).ValidateNotifications() != nil {
+		t.Fatal("rejected a dedicated notification credential")
+	}
+}
+
+func TestSessionKey(t *testing.T) {
+	key := bytes.Repeat([]byte{0xab}, 32)
+	for _, encoded := range []string{
+		base64.StdEncoding.EncodeToString(key),
+		base64.RawURLEncoding.EncodeToString(key),
+		hex.EncodeToString(key),
+		" " + base64.StdEncoding.EncodeToString(key) + "\n",
+	} {
+		got, err := parseSessionKey(encoded)
+		if err != nil || !bytes.Equal(got, key) {
+			t.Fatalf("parseSessionKey(%q) = %x, %v", encoded, got, err)
 		}
 	}
-	cfg := Config{NotificationToken: token, MCPToken: "read", NotificationChatIDs: []int64{-1001234567890}}
-	if cfg.ValidateNotifications() != nil || !cfg.HasNotificationAPI() {
-		t.Fatal("dedicated credential did not enable API")
+	for _, encoded := range []string{"short", base64.StdEncoding.EncodeToString(key[:16]), hex.EncodeToString(append(key, 1))} {
+		if _, err := parseSessionKey(encoded); err == nil {
+			t.Fatalf("accepted session key %q", encoded)
+		}
 	}
-	cfg.NotificationToken = ""
-	if cfg.HasNotificationAPI() {
-		t.Fatal("missing token enabled API")
+	if (Config{}).ValidateSessionKey() == nil {
+		t.Fatal("missing session key accepted")
+	}
+	if (Config{SessionKey: key}).ValidateSessionKey() != nil {
+		t.Fatal("valid session key rejected")
 	}
 }

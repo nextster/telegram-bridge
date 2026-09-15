@@ -73,7 +73,7 @@ func newOAuthTestService(t *testing.T) (*Service, *db.Store, *fakeTelegram) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service := &Service{bot: bot, store: store, cfg: config.Config{}, ownerID: func() int64 { return testOwnerID }}
+	service := &Service{bot: bot, store: store, cfg: config.Config{}, accounts: &fakeAccounts{connected: map[int64]bool{testOwnerID: true}}}
 	return service, store, api
 }
 
@@ -130,10 +130,10 @@ func TestOAuthStartShowsPromptOnlyToAccountOwner(t *testing.T) {
 	}
 	calls := api.take()
 	if len(calls) != 1 || strings.Contains(calls[0].Body["text"].(string), "42") || calls[0].Body["reply_markup"] != nil {
-		t.Fatalf("stranger received a prompt: %#v", calls)
+		t.Fatalf("a user without a connected account received a prompt: %#v", calls)
 	}
-	if subscribers, _ := store.ListSubscribers(ctx); len(subscribers) != 0 {
-		t.Fatalf("OAuth deep link subscribed a stranger: %#v", subscribers)
+	if subscribed, _ := store.IsSubscribed(ctx, 222); subscribed {
+		t.Fatal("OAuth deep link subscribed a user")
 	}
 
 	if err := service.handleUpdate(ctx, startMessage(testOwnerID, testOwnerID, "/start oauth_req1")); err != nil {
@@ -164,7 +164,13 @@ func TestOAuthCallbackRequiresOwnerAndMatchingNumber(t *testing.T) {
 		t.Fatal(err)
 	}
 	if request, _, _ := store.GetOAuthRequest(ctx, "stranger"); request.Status != db.OAuthRequestPending {
-		t.Fatalf("non-owner press changed status to %s", request.Status)
+		t.Fatalf("a user without a connected account changed status to %s", request.Status)
+	}
+	if err := service.handleUpdate(ctx, oauthCallback(testOwnerID, 333, "oauth:stranger:42")); err != nil {
+		t.Fatal(err)
+	}
+	if request, _, _ := store.GetOAuthRequest(ctx, "stranger"); request.Status != db.OAuthRequestPending {
+		t.Fatalf("a press outside the private chat changed status to %s", request.Status)
 	}
 
 	createPendingOAuthRequest(t, store, "wrong", "Codex")
@@ -197,9 +203,9 @@ func TestOAuthCallbackRequiresOwnerAndMatchingNumber(t *testing.T) {
 	}
 }
 
-func TestNoOAuthApprovalWithoutLoggedInOwner(t *testing.T) {
+func TestNoOAuthApprovalWithoutConnectedAccount(t *testing.T) {
 	service, store, _ := newOAuthTestService(t)
-	service.ownerID = func() int64 { return 0 }
+	service.accounts = &fakeAccounts{connected: map[int64]bool{}}
 	ctx := context.Background()
 	createPendingOAuthRequest(t, store, "orphan", "Codex")
 	if err := service.handleUpdate(ctx, oauthCallback(testOwnerID, testOwnerID, "oauth:orphan:42")); err != nil {

@@ -2,13 +2,13 @@ package mcpserver
 
 import (
 	"context"
-	"crypto/subtle"
 	"errors"
-	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/nextster/telegram-bridge/internal/media"
@@ -16,17 +16,23 @@ import (
 )
 
 type Server struct {
-	monitor             Monitor
+	accounts            AccountResolver
 	media               *media.Service
 	publicURL           string
-	token               string
 	verifyToken         TokenVerifier
 	resourceMetadataURL string
 	handler             http.Handler
 }
 
-// TokenVerifier accepts bearer tokens issued by the OAuth authorization server.
-type TokenVerifier func(context.Context, string) (bool, error)
+// TokenVerifier resolves a bearer token to the Telegram user it belongs to. It
+// returns auth.ErrInvalidToken for unknown, expired, or revoked tokens.
+type TokenVerifier func(ctx context.Context, token string) (userID int64, expires time.Time, err error)
+
+// AccountResolver returns the connected Telegram account of a user. Tools only
+// ever act on the account of the authenticated caller.
+type AccountResolver func(userID int64) (Monitor, error)
+
+var errNoPrincipal = errors.New("request is not authenticated")
 
 type Monitor interface {
 	ListDialogs(context.Context, string, int) ([]monitor.TelegramDialog, error)
@@ -87,21 +93,21 @@ type skippedMedia struct {
 }
 
 type Options struct {
-	Media     *media.Service
-	PublicURL string
-	// VerifyToken and ResourceMetadataURL enable OAuth access tokens in
-	// addition to the static token.
-	VerifyToken         TokenVerifier
+	Accounts    AccountResolver
+	VerifyToken TokenVerifier
+	Media       *media.Service
+	PublicURL   string
+	// ResourceMetadataURL is advertised in 401 challenges when OAuth is enabled.
 	ResourceMetadataURL string
 }
 
-func New(service Monitor, token string, options ...Options) *Server {
-	server := &Server{monitor: service, token: strings.TrimSpace(token)}
-	if len(options) > 0 {
-		server.media = options[0].Media
-		server.publicURL = strings.TrimRight(options[0].PublicURL, "/")
-		server.verifyToken = options[0].VerifyToken
-		server.resourceMetadataURL = options[0].ResourceMetadataURL
+func New(options Options) *Server {
+	server := &Server{
+		accounts:            options.Accounts,
+		media:               options.Media,
+		publicURL:           strings.TrimRight(options.PublicURL, "/"),
+		verifyToken:         options.VerifyToken,
+		resourceMetadataURL: options.ResourceMetadataURL,
 	}
 	mcpServer := mcp.NewServer(&mcp.Implementation{Name: "telegram-bridge", Version: "1.0.0"}, nil)
 	mcp.AddTool(mcpServer, &mcp.Tool{
@@ -131,20 +137,104 @@ func New(service Monitor, token string, options ...Options) *Server {
 	mux := http.NewServeMux()
 	mux.Handle("/", streamable)
 	mux.HandleFunc("/mcp/media/", server.downloadFile)
-	server.handler = server.authenticate(mux)
+	requireToken := auth.RequireBearerToken(server.verifyBearer, &auth.RequireBearerTokenOptions{ResourceMetadataURL: server.resourceMetadataURL})
+	server.handler = challengeRealm(requireToken(mux))
 	return server
 }
+
+func (s *Server) verifyBearer(ctx context.Context, token string, _ *http.Request) (*auth.TokenInfo, error) {
+	if s.verifyToken == nil {
+		return nil, auth.ErrInvalidToken
+	}
+	userID, expires, err := s.verifyToken(ctx, token)
+	if err != nil {
+		return nil, err
+	}
+	if userID <= 0 || expires.IsZero() {
+		return nil, auth.ErrInvalidToken
+	}
+	return &auth.TokenInfo{UserID: strconv.FormatInt(userID, 10), Expiration: expires}, nil
+}
+
+// principal returns the Telegram user of an authenticated tool call.
+func principal(req *mcp.CallToolRequest) (int64, error) {
+	if req == nil || req.Extra == nil || req.Extra.TokenInfo == nil {
+		return 0, errNoPrincipal
+	}
+	return parsePrincipal(req.Extra.TokenInfo)
+}
+
+func parsePrincipal(info *auth.TokenInfo) (int64, error) {
+	if info == nil {
+		return 0, errNoPrincipal
+	}
+	userID, err := strconv.ParseInt(info.UserID, 10, 64)
+	if err != nil || userID <= 0 {
+		return 0, errNoPrincipal
+	}
+	return userID, nil
+}
+
+func (s *Server) account(req *mcp.CallToolRequest) (Monitor, error) {
+	userID, err := principal(req)
+	if err != nil {
+		return nil, err
+	}
+	if s.accounts == nil {
+		return nil, media.Fail("telegram_unavailable")
+	}
+	account, err := s.accounts(userID)
+	if err != nil || account == nil {
+		return nil, errors.New("your Telegram account is not connected; send /login to the bot")
+	}
+	return account, nil
+}
+
+// challengeRealm names the realm in 401 responses that carry no OAuth
+// resource metadata challenge.
+func challengeRealm(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(&realmWriter{ResponseWriter: w}, r)
+	})
+}
+
+type realmWriter struct {
+	http.ResponseWriter
+}
+
+func (w *realmWriter) WriteHeader(status int) {
+	if status == http.StatusUnauthorized && w.Header().Get("WWW-Authenticate") == "" {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="telegram-bridge-mcp"`)
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *realmWriter) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *realmWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.handler.ServeHTTP(w, r)
 }
 
-func (s *Server) listDialogs(ctx context.Context, _ *mcp.CallToolRequest, input listDialogsInput) (*mcp.CallToolResult, listDialogsOutput, error) {
-	dialogs, err := s.monitor.ListDialogs(ctx, input.Query, input.Limit)
+func (s *Server) listDialogs(ctx context.Context, req *mcp.CallToolRequest, input listDialogsInput) (*mcp.CallToolResult, listDialogsOutput, error) {
+	account, err := s.account(req)
+	if err != nil {
+		return nil, listDialogsOutput{}, err
+	}
+	dialogs, err := account.ListDialogs(ctx, input.Query, input.Limit)
 	return nil, listDialogsOutput{Dialogs: dialogs}, err
 }
 
-func (s *Server) searchMessages(ctx context.Context, _ *mcp.CallToolRequest, input searchMessagesInput) (*mcp.CallToolResult, messagesOutput, error) {
+func (s *Server) searchMessages(ctx context.Context, req *mcp.CallToolRequest, input searchMessagesInput) (*mcp.CallToolResult, messagesOutput, error) {
+	account, err := s.account(req)
+	if err != nil {
+		return nil, messagesOutput{}, err
+	}
 	minDate, err := parseDate(input.MinDate)
 	if err != nil {
 		return nil, messagesOutput{}, err
@@ -153,47 +243,11 @@ func (s *Server) searchMessages(ctx context.Context, _ *mcp.CallToolRequest, inp
 	if err != nil {
 		return nil, messagesOutput{}, err
 	}
-	messages, err := s.monitor.SearchMessages(ctx, monitor.MessageSearchOptions{
+	messages, err := account.SearchMessages(ctx, monitor.MessageSearchOptions{
 		Chat: input.Chat, Query: input.Query, Limit: input.Limit,
 		MinDate: minDate, MaxDate: maxDate, OffsetID: input.OffsetID,
 	})
 	return nil, messagesOutput{Messages: messages}, err
-}
-
-func (s *Server) authenticate(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		scheme, provided, _ := strings.Cut(r.Header.Get("Authorization"), " ")
-		if !strings.EqualFold(scheme, "Bearer") || provided == "" {
-			s.unauthorized(w)
-			return
-		}
-		if s.token != "" && subtle.ConstantTimeCompare([]byte(provided), []byte(s.token)) == 1 {
-			next.ServeHTTP(w, r)
-			return
-		}
-		if s.verifyToken != nil {
-			ok, err := s.verifyToken(r.Context(), provided)
-			if err != nil {
-				log.Printf("verify MCP access token failed: %v", err)
-				http.Error(w, "authentication is temporarily unavailable", http.StatusServiceUnavailable)
-				return
-			}
-			if ok {
-				next.ServeHTTP(w, r)
-				return
-			}
-		}
-		s.unauthorized(w)
-	})
-}
-
-func (s *Server) unauthorized(w http.ResponseWriter) {
-	challenge := `Bearer realm="telegram-bridge-mcp"`
-	if s.resourceMetadataURL != "" {
-		challenge += `, resource_metadata="` + s.resourceMetadataURL + `"`
-	}
-	w.Header().Set("WWW-Authenticate", challenge)
-	http.Error(w, "unauthorized", http.StatusUnauthorized)
 }
 
 func parseDate(value string) (time.Time, error) {

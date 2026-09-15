@@ -1,12 +1,15 @@
 # telegram-bridge
 
-Single-binary Telegram radar MVP:
+Telegram MCP server and radar for a small group of people. Every user connects
+their own Telegram account through the bot and gets access only to that
+account: its MCP tools, watch rules, alerts, deleted-message archive,
+notification API, tokens and dashboard. There is no administrator role.
 
-- SQLite storage.
+- SQLite storage; Telegram sessions encrypted with AES-256-GCM.
 - Telegram bot via `telego`.
 - Telegram user API monitoring via `gotd/td`.
 - Mini App compatible web UI via `net/http` and `html/template`.
-- MCP access to the logged-in Telegram account, with explicit cloud media processing.
+- MCP access to the caller's own Telegram account, with explicit cloud media processing.
 - OpenRouter voice/video-note transcription and separately stored image description/OCR.
 - Fly.io deployment with a persistent `/data` volume.
 
@@ -31,39 +34,45 @@ export TELEGRAM_BOT_TOKEN="123:bot-token"
 
 Local development also reads `.env.local` automatically. Keep real secrets there, not in tracked Go files.
 
-Required env for user API monitoring:
+Required env for Telegram accounts:
 
 ```sh
 export TELEGRAM_API_ID="123456"
 export TELEGRAM_API_HASH="api_hash"
+export TELEGRAM_BRIDGE_SESSION_KEY="$(openssl rand -base64 32)"
 ```
 
-Optional env:
+The session key encrypts every stored Telegram session. Keep it stable and
+secret: losing it disconnects every user, and anyone holding it together with
+the database can use the sessions.
 
-```sh
-export TELEGRAM_PHONE="+15551234567"
-export TELEGRAM_PASSWORD="account-password"
-export TELEGRAM_BRIDGE_ADMIN_CHAT_IDS="123456789"
-export TELEGRAM_BRIDGE_MCP_TOKEN="a-long-random-bearer-token"
-```
-
-The bot can authorize the gotd user session with `/login`. The bot only asks for the Telegram phone number and then sends a short-lived site login link. Enter the Telegram login code and 2FA password on the HTTPS site, not in the bot chat: Telegram blocks code-based sign-in after a code is shared in a bot chat. If `TELEGRAM_BRIDGE_ADMIN_CHAT_IDS` is not set, the first chat that runs `/start` becomes the admin chat for MVP operations.
-
-The CLI `login` command still works and stores the gotd user session in `data/telegram.session` by default. On Fly.io it uses `/data/telegram.session`.
+Each user connects their own account with `/login` in a private chat with the
+bot. The bot asks them to share their contact (typed phone numbers are refused,
+so nobody can start a login for someone else's number) and sends a short-lived
+site login link. The Telegram code and 2FA password are entered on the HTTPS
+site, not in the bot chat: Telegram blocks code-based sign-in after a code is
+shared in a bot chat. The session is saved only if the account that signs in is
+the same Telegram user who asked the bot; otherwise it is logged out at once.
+`/logout` ends the Telegram session and revokes that user's MCP connections and
+tokens.
 
 ## Bot commands
 
-- `/start` subscribes the current chat to alerts.
-- `/stop` unsubscribes it.
+The bot works only in private chats, and every command acts on the sender's
+own account.
+
+- `/start` turns alerts on.
+- `/stop` turns them off.
 - `/add phrase` adds a simple one-term watch rule.
 - `/watch name :: any1, any2 :: required1 :: excluded1` adds a flexible watch rule.
-- `/del phrase-or-id` deletes a monitored phrase.
-- `/keywords` lists phrases.
-- `/recent` shows latest matches.
-- `/login` authorizes Telegram user API monitoring.
-- `/loginstatus` shows user session status.
-- `/cancel` cancels an in-progress bot login.
-- `/connections` lists and revokes MCP clients connected through OAuth.
+- `/del phrase-or-id` deletes one of your rules.
+- `/keywords` lists your rules.
+- `/recent` shows your latest matches.
+- `/login` connects your Telegram account.
+- `/loginstatus` shows its status.
+- `/logout` disconnects it and revokes your MCP connections and tokens.
+- `/cancel` cancels an in-progress login.
+- `/connections` lists and revokes your MCP clients connected through OAuth.
 
 ## Fly.io
 
@@ -81,6 +90,7 @@ fly secrets set TELEGRAM_BOT_TOKEN="123:bot-token"
 fly secrets set TELEGRAM_API_ID="123456"
 fly secrets set TELEGRAM_API_HASH="api_hash"
 fly secrets set TELEGRAM_BRIDGE_PUBLIC_URL="https://telegram-bridge.fly.dev"
+fly secrets set TELEGRAM_BRIDGE_SESSION_KEY="$(openssl rand -base64 32)"
 ```
 
 Deploy:
@@ -115,29 +125,33 @@ For an extra post-deploy public health check:
 WAIT_HEALTH=1 scripts/deploy-fast.sh
 ```
 
-Authorize the user session once through the bot:
+Each user connects their account through the bot:
 
 1. Open the bot in Telegram.
 2. Send `/start`.
-3. Send `/login`.
-4. Share your phone if the bot asks for it.
-5. Open the login link from the bot.
-6. Enter the Telegram login code and 2FA password on the site.
+3. Send `/login` and share your contact.
+4. Open the login link from the bot.
+5. Enter the Telegram login code and 2FA password on the site.
 
-The old SSH path is still available:
+### Upgrading a single-account deployment
 
-```sh
-fly ssh console -C "telegram-bridge login"
-```
+On the first start of this version, an existing `TELEGRAM_BRIDGE_SESSION` file
+is encrypted into the database under the account it belongs to and renamed to
+`*.imported`. Existing rules, matches, sources and the deleted-message archive
+are assigned to that account. `TELEGRAM_BRIDGE_MCP_TOKEN`,
+`TELEGRAM_BRIDGE_NOTIFICATION_TOKEN` and `TELEGRAM_BRIDGE_NOTIFICATION_CHAT_IDS`
+become that account's personal tokens and groups in the same run only; remove
+them from the environment afterwards. Set `TELEGRAM_BRIDGE_SESSION_KEY` before
+upgrading.
 
 ## HTTP notification API
 
-`POST /notifications/v1/messages` sends authorized notifications through the
-already-logged-in personal Telegram account. It uses a dedicated
-`TELEGRAM_BRIDGE_NOTIFICATION_TOKEN` and a server-side group allowlist
-(`TELEGRAM_BRIDGE_NOTIFICATION_CHAT_IDS`). The notification token must differ
-from the MCP token. MCP exposes no send tool; its media recognition
-actions require explicit paid-processing requests.
+`POST /notifications/v1/messages` posts to a group as the token owner's own
+Telegram account. Each user creates a notification token and allows groups on
+their dashboard; a token can post only to its owner's groups, only as its owner.
+Notification tokens are not accepted by MCP, and MCP tokens are not accepted
+here. MCP exposes no send tool; its media recognition actions require explicit
+paid-processing requests.
 
 The JSON request contains `chat`, `event_id` and `text`. SQLite receipts deduplicate
 an event across clients and server restarts. See [API setup and recovery](docs/NOTIFICATIONS.md)
@@ -146,7 +160,9 @@ for activation, verification, security boundaries and rollback.
 ## MCP
 
 The Streamable HTTP endpoint lives at `https://<your-host>/mcp`. Clients
-authenticate with OAuth approved in the bot, or with a static bearer token.
+authenticate with OAuth approved in the bot, or with a personal MCP token from
+the dashboard. Either way the tools act only on the account that owns the
+credential.
 
 ### OAuth with bot approval
 
@@ -170,31 +186,31 @@ Pressing the number from the page approves; any other button denies the
 request.
 
 - The bot never sends approval prompts on its own, so nobody can push prompts
-  to the owner by opening authorization pages.
-- Only the Telegram account logged in to the bridge can approve, in its private
-  chat with the bot. Other subscribers and admin chats cannot.
+  to a user by opening authorization pages.
+- The connection is granted to whoever confirms it, for their own connected
+  account, in their private chat with the bot. Confirming a request somebody
+  else opened gives that person access to your account, so press only the
+  number shown on your own screen.
 - Codes and tokens never pass through Telegram. Only the browser that opened the
   page receives the single authorization code.
 - Redirects are limited to loopback addresses and the Claude connector callback;
   add exact HTTPS callbacks with `TELEGRAM_BRIDGE_OAUTH_REDIRECT_URIS`.
 - Access tokens last one hour. Refresh tokens rotate, expire after 90 days
   without use, and connections end after a year. Reusing an old refresh token
-  revokes the connection and notifies the owner. SQLite stores only SHA-256
+  revokes the connection and notifies its user. SQLite stores only SHA-256
   hashes.
 - `/connections` lists active clients and revokes them.
 
-### Static bearer token
+### Personal MCP token
 
-A dedicated token still works for the Codex plugin, the local dev adapter, and
-media download URLs:
+Clients without OAuth, such as the Codex plugin and the local dev adapter, use
+a personal MCP token created on the dashboard and shown once. Put it in
+`TELEGRAM_BRIDGE_MCP_TOKEN` for the plugin. Clients send
+`Authorization: Bearer <token>` on every request; media download URLs need the
+same credential.
 
-```sh
-fly secrets set TELEGRAM_BRIDGE_MCP_TOKEN="$(openssl rand -hex 32)"
-```
-
-The MCP server reuses the live gotd client inside `telegram-bridge serve`, so it does
-not create a second Telegram session or require another login. Clients must
-send `Authorization: Bearer <token>` on every request.
+The MCP server reuses each user's live gotd client inside `telegram-bridge serve`,
+so it does not create a second Telegram session or require another login.
 
 History and search tools:
 
@@ -268,12 +284,12 @@ scripts/codex-plugin.sh dev:unlink
 
 ## Private message deletion alerts
 
-The logged-in user session keeps a private SQLite snapshot of direct,
+Each connected account keeps a private SQLite snapshot of its direct,
 non-bot chats so the bot can report messages that later disappear. On the
 first run it seeds up to the latest 100 messages from each direct dialog in
 the 100 most recent Telegram dialogs, then keeps new messages and edits
 current. Snapshots are retained for 90 days, with a 25,000-message safety cap
-for the small Fly volume. Pending alerts are protected from pruning.
+per account for the small Fly volume. Pending alerts are protected from pruning.
 
 It stores text/captions and a media kind, not photo, video, voice, or file
 bytes. The archive is not exposed on the dashboard or through MCP. Deletion
@@ -309,11 +325,10 @@ The dashboard can create grouped rules with:
   as `XG1250`/`XG-1250` and `T25` normalize consistently without making `12`
   match `1200`.
 
-Dashboard reads and mutations require a validated Telegram Mini App session
-from the configured bot admin chat. Opening the public URL directly shows only
-an authentication prompt; it does not render sources, rules, or recent match
-text. Bot management commands and destructive callback buttons are likewise
-restricted to the admin chat.
+Dashboard reads and mutations require a validated Telegram Mini App session,
+and every page and action is scoped to that Telegram user. Rules can be scoped
+only to the user's own sources. Opening the public URL directly shows only an
+authentication prompt; it does not render sources, rules, or recent match text.
 
 Exclusions are exact-only so `продан` cannot suppress a normal `продам`
 listing. A required-any group can also contain a unit-aware numeric minimum,
@@ -328,8 +343,10 @@ one bot status message per rule:
 
 ```sh
 printf '%s' '{"delete":["old phrase"],"rules":[{"name":"front light","any":["front bike light","велофара"],"required_any":[["USB-C","Type-C"],["1000","1200","1600"]],"prefer":["daytime flash","Garmin mount"],"exclude":["sold","продано"],"note":"Verify the beam and underside mount."}]}' \
-  | telegram-bridge rules-import
+  | telegram-bridge rules-import -owner 123456789
 ```
+
+`-owner` is the Telegram user ID that owns the imported rules.
 
 Imports may also define `default_exclude`, `default_sources`, and
 `default_exclude_complete_bike`. A rule inherits the default sources when
@@ -338,7 +355,7 @@ Imports may also define `default_exclude`, `default_sources`, and
 default exclusions, a numeric minimum, and a source-scoped rule:
 
 ```sh
-telegram-bridge rules-import < rules/example.json
+telegram-bridge rules-import -owner 123456789 < rules/example.json
 ```
 
 Keep personal rule packs in `rules/`: every JSON file there except the example

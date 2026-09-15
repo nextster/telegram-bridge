@@ -19,7 +19,7 @@ func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) 
 func TestServerRejectsMissingToken(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/mcp", nil)
 	response := httptest.NewRecorder()
-	New(nil, "secret").ServeHTTP(response, request)
+	New(Options{VerifyToken: testVerifier(map[string]int64{"secret": testUser}), Accounts: accountsFor(map[int64]Monitor{testUser: &historyReader{}})}).ServeHTTP(response, request)
 
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want %d", response.Code, http.StatusUnauthorized)
@@ -30,7 +30,7 @@ func TestServerRejectsMissingToken(t *testing.T) {
 }
 
 func TestMCPHandshakeAndToolsList(t *testing.T) {
-	httpServer := httptest.NewServer(New(nil, "secret"))
+	httpServer := httptest.NewServer(New(Options{VerifyToken: testVerifier(map[string]int64{"secret": testUser}), Accounts: accountsFor(map[int64]Monitor{testUser: &historyReader{}})}))
 	defer httpServer.Close()
 
 	baseTransport := http.DefaultTransport

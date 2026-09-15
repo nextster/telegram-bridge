@@ -12,6 +12,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/auth"
+
+	"github.com/nextster/telegram-bridge/internal/apitoken"
 	"github.com/nextster/telegram-bridge/internal/config"
 	"github.com/nextster/telegram-bridge/internal/db"
 	"github.com/nextster/telegram-bridge/internal/mcpserver"
@@ -21,12 +24,33 @@ import (
 	"github.com/nextster/telegram-bridge/internal/oauth"
 )
 
+// Accounts is the account manager as seen by the web server. Every method is
+// scoped to one Telegram user.
+type Accounts interface {
+	Account(owner int64) (*monitor.Service, error)
+	Status(owner int64) monitor.Status
+	Login(ctx context.Context, owner int64, opts monitor.LoginOptions) (monitor.LoginResult, error)
+	NotificationSender(ctx context.Context, accountID int64) (notify.NotificationSender, error)
+}
+
+// UserNotifier delivers a private message to one user.
+type UserNotifier interface {
+	NotifyUser(ctx context.Context, userID int64, text string) error
+}
+
+type nopUserNotifier struct{}
+
+func (nopUserNotifier) NotifyUser(context.Context, int64, string) error { return nil }
+
+// Server serves the per-user dashboard, site login, MCP, OAuth, and the
+// notification API. Every dashboard request acts for the Telegram user in the
+// signed Mini App session only.
 type Server struct {
 	cfg           config.Config
 	store         *db.Store
-	monitor       *monitor.Service
+	accounts      Accounts
 	media         *media.Service
-	notifier      notify.SystemNotifier
+	notifier      UserNotifier
 	template      *template.Template
 	loginTemplate *template.Template
 	login         *webLoginManager
@@ -34,22 +58,24 @@ type Server struct {
 }
 
 type dashboardData struct {
-	Stats          db.Stats
-	Keywords       []db.Keyword
-	Peers          []db.MonitorPeer
-	Events         []db.Event
-	TelegramStatus monitor.Status
-	Error          string
-	Notice         string
-	Now            time.Time
+	Stats             db.Stats
+	Keywords          []db.Keyword
+	Peers             []db.MonitorPeer
+	Events            []db.Event
+	Tokens            []db.APIToken
+	NotificationChats []db.NotificationChat
+	NewToken          string
+	NewTokenScope     string
+	PublicURL         string
+	TelegramStatus    monitor.Status
+	Error             string
+	Notice            string
+	Now               time.Time
 }
 
-func New(cfg config.Config, store *db.Store, monitorService *monitor.Service, notifier notify.SystemNotifier) (*Server, error) {
-	if err := cfg.ValidateNotifications(); err != nil {
-		return nil, err
-	}
+func New(cfg config.Config, store *db.Store, accounts Accounts, notifier UserNotifier) (*Server, error) {
 	if notifier == nil {
-		notifier = notify.Nop{}
+		notifier = nopUserNotifier{}
 	}
 	tpl, err := template.New("dashboard").Funcs(template.FuncMap{
 		"time": func(t time.Time) string {
@@ -84,11 +110,11 @@ func New(cfg config.Config, store *db.Store, monitorService *monitor.Service, no
 	return &Server{
 		cfg:           cfg,
 		store:         store,
-		monitor:       monitorService,
+		accounts:      accounts,
 		notifier:      notifier,
 		template:      tpl,
 		loginTemplate: loginTpl,
-		login:         newWebLoginManager(store, monitorService, notifier),
+		login:         newWebLoginManager(store, accounts, notifier),
 	}, nil
 }
 
@@ -127,75 +153,115 @@ func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.dashboardEntry)
 	mux.HandleFunc("POST /webapp/auth", s.authenticateWebApp)
-	mux.HandleFunc("POST /keywords/add", s.requireWebAdmin(s.addKeyword))
-	mux.HandleFunc("POST /rules/add", s.requireWebAdmin(s.addWatchRule))
-	mux.HandleFunc("POST /keywords/delete", s.requireWebAdmin(s.deleteKeyword))
-	mux.HandleFunc("POST /sources/sync", s.requireWebAdmin(s.syncSources))
-	mux.HandleFunc("POST /sources/toggle", s.requireWebAdmin(s.toggleSource))
-	mux.HandleFunc("POST /history/backfill", s.requireWebAdmin(s.backfillHistory))
+	mux.HandleFunc("POST /keywords/add", s.requireWebUser(s.addKeyword))
+	mux.HandleFunc("POST /rules/add", s.requireWebUser(s.addWatchRule))
+	mux.HandleFunc("POST /keywords/delete", s.requireWebUser(s.deleteKeyword))
+	mux.HandleFunc("POST /sources/sync", s.requireWebUser(s.syncSources))
+	mux.HandleFunc("POST /sources/toggle", s.requireWebUser(s.toggleSource))
+	mux.HandleFunc("POST /history/backfill", s.requireWebUser(s.backfillHistory))
+	mux.HandleFunc("POST /tokens/create", s.requireWebUser(s.createToken))
+	mux.HandleFunc("POST /tokens/delete", s.requireWebUser(s.deleteToken))
+	mux.HandleFunc("POST /notification-chats/add", s.requireWebUser(s.addNotificationChat))
+	mux.HandleFunc("POST /notification-chats/delete", s.requireWebUser(s.deleteNotificationChat))
 	mux.HandleFunc("GET /login", s.loginPage)
 	mux.HandleFunc("POST /login", s.loginSubmit)
 	mux.HandleFunc("POST /login/restart", s.loginRestart)
 	mux.HandleFunc("GET /healthz", s.healthz)
-	if s.cfg.HasMCP() && s.monitor != nil {
-		options := mcpserver.Options{Media: s.media, PublicURL: s.cfg.PublicBaseURL}
+	if s.accounts != nil && s.store != nil {
+		options := mcpserver.Options{
+			Media:       s.media,
+			PublicURL:   s.cfg.PublicBaseURL,
+			VerifyToken: s.verifyMCPToken,
+			Accounts: func(userID int64) (mcpserver.Monitor, error) {
+				account, err := s.accounts.Account(userID)
+				if err != nil {
+					return nil, err
+				}
+				return account, nil
+			},
+		}
 		if s.oauth != nil {
 			s.oauth.Register(mux)
-			options.VerifyToken = s.oauth.VerifyAccessToken
 			options.ResourceMetadataURL = s.oauth.ResourceMetadataURL()
 			log.Print("MCP OAuth enabled with Telegram bot approval")
 		}
-		mcpHandler := mcpserver.New(s.monitor, s.cfg.MCPToken, options)
+		mcpHandler := mcpserver.New(options)
 		mux.Handle("/mcp", mcpHandler)
 		mux.Handle("/mcp/media/", mcpHandler)
 		log.Print("MCP endpoint enabled at /mcp")
-	}
-	if s.cfg.HasNotificationAPI() && s.monitor != nil && s.store != nil {
-		notifications := notify.NewNotifications(s.store, s.monitor, s.cfg.NotificationChatIDs)
-		mux.Handle("POST /notifications/v1/messages", notify.NewHTTPHandler(notifications, s.cfg.NotificationToken))
+
+		notifications := notify.NewNotifications(s.store, s.accounts)
+		mux.Handle("POST /notifications/v1/messages", notify.NewHTTPHandler(notifications, s.store))
 		log.Print("Notification API enabled at /notifications/v1/messages")
 	}
 	return mux
 }
 
-func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
+// verifyMCPToken accepts OAuth access tokens and personal MCP tokens and
+// returns the Telegram user they belong to.
+func (s *Server) verifyMCPToken(ctx context.Context, token string) (int64, time.Time, error) {
+	now := time.Now()
+	if s.oauth != nil {
+		userID, expires, ok, err := s.oauth.VerifyAccessToken(ctx, token)
+		if err != nil {
+			return 0, time.Time{}, err
+		}
+		if ok {
+			return userID, expires, nil
+		}
+	}
+	owner, ok, err := s.store.ResolveAPIToken(ctx, apitoken.Hash(token), db.APITokenScopeMCP, now)
+	if err != nil {
+		return 0, time.Time{}, err
+	}
+	if !ok {
+		return 0, time.Time{}, auth.ErrInvalidToken
+	}
+	return owner, now.Add(time.Hour), nil
+}
+
+func (s *Server) dashboard(w http.ResponseWriter, r *http.Request, userID int64) {
+	s.renderDashboard(w, r, userID, dashboardData{
+		Error:  r.URL.Query().Get("error"),
+		Notice: r.URL.Query().Get("notice"),
+	})
+}
+
+func (s *Server) renderDashboard(w http.ResponseWriter, r *http.Request, userID int64, data dashboardData) {
 	ctx := r.Context()
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors https://web.telegram.org https://*.telegram.org")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	stats, err := s.store.Stats(ctx)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	var err error
+	if data.Stats, err = s.store.Stats(ctx, userID); err != nil {
+		http.Error(w, "dashboard unavailable", http.StatusInternalServerError)
 		return
 	}
-	keywords, err := s.store.ListKeywords(ctx)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if data.Keywords, err = s.store.ListKeywords(ctx, userID); err != nil {
+		http.Error(w, "dashboard unavailable", http.StatusInternalServerError)
 		return
 	}
-	peers, err := s.store.ListMonitorPeers(ctx, false)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if data.Peers, err = s.store.ListMonitorPeers(ctx, userID, false); err != nil {
+		http.Error(w, "dashboard unavailable", http.StatusInternalServerError)
 		return
 	}
-	events, err := s.store.ListEvents(ctx, 50)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if data.Events, err = s.store.ListEvents(ctx, userID, 50); err != nil {
+		http.Error(w, "dashboard unavailable", http.StatusInternalServerError)
 		return
 	}
-
-	data := dashboardData{
-		Stats:    stats,
-		Keywords: keywords,
-		Peers:    peers,
-		Events:   events,
-		Error:    r.URL.Query().Get("error"),
-		Notice:   r.URL.Query().Get("notice"),
-		Now:      time.Now(),
+	if data.Tokens, err = s.store.ListAPITokens(ctx, userID); err != nil {
+		http.Error(w, "dashboard unavailable", http.StatusInternalServerError)
+		return
 	}
-	if s.monitor != nil {
-		data.TelegramStatus = s.monitor.Status()
+	if data.NotificationChats, err = s.store.ListNotificationChats(ctx, userID); err != nil {
+		http.Error(w, "dashboard unavailable", http.StatusInternalServerError)
+		return
+	}
+	data.Now = time.Now()
+	data.PublicURL = strings.TrimRight(s.cfg.PublicBaseURL, "/")
+	if s.accounts != nil {
+		data.TelegramStatus = s.accounts.Status(userID)
 	} else {
 		data.TelegramStatus = monitor.Status{Configured: s.cfg.HasTelegramUserAPI()}
 	}
@@ -205,22 +271,20 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) addKeyword(w http.ResponseWriter, r *http.Request) {
+func (s *Server) addKeyword(w http.ResponseWriter, r *http.Request, userID int64) {
 	if err := r.ParseForm(); err != nil {
 		redirectError(w, r, "invalid form")
 		return
 	}
-	phrase := r.FormValue("phrase")
-	keyword, err := s.store.AddKeyword(r.Context(), phrase)
+	keyword, err := s.store.AddKeyword(r.Context(), userID, r.FormValue("phrase"))
 	if err != nil {
 		redirectError(w, r, err.Error())
 		return
 	}
-	s.notifySystem(fmt.Sprintf("Keyword added: #%d %s", keyword.ID, keyword.Phrase))
 	redirectNotice(w, r, fmt.Sprintf("added keyword #%d", keyword.ID))
 }
 
-func (s *Server) addWatchRule(w http.ResponseWriter, r *http.Request) {
+func (s *Server) addWatchRule(w http.ResponseWriter, r *http.Request, userID int64) {
 	if err := r.ParseForm(); err != nil {
 		redirectError(w, r, "invalid form")
 		return
@@ -232,11 +296,15 @@ func (s *Server) addWatchRule(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		peerID, err := strconv.ParseInt(rawID, 10, 64)
-		if err == nil && peerID > 0 {
+		if err != nil || peerID <= 0 {
+			continue
+		}
+		// Rules may only be scoped to the user's own sources.
+		if _, owned, err := s.store.GetMonitorPeer(r.Context(), userID, peerType, peerID); err == nil && owned {
 			sources = append(sources, db.RuleSource{PeerType: peerType, PeerID: peerID})
 		}
 	}
-	rule, err := s.store.UpsertWatchRule(r.Context(), db.Keyword{
+	rule, err := s.store.UpsertWatchRule(r.Context(), userID, db.Keyword{
 		Phrase:              r.FormValue("name"),
 		AnyTerms:            splitTerms(r.FormValue("any")),
 		AllTerms:            splitTerms(r.FormValue("all")),
@@ -252,7 +320,6 @@ func (s *Server) addWatchRule(w http.ResponseWriter, r *http.Request) {
 		redirectError(w, r, err.Error())
 		return
 	}
-	s.notifySystem(fmt.Sprintf("Watch rule added: #%d %s", rule.ID, rule.Phrase))
 	redirectNotice(w, r, fmt.Sprintf("watching %s", rule.Phrase))
 }
 
@@ -278,7 +345,7 @@ func splitTermGroups(value string) [][]string {
 	return out
 }
 
-func (s *Server) deleteKeyword(w http.ResponseWriter, r *http.Request) {
+func (s *Server) deleteKeyword(w http.ResponseWriter, r *http.Request, userID int64) {
 	if err := r.ParseForm(); err != nil {
 		redirectError(w, r, "invalid form")
 		return
@@ -287,7 +354,7 @@ func (s *Server) deleteKeyword(w http.ResponseWriter, r *http.Request) {
 	if id == "" {
 		id = r.FormValue("phrase")
 	}
-	rows, err := s.store.DeleteKeyword(r.Context(), id)
+	rows, err := s.store.DeleteKeyword(r.Context(), userID, id)
 	if err != nil {
 		redirectError(w, r, err.Error())
 		return
@@ -299,21 +366,32 @@ func (s *Server) deleteKeyword(w http.ResponseWriter, r *http.Request) {
 	redirectNotice(w, r, "deleted keyword")
 }
 
-func (s *Server) syncSources(w http.ResponseWriter, r *http.Request) {
-	if s.monitor == nil {
-		redirectError(w, r, "telegram monitor is not configured")
-		return
+func (s *Server) account(userID int64) (*monitor.Service, error) {
+	if s.accounts == nil {
+		return nil, errors.New("telegram monitor is not configured")
 	}
-	count, err := s.monitor.SyncDialogs(r.Context())
+	account, err := s.accounts.Account(userID)
+	if err != nil {
+		return nil, errors.New("your Telegram account is not connected; send /login to the bot")
+	}
+	return account, nil
+}
+
+func (s *Server) syncSources(w http.ResponseWriter, r *http.Request, userID int64) {
+	account, err := s.account(userID)
 	if err != nil {
 		redirectError(w, r, err.Error())
 		return
 	}
-	s.notifySystem(fmt.Sprintf("Sources synced: %d chats found.", count))
+	count, err := account.SyncDialogs(r.Context())
+	if err != nil {
+		redirectError(w, r, err.Error())
+		return
+	}
 	redirectNotice(w, r, fmt.Sprintf("synced %d sources from Telegram", count))
 }
 
-func (s *Server) toggleSource(w http.ResponseWriter, r *http.Request) {
+func (s *Server) toggleSource(w http.ResponseWriter, r *http.Request, userID int64) {
 	if err := r.ParseForm(); err != nil {
 		redirectError(w, r, "invalid form")
 		return
@@ -325,24 +403,21 @@ func (s *Server) toggleSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	enabled := r.FormValue("enabled") == "1"
-	if err := s.store.SetMonitorPeerEnabled(r.Context(), peerType, peerID, enabled); err != nil {
-		redirectError(w, r, err.Error())
+	if err := s.store.SetMonitorPeerEnabled(r.Context(), userID, peerType, peerID, enabled); err != nil {
+		redirectError(w, r, "source not found")
 		return
 	}
-	peer, _, _ := s.store.GetMonitorPeer(r.Context(), peerType, peerID)
-	sourceName := formatSourceName(peerType, peerID, peer)
 	if enabled {
-		s.notifySystem("Monitoring enabled: " + sourceName)
 		redirectNotice(w, r, "source monitoring enabled")
 		return
 	}
-	s.notifySystem("Monitoring paused: " + sourceName)
 	redirectNotice(w, r, "source monitoring paused")
 }
 
-func (s *Server) backfillHistory(w http.ResponseWriter, r *http.Request) {
-	if s.monitor == nil {
-		redirectError(w, r, "telegram monitor is not configured")
+func (s *Server) backfillHistory(w http.ResponseWriter, r *http.Request, userID int64) {
+	account, err := s.account(userID)
+	if err != nil {
+		redirectError(w, r, err.Error())
 		return
 	}
 	if err := r.ParseForm(); err != nil {
@@ -354,28 +429,114 @@ func (s *Server) backfillHistory(w http.ResponseWriter, r *http.Request) {
 		redirectError(w, r, "invalid days value")
 		return
 	}
-	result, err := s.monitor.Backfill(r.Context(), days)
+	result, err := account.Backfill(r.Context(), days)
 	if err != nil {
 		redirectError(w, r, err.Error())
 		return
 	}
-	s.notifySystem(fmt.Sprintf("History scan finished: %d messages, %d matched, %d new events", result.Scanned, result.Matched, result.Inserted))
 	redirectNotice(w, r, fmt.Sprintf("history scanned: %d messages, %d matched, %d new events", result.Scanned, result.Matched, result.Inserted))
 }
 
-func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), time.Second)
-	defer cancel()
-
-	stats, err := s.store.Stats(ctx)
-	if err != nil {
-		log.Printf("health stats unavailable: %v", err)
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		fmt.Fprintln(w, "ok stats=unavailable")
+func (s *Server) createToken(w http.ResponseWriter, r *http.Request, userID int64) {
+	if err := r.ParseForm(); err != nil {
+		redirectError(w, r, "invalid form")
 		return
 	}
+	scope := r.FormValue("scope")
+	token, hash, err := apitoken.New(scope)
+	if err != nil {
+		redirectError(w, r, "unknown token type")
+		return
+	}
+	name := strings.TrimSpace(r.FormValue("name"))
+	if len([]rune(name)) > 60 {
+		name = string([]rune(name)[:60])
+	}
+	if _, err := s.store.CreateAPIToken(r.Context(), userID, scope, name, hash, time.Now()); err != nil {
+		redirectError(w, r, "could not create token")
+		return
+	}
+	// The token is shown once, in this response only.
+	s.renderDashboard(w, r, userID, dashboardData{NewToken: token, NewTokenScope: scope, Notice: "token created; copy it now"})
+}
+
+func (s *Server) deleteToken(w http.ResponseWriter, r *http.Request, userID int64) {
+	if err := r.ParseForm(); err != nil {
+		redirectError(w, r, "invalid form")
+		return
+	}
+	id, err := strconv.ParseInt(r.FormValue("id"), 10, 64)
+	if err != nil || s.store.DeleteAPIToken(r.Context(), userID, id) != nil {
+		redirectError(w, r, "token not found")
+		return
+	}
+	redirectNotice(w, r, "token deleted")
+}
+
+func (s *Server) addNotificationChat(w http.ResponseWriter, r *http.Request, userID int64) {
+	if err := r.ParseForm(); err != nil {
+		redirectError(w, r, "invalid form")
+		return
+	}
+	chatID, err := parseNotificationChat(r.FormValue("chat"))
+	if err != nil {
+		redirectError(w, r, "use a group key such as channel:123 or a Bot API group ID such as -100123")
+		return
+	}
+	if s.accounts == nil {
+		redirectError(w, r, "telegram monitor is not configured")
+		return
+	}
+	sender, err := s.accounts.NotificationSender(r.Context(), userID)
+	if err != nil {
+		redirectError(w, r, "your Telegram account is not connected; send /login to the bot")
+		return
+	}
+	// The group must be reachable by the user's own account.
+	if err := sender.CheckNotificationChat(r.Context(), chatID); err != nil {
+		redirectError(w, r, "your Telegram account cannot post in that group")
+		return
+	}
+	if err := s.store.AddNotificationChat(r.Context(), userID, chatID, r.FormValue("title"), time.Now()); err != nil {
+		redirectError(w, r, "could not save group")
+		return
+	}
+	redirectNotice(w, r, "notification group allowed")
+}
+
+func (s *Server) deleteNotificationChat(w http.ResponseWriter, r *http.Request, userID int64) {
+	if err := r.ParseForm(); err != nil {
+		redirectError(w, r, "invalid form")
+		return
+	}
+	chatID, err := strconv.ParseInt(r.FormValue("chat_id"), 10, 64)
+	if err != nil || s.store.RemoveNotificationChat(r.Context(), userID, chatID) != nil {
+		redirectError(w, r, "group not found")
+		return
+	}
+	redirectNotice(w, r, "notification group removed")
+}
+
+// parseNotificationChat accepts a group key (channel:123, chat:123) or a Bot
+// API group ID (-100123, -123).
+func parseNotificationChat(value string) (int64, error) {
+	value = strings.TrimSpace(value)
+	if strings.Contains(value, ":") {
+		return notify.ChatID(value)
+	}
+	id, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || id >= 0 {
+		return 0, errors.New("invalid group id")
+	}
+	if id <= -1000000000000 {
+		return notify.ChatID("channel:" + strconv.FormatInt(-1000000000000-id, 10))
+	}
+	return notify.ChatID("chat:" + strconv.FormatInt(-id, 10))
+}
+
+func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	fmt.Fprintf(w, "ok subscribers=%d keywords=%d sources=%d enabled_sources=%d events=%d\n", stats.Subscribers, stats.Keywords, stats.Peers, stats.EnabledPeers, stats.Events)
+	fmt.Fprintln(w, "ok")
 }
 
 func redirectError(w http.ResponseWriter, r *http.Request, message string) {
@@ -388,27 +549,6 @@ func redirectNotice(w http.ResponseWriter, r *http.Request, message string) {
 
 func urlQuery(value string) string {
 	return url.QueryEscape(value)
-}
-
-func (s *Server) notifySystem(text string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := s.notifier.NotifySystem(ctx, text); err != nil {
-		log.Printf("send system notification failed: %v", err)
-	}
-}
-
-func formatSourceName(peerType string, peerID int64, peer db.MonitorPeer) string {
-	if title := strings.TrimSpace(peer.Title); title != "" {
-		if username := strings.TrimSpace(peer.Username); username != "" {
-			return fmt.Sprintf("%s (@%s)", title, username)
-		}
-		return title
-	}
-	if username := strings.TrimSpace(peer.Username); username != "" {
-		return "@" + username
-	}
-	return fmt.Sprintf("%s:%d", peerType, peerID)
 }
 
 const dashboardTemplate = `<!doctype html>
@@ -502,7 +642,7 @@ const dashboardTemplate = `<!doctype html>
       display: flex;
       gap: 8px;
     }
-    input, textarea {
+    input, textarea, select {
       width: 100%;
       min-height: 40px;
       border: 1px solid var(--line);
@@ -635,7 +775,7 @@ const dashboardTemplate = `<!doctype html>
     {{if .Notice}}<div class="alert notice">{{.Notice}}</div>{{end}}
 
     <section class="stats">
-      <div class="stat"><strong>{{.Stats.Subscribers}}</strong><span>Subscribers</span></div>
+      <div class="stat"><strong>{{.Stats.Peers}}</strong><span>Known sources</span></div>
       <div class="stat"><strong>{{.Stats.Keywords}}</strong><span>Watch rules</span></div>
       <div class="stat"><strong>{{.Stats.EnabledPeers}}</strong><span>Monitored Sources</span></div>
       <div class="stat"><strong>{{.Stats.Events}}</strong><span>Matches</span></div>
@@ -649,7 +789,7 @@ const dashboardTemplate = `<!doctype html>
             <span class="badge">Telegram user connected</span>
             <span class="muted">user {{.TelegramStatus.UserID}}</span>
           {{else if .TelegramStatus.Configured}}
-            <span class="badge warn">Telegram user not logged in</span>
+            <span class="badge warn">Telegram not connected · send /login to the bot</span>
           {{else}}
             <span class="badge off">Telegram user API not configured</span>
           {{end}}
@@ -722,6 +862,65 @@ const dashboardTemplate = `<!doctype html>
           </div>
         {{else}}
           <p class="muted">No watch rules yet.</p>
+        {{end}}
+      </div>
+    </section>
+
+    <section class="grid">
+      <div class="panel">
+        <h2>Personal tokens</h2>
+        {{if .NewToken}}
+          <div class="alert notice">
+            <strong>Copy this {{.NewTokenScope}} token now. It is not shown again.</strong>
+            <pre><code>{{.NewToken}}</code></pre>
+          </div>
+        {{end}}
+        <p class="muted">Tokens act only for your Telegram account. MCP clients that support OAuth do not need a token: add <code>{{.PublicURL}}/mcp</code> and approve the request in the bot.</p>
+        <form method="post" action="/tokens/create" class="form-row">
+          <input name="name" maxlength="60" placeholder="token name">
+          <select name="scope">
+            <option value="mcp">MCP</option>
+            <option value="notify">Notifications</option>
+          </select>
+          <button type="submit">Create</button>
+        </form>
+        {{range .Tokens}}
+          <div class="keyword">
+            <div class="rule-copy">
+              <code>#{{.ID}} {{.Scope}}{{if .Name}} · {{.Name}}{{end}}</code>
+              <small>created {{date .CreatedAt}}{{if not .LastUsedAt.IsZero}} · last used {{time .LastUsedAt}}{{end}}</small>
+            </div>
+            <form method="post" action="/tokens/delete">
+              <input type="hidden" name="id" value="{{.ID}}">
+              <button class="delete" type="submit">Delete</button>
+            </form>
+          </div>
+        {{else}}
+          <p class="muted">No tokens.</p>
+        {{end}}
+      </div>
+
+      <div class="panel">
+        <h2>Notification groups</h2>
+        <p class="muted">Notification tokens post only to groups listed here, as your Telegram account. Endpoint: <code>POST {{.PublicURL}}/notifications/v1/messages</code></p>
+        <form method="post" action="/notification-chats/add" class="rule-form">
+          <label>Group<input name="chat" placeholder="channel:123 or -100123" required></label>
+          <label>Label<input name="title" maxlength="80" placeholder="optional"></label>
+          <button type="submit">Allow group</button>
+        </form>
+        {{range .NotificationChats}}
+          <div class="keyword">
+            <div class="rule-copy">
+              <code>{{.ChatID}}</code>
+              {{if .Title}}<small>{{.Title}}</small>{{end}}
+            </div>
+            <form method="post" action="/notification-chats/delete">
+              <input type="hidden" name="chat_id" value="{{.ChatID}}">
+              <button class="delete" type="submit">Remove</button>
+            </form>
+          </div>
+        {{else}}
+          <p class="muted">No groups allowed.</p>
         {{end}}
       </div>
     </section>

@@ -1,21 +1,38 @@
 package notify
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"strings"
+	"time"
+
+	"github.com/nextster/telegram-bridge/internal/apitoken"
+	"github.com/nextster/telegram-bridge/internal/db"
 )
 
-// The notification API has its own credential and never accepts the MCP token.
-func NewHTTPHandler(service *Notifications, token string) http.Handler {
+// NewHTTPHandler accepts only personal notification tokens. The token decides
+// the sending account; MCP and OAuth tokens are never accepted.
+func NewHTTPHandler(service *Notifications, store *db.Store) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
 		provided, bearer := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if token == "" || !bearer || subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
+		var accountID int64
+		if bearer && provided != "" {
+			owner, ok, err := store.ResolveAPIToken(r.Context(), apitoken.Hash(provided), db.APITokenScopeNotify, time.Now())
+			if err != nil {
+				log.Printf("resolve notification token failed: %v", err)
+				notificationError(w, http.StatusServiceUnavailable, "temporarily_unavailable")
+				return
+			}
+			if ok {
+				accountID = owner
+			}
+		}
+		if accountID <= 0 {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="telegram-bridge-notifications"`)
 			notificationError(w, http.StatusUnauthorized, "unauthorized")
 			return
@@ -42,7 +59,7 @@ func NewHTTPHandler(service *Notifications, token string) http.Handler {
 			notificationError(w, http.StatusBadRequest, "invalid_request")
 			return
 		}
-		receipt, err := service.Send(r.Context(), input)
+		receipt, err := service.Send(r.Context(), accountID, input)
 		if err != nil {
 			// Do not expose Telegram errors, session details, database paths or payloads.
 			notificationError(w, http.StatusUnprocessableEntity, "notification_rejected_check_destination_event_and_receipt")

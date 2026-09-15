@@ -98,7 +98,7 @@ const pageTemplate = `<!doctype html>
     <div class="code" aria-label="Код подтверждения">{{.Code}}</div>
     <a class="button" href="{{.ApprovalLink}}" target="_blank" rel="noopener noreferrer">Подтвердить в Telegram</a>
     <p id="status" class="status" role="status">Ждём подтверждения в Telegram…</p>
-    <p class="muted">Подтвердить может только владелец подключённого аккаунта Telegram. Если вы не запускали подключение, закройте страницу.</p>
+    <p class="muted">Доступ получит тот аккаунт Telegram, который подтвердит запрос в боте. Если вы не запускали подключение сами, закройте страницу.</p>
     <script nonce="{{.Nonce}}">
       (() => {
         const status = document.getElementById('status');

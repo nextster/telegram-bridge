@@ -2,33 +2,19 @@ package web
 
 import (
 	"context"
-	"github.com/nextster/telegram-bridge/internal/db"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/nextster/telegram-bridge/internal/apitoken"
 	"github.com/nextster/telegram-bridge/internal/config"
-	"github.com/nextster/telegram-bridge/internal/monitor"
+	"github.com/nextster/telegram-bridge/internal/db"
 	"github.com/nextster/telegram-bridge/internal/oauth"
 )
 
-func TestRoutesAllowRootAndMCP(t *testing.T) {
-	server := &Server{
-		cfg:     config.Config{MCPToken: "secret"},
-		monitor: &monitor.Service{},
-	}
-	handler := server.routes()
-
-	request := httptest.NewRequest(http.MethodPost, "/mcp", nil)
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusUnauthorized {
-		t.Fatalf("POST /mcp status = %d, want %d", response.Code, http.StatusUnauthorized)
-	}
-}
-
-func TestRoutesMountOAuthWithoutStaticToken(t *testing.T) {
+func TestRoutesMountOAuth(t *testing.T) {
 	store, err := db.Open(context.Background(), t.TempDir()+"/oauth-routes.db")
 	if err != nil {
 		t.Fatal(err)
@@ -39,9 +25,9 @@ func TestRoutesMountOAuthWithoutStaticToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	server := &Server{
-		cfg:     config.Config{BotToken: "123:token", PublicBaseURL: "https://telegram-bridge.example", OAuthMode: "on"},
-		monitor: &monitor.Service{},
-		store:   store,
+		cfg:      config.Config{BotToken: "123:token", PublicBaseURL: "https://telegram-bridge.example", OAuthMode: "on"},
+		accounts: &fakeAccounts{},
+		store:    store,
 	}
 	server.SetOAuth(oauthServer)
 	handler := server.routes()
@@ -70,7 +56,7 @@ func (stubApprover) OAuthApprovalLink(context.Context, string) (string, error) {
 	return "https://t.me/bridge_test_bot", nil
 }
 
-func (stubApprover) OAuthConnectionRevoked(context.Context, string, string) error { return nil }
+func (stubApprover) OAuthConnectionRevoked(context.Context, int64, string, string) error { return nil }
 
 func TestSplitTermGroups(t *testing.T) {
 	got := splitTermGroups("USB-C, Type-C\n1000 lm, 1200 lm\r\n\n31.8")
@@ -79,47 +65,51 @@ func TestSplitTermGroups(t *testing.T) {
 	}
 }
 
-func TestNotificationAPIDoesNotExposeMCPWrites(t *testing.T) {
-	store, err := db.Open(context.Background(), t.TempDir()+"/notifications.db")
+func TestPersonalTokensHaveSeparateScopes(t *testing.T) {
+	store, err := db.Open(context.Background(), t.TempDir()+"/tokens.db")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	for _, enabled := range []bool{false, true} {
-		cfg := config.Config{MCPToken: "secret", NotificationToken: strings.Repeat("n", 32)}
-		if enabled {
-			cfg.NotificationChatIDs = []int64{-1001234567890}
-		}
-		server := &Server{cfg: cfg, monitor: &monitor.Service{}, store: store}
+	ctx := context.Background()
+	mcpToken, mcpHash, _ := apitoken.New(db.APITokenScopeMCP)
+	notifyToken, notifyHash, _ := apitoken.New(db.APITokenScopeNotify)
+	if _, err := store.CreateAPIToken(ctx, aliceID, db.APITokenScopeMCP, "", mcpHash, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateAPIToken(ctx, aliceID, db.APITokenScopeNotify, "", notifyHash, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{cfg: config.Config{}, accounts: &fakeAccounts{}, store: store}
+	handler := server.routes()
+
+	for token, want := range map[string]int{"": 401, "tbm_unknown": 401, notifyToken: 401, mcpToken: 200} {
 		request := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`))
-		request.Header.Set("Authorization", "Bearer secret")
+		if token != "" {
+			request.Header.Set("Authorization", "Bearer "+token)
+		}
 		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("Accept", "application/json, text/event-stream")
 		response := httptest.NewRecorder()
-		server.routes().ServeHTTP(response, request)
-		if response.Code != 200 {
-			t.Fatalf("tools/list status=%d body=%s", response.Code, response.Body.String())
+		handler.ServeHTTP(response, request)
+		if response.Code != want {
+			t.Fatalf("MCP with %.8q status=%d want=%d body=%s", token, response.Code, want, response.Body.String())
 		}
-		if strings.Contains(response.Body.String(), "telegram_send_notification") {
-			t.Fatalf("incorrect notification capability when enabled=%t", enabled)
+		if want == 200 && strings.Contains(response.Body.String(), "telegram_send_notification") {
+			t.Fatal("MCP exposes notification writes")
 		}
-		for _, auth := range []string{"Bearer secret", "Bearer " + cfg.NotificationToken} {
-			req := httptest.NewRequest(http.MethodPost, "/notifications/v1/messages", strings.NewReader("bad json"))
-			req.Header.Set("Authorization", auth)
-			req.Header.Set("Content-Type", "application/json")
-			rec := httptest.NewRecorder()
-			server.routes().ServeHTTP(rec, req)
-			want := 404
-			if enabled {
-				want = 401
-				if auth == "Bearer "+cfg.NotificationToken {
-					want = 400
-				}
-			}
-			if rec.Code != want {
-				t.Fatalf("notification API status=%d want=%d", rec.Code, want)
-			}
-		}
+	}
 
+	for token, want := range map[string]int{"": 401, mcpToken: 401, notifyToken: 400} {
+		request := httptest.NewRequest(http.MethodPost, "/notifications/v1/messages", strings.NewReader("bad json"))
+		if token != "" {
+			request.Header.Set("Authorization", "Bearer "+token)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != want {
+			t.Fatalf("notification API with %.8q status=%d want=%d", token, response.Code, want)
+		}
 	}
 }

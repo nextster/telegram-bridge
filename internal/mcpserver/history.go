@@ -9,7 +9,11 @@ import (
 	"github.com/nextster/telegram-bridge/internal/monitor"
 )
 
-func (s *Server) getHistory(ctx context.Context, _ *mcp.CallToolRequest, in getHistoryInput) (*mcp.CallToolResult, historyOutput, error) {
+func (s *Server) getHistory(ctx context.Context, req *mcp.CallToolRequest, in getHistoryInput) (*mcp.CallToolResult, historyOutput, error) {
+	userID, err := principal(req)
+	if err != nil {
+		return nil, historyOutput{}, err
+	}
 	minDate, err := parseDate(in.MinDate)
 	if err != nil {
 		return nil, historyOutput{}, err
@@ -39,11 +43,12 @@ func (s *Server) getHistory(ctx context.Context, _ *mcp.CallToolRequest, in getH
 			maxDate = time.Now().UTC().Truncate(time.Second).Add(time.Second)
 		}
 	}
-	if s.monitor == nil {
-		return nil, historyOutput{}, media.Fail("telegram_unavailable")
+	account, err := s.account(req)
+	if err != nil {
+		return nil, historyOutput{}, err
 	}
 	readCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	page, err := s.monitor.GetHistoryPage(readCtx, monitor.HistoryOptions{Chat: in.Chat, Limit: in.Limit, OffsetID: in.OffsetID, MinDate: minDate, MaxDate: maxDate})
+	page, err := account.GetHistoryPage(readCtx, monitor.HistoryOptions{Chat: in.Chat, Limit: in.Limit, OffsetID: in.OffsetID, MinDate: minDate, MaxDate: maxDate})
 	cancel()
 	if err != nil {
 		return nil, historyOutput{}, err
@@ -70,11 +75,11 @@ func (s *Server) getHistory(ctx context.Context, _ *mcp.CallToolRequest, in getH
 	}
 	batch := media.Batch{Items: []media.BatchItem{}, Settled: true, AllSucceeded: true}
 	if len(refs) > 0 {
-		batch, err = s.media.StartBatch(ctx, refs, media.BatchOptions{Audio: in.Audio, Image: in.Image}, true)
+		batch, err = s.media.StartBatch(ctx, userID, refs, media.BatchOptions{Audio: in.Audio, Image: in.Image}, true)
 		if err != nil {
 			return nil, out, err
 		}
-		batch, err = s.media.WaitBatch(ctx, batch, wait)
+		batch, err = s.media.WaitBatch(ctx, userID, batch, wait)
 		if err != nil {
 			return nil, out, err
 		}

@@ -399,7 +399,9 @@ func (s *Store) PrivateArchiveStats(ctx context.Context, ownerUserID int64) (Pri
 	return stats, nil
 }
 
-func (s *Store) PrunePrivateArchive(ctx context.Context, before time.Time, maxMessages int) error {
+// PrunePrivateArchive applies the retention window and message cap to one
+// owner's archive, so a busy account cannot evict other accounts' messages.
+func (s *Store) PrunePrivateArchive(ctx context.Context, ownerUserID int64, before time.Time, maxMessages int) error {
 	if before.IsZero() {
 		return nil
 	}
@@ -413,14 +415,15 @@ func (s *Store) PrunePrivateArchive(ctx context.Context, before time.Time, maxMe
 	defer tx.Rollback()
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM private_messages
-		WHERE message_date < ?
+		WHERE owner_user_id = ?
+		  AND message_date < ?
 		  AND NOT EXISTS (
 			SELECT 1 FROM private_message_deletions d
 			WHERE d.owner_user_id = private_messages.owner_user_id
 			  AND d.message_id = private_messages.message_id
 			  AND d.notified_at = ''
 		  )
-	`, formatTime(before)); err != nil {
+	`, ownerUserID, formatTime(before)); err != nil {
 		return fmt.Errorf("prune private messages: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `
@@ -428,21 +431,22 @@ func (s *Store) PrunePrivateArchive(ctx context.Context, before time.Time, maxMe
 		WHERE (owner_user_id, message_id) IN (
 			SELECT owner_user_id, message_id
 			FROM private_messages m
-			WHERE NOT EXISTS (
+			WHERE m.owner_user_id = ? AND NOT EXISTS (
 				SELECT 1 FROM private_message_deletions d
 				WHERE d.owner_user_id = m.owner_user_id
 				  AND d.message_id = m.message_id
 				  AND d.notified_at = ''
 			)
-			ORDER BY message_date DESC, owner_user_id, message_id DESC
+			ORDER BY message_date DESC, message_id DESC
 			LIMIT -1 OFFSET ?
 		)
-	`, maxMessages); err != nil {
+	`, ownerUserID, maxMessages); err != nil {
 		return fmt.Errorf("cap private messages: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM private_message_deletions
-		WHERE observed_at < ?
+		WHERE owner_user_id = ?
+		  AND observed_at < ?
 		  AND (
 			notified_at != ''
 			OR NOT EXISTS (
@@ -451,7 +455,7 @@ func (s *Store) PrunePrivateArchive(ctx context.Context, before time.Time, maxMe
 				  AND m.message_id = private_message_deletions.message_id
 			)
 		  )
-	`, formatTime(before)); err != nil {
+	`, ownerUserID, formatTime(before)); err != nil {
 		return fmt.Errorf("prune private deletions: %w", err)
 	}
 	if err := tx.Commit(); err != nil {

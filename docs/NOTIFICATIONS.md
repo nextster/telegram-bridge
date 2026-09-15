@@ -1,31 +1,28 @@
 # HTTP notification API
 
-`POST /notifications/v1/messages` sends plain text as the already-authorized
-personal Telegram account. It reuses the live gotd client, not a bot or a second
-session. MCP remains read-only and has no notification tool.
+`POST /notifications/v1/messages` sends plain text to a group as the token
+owner's own Telegram account. It reuses that account's live gotd client, not a
+bot or a second session. MCP remains read-only and has no notification tool.
 
 ## Authentication and activation
 
-Configure a dedicated random `TELEGRAM_BRIDGE_NOTIFICATION_TOKEN` (at least 32
-characters; generate with `openssl rand -hex 32`) in the server secret store and
-in the authorized caller's environment. Never reuse the MCP token:
-configuration rejects equal values. Keep credentials out of Git, command-line
-arguments and logs. Requests require `Authorization: Bearer <notification-token>`
-over HTTPS. No cookie, MCP credential or Telegram session file is accepted as
-notification API authentication.
+Every user sets this up for their own account on the dashboard:
 
-Set `TELEGRAM_BRIDGE_NOTIFICATION_CHAT_IDS` to a comma-separated list of verified
-negative Bot API-style group IDs. `chat:123` maps to `-123`; `channel:123` maps to
-`-1000000000123`, following the [Telegram ID specification](https://core.telegram.org/api/bots/ids).
-These are only a numeric representation; delivery uses the personal account.
-Resolve the actual group with `telegram_list_dialogs` first. For supergroups,
-the existing account-scoped access hash must be known to the bridge. The account
-must belong to the group and be allowed to write there. A bot need not be present.
+1. Create a **Notifications** token. It is shown once; SQLite keeps only its
+   SHA-256 hash. Keep it in the caller's secret store, never in Git,
+   command-line arguments or logs.
+2. Allow a group by its key (`channel:123`, `chat:123`) or Bot API group ID
+   (`-1000000000123`, `-123`), following the
+   [Telegram ID specification](https://core.telegram.org/api/bots/ids). The
+   bridge checks with the user's own account that it can post there before
+   saving. Resolve the group with `telegram_list_dialogs` first.
 
-The API route is absent unless its dedicated token, group allowlist, store and
-user API service are configured. Do not enable client calls until the reviewed
-server has been deployed and live delivery verified. Existing MCP access alone
-cannot enable or invoke notification writes.
+Requests require `Authorization: Bearer <notification-token>` over HTTPS. A
+token resolves to exactly one user: it posts only to that user's allowed groups
+and only as that user's account. MCP tokens, OAuth access tokens, cookies and
+session files are not accepted, and notification tokens are not accepted by
+MCP. The account must belong to the group and be allowed to write there; a bot
+need not be present.
 
 ## Request and response
 
@@ -48,21 +45,22 @@ A confirmed send or exact repeat returns HTTP 200:
 ```
 
 Missing/wrong credentials return 401; invalid JSON returns 400, wrong content
-type 415 and unsupported methods 405. A disallowed destination, invalid event,
-conflicting payload, unavailable user session or uncertain delivery returns 422
-with a redacted error code. Verify destination, event identity and the receipt
-before retrying. An inactive API returns 404. Responses are marked `no-store`.
+type 415 and unsupported methods 405. A group the token owner has not allowed,
+invalid event, conflicting payload, disconnected account or uncertain delivery
+returns 422 with a redacted error code. Verify destination, event identity and
+the receipt before retrying. Responses are marked `no-store`.
 
 The notification key permits arbitrary text and new event IDs within the allowed
 groups; it does not prove a release happened or request human approval for each
-message. Keep it scoped to trusted release automation. Removing a group or rotating
-this key revokes its notification access without changing read-only MCP credentials.
+message. Keep it scoped to trusted release automation. Removing a group or deleting
+the token on the dashboard revokes its access without changing MCP credentials;
+`/logout` in the bot deletes all of the user's tokens.
 
 ## Durable delivery and recovery
 
 `notification_receipts` stores destination, event ID, SHA-256 text digest, status,
 creation time and message ID, but no message body or credentials. Its primary key
-is `(chat_id, event_id)`. An atomic reservation prevents concurrent sends; confirmed
+is `(account_id, chat_id, event_id)`, so users never share or see each other's receipts. An atomic reservation prevents concurrent sends; confirmed
 repeats return the same receipt. Reusing an event ID with different text is rejected.
 
 The user API verifies active group membership before sending. Delivery calls
@@ -82,19 +80,15 @@ database before repairs. Do not clear all receipts or re-upload a release.
 ## Deployment verification and rollback
 
 Run `scripts/check.sh`, then deploy reviewed code using the repository deployment
-instructions. The existing migration-on-open path adds the receipts table; no new
-runtime dependency, Telegram login, Fly infrastructure or polling loop is needed.
+instructions. Migrations run when the database opens.
 
-Verify `/healthz`, an authenticated MCP `tools/list` with exactly the original three
-read-only tools, and 401 from the notification API with missing or MCP credentials.
-Send one explicitly agreed message to the verified group with the notification key,
-inspect its returned ID in Telegram, then repeat the same request and verify no new
-post appears. Confirm a non-allowlisted destination is rejected without a send.
-Automated tests cover these boundaries with fake RPCs, senders and temporary databases;
-they do not establish live membership or production delivery.
+Verify `/healthz`, an authenticated MCP `tools/list` without a send tool, and 401
+from the notification API with missing or MCP credentials. Send one explicitly
+agreed message to an allowed group with a notification token, inspect its returned
+ID in Telegram, then repeat the same request and verify no new post appears.
+Confirm a group allowed only by another user is rejected without a send.
+Automated tests cover these boundaries with fake RPCs, senders and temporary
+databases; they do not establish live membership or production delivery.
 
-Disable by removing `TELEGRAM_BRIDGE_NOTIFICATION_TOKEN` or clearing the allowlist
-and restarting. Older code ignores the additive receipt table; retain it for rollback
-and later reactivation. The existing session, monitor and watch rules remain
-unchanged. Read-only plugin metadata should be refreshed with `scripts/codex-plugin.sh
-reload` after removing the earlier experimental MCP notification capability.
+A user disables their notifications by deleting their notification tokens or
+groups on the dashboard.

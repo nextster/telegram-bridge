@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"strings"
 	"time"
 )
 
@@ -89,12 +90,23 @@ func (s *Store) EnqueueMedia(ctx context.Context, j MediaJob) (MediaJob, error) 
 	return result, err
 }
 
-func (s *Store) ClaimMedia(ctx context.Context, accountID int64, now time.Time) (MediaJob, error) {
+// ClaimMedia claims the oldest runnable job of any account that currently has
+// a live Telegram session. A job is always processed with its own account.
+func (s *Store) ClaimMedia(ctx context.Context, accountIDs []int64, now time.Time) (MediaJob, error) {
+	if len(accountIDs) == 0 {
+		return MediaJob{}, sql.ErrNoRows
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(accountIDs)), ",")
+	args := []any{now.Unix()}
+	for _, id := range accountIDs {
+		args = append(args, id)
+	}
+	args = append(args, now.Unix(), now.Unix())
 	return scanMediaJob(s.db.QueryRowContext(ctx, `UPDATE media_jobs SET status='preparing', attempts=attempts+1, updated_at=?
-		WHERE id=(SELECT id FROM media_jobs WHERE account_id=? AND status IN ('queued','retry_wait') AND retry_at<=?
+		WHERE id=(SELECT id FROM media_jobs WHERE account_id IN (`+placeholders+`) AND status IN ('queued','retry_wait') AND retry_at<=?
 		AND NOT EXISTS(SELECT 1 FROM media_jobs WHERE error_code='openrouter_rate_limited' AND retry_at>?)
 		ORDER BY created_at,id LIMIT 1)
-		RETURNING `+mediaColumns, now.Unix(), accountID, now.Unix(), now.Unix()))
+		RETURNING `+mediaColumns, args...))
 }
 
 // A persisted 429 pauses every worker, including after restart.

@@ -33,8 +33,11 @@ func TestInterruptedPreparationRemainsRetryable(t *testing.T) {
 	}
 }
 
-func (s *batchSource) AccountID() int64 { return 1 }
-func (s *batchSource) Attachment(_ context.Context, chat string, id int) (Attachment, error) {
+func (s *batchSource) LiveAccounts() []int64 { return []int64{testAccount} }
+func (s *batchSource) Attachment(_ context.Context, accountID int64, chat string, id int) (Attachment, error) {
+	if accountID != testAccount {
+		return Attachment{}, Fail("telegram_account_unavailable")
+	}
 	kind := "voice"
 	if id%3 == 0 {
 		kind = "image"
@@ -44,7 +47,7 @@ func (s *batchSource) Attachment(_ context.Context, chat string, id int) (Attach
 	}
 	return Attachment{AccountID: 1, Chat: chat, MessageID: id, Kind: kind, Supported: id != 99, Size: 5, Duration: 10, Fingerprint: Digest(id)}, nil
 }
-func (s *batchSource) Download(_ context.Context, _ Attachment, w io.Writer) error {
+func (s *batchSource) Download(_ context.Context, _ int64, _ Attachment, w io.Writer) error {
 	s.downloads.Add(1)
 	_, err := io.WriteString(w, "audio")
 	return err
@@ -114,7 +117,7 @@ func TestParallelBatchAndSingleCallsShareJobsAndWaiters(t *testing.T) {
 	errors := make(chan error, 10)
 	for range 10 {
 		group.Go(func() {
-			batch, err := s.StartBatch(context.Background(), refs, settings, true)
+			batch, err := s.StartBatch(context.Background(), testAccount, refs, settings, true)
 			results <- batch
 			errors <- err
 		})
@@ -138,7 +141,7 @@ func TestParallelBatchAndSingleCallsShareJobsAndWaiters(t *testing.T) {
 			}
 		}
 	}
-	single, err := s.Start(context.Background(), refs[0].Chat, refs[0].MessageID, "transcription", settings.Audio, true)
+	single, err := s.Start(context.Background(), testAccount, refs[0].Chat, refs[0].MessageID, "transcription", settings.Audio, true)
 	if err != nil || single.ID != first.Items[0].Job.ID {
 		t.Fatal("single and batch do not share cache")
 	}
@@ -161,12 +164,12 @@ func TestParallelBatchAndSingleCallsShareJobsAndWaiters(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	interrupted, err := s.WaitBatch(ctx, first, time.Second)
+	interrupted, err := s.WaitBatch(ctx, testAccount, first, time.Second)
 	if err != nil || !interrupted.TimedOut || interrupted.Settled {
 		t.Fatal("cancelled waiter lost pending state")
 	}
 	close(p.release)
-	finished, err := s.WaitBatch(context.Background(), first, 10*time.Second)
+	finished, err := s.WaitBatch(context.Background(), testAccount, first, 10*time.Second)
 	if err != nil || !finished.Settled || !finished.AllSucceeded || finished.TimedOut {
 		t.Fatalf("batch not completed: %+v %v", finished, err)
 	}
@@ -181,7 +184,7 @@ func TestParallelBatchAndSingleCallsShareJobsAndWaiters(t *testing.T) {
 			t.Fatal("mixed image fields")
 		}
 	}
-	repeated, err := s.StartBatch(context.Background(), refs, settings, true)
+	repeated, err := s.StartBatch(context.Background(), testAccount, refs, settings, true)
 	if err != nil || !repeated.AllSucceeded || p.calls.Load() != 9 {
 		t.Fatal("cached batch reprocessed")
 	}
@@ -191,34 +194,34 @@ func TestBatchValidationTimeoutAndPartialErrors(t *testing.T) {
 	s, _, _ := testService(t)
 	s.source = &batchSource{}
 	for _, refs := range [][]Reference{nil, make([]Reference, 101), {{Chat: "/etc/passwd", MessageID: 1}}} {
-		if _, err := s.StartBatch(context.Background(), refs, BatchOptions{}, true); err == nil {
+		if _, err := s.StartBatch(context.Background(), testAccount, refs, BatchOptions{}, true); err == nil {
 			t.Fatal("invalid batch allowed")
 		}
 	}
 	refs := []Reference{{Chat: "chat:1", MessageID: 1}, {Chat: "chat:1", MessageID: 99}}
-	if _, err := s.StartBatch(context.Background(), refs, BatchOptions{}, false); err == nil {
+	if _, err := s.StartBatch(context.Background(), testAccount, refs, BatchOptions{}, false); err == nil {
 		t.Fatal("implicit paid batch")
 	}
-	if _, err := s.StartBatch(context.Background(), refs, BatchOptions{Audio: Options{Model: "bad"}}, true); err == nil {
+	if _, err := s.StartBatch(context.Background(), testAccount, refs, BatchOptions{Audio: Options{Model: "bad"}}, true); err == nil {
 		t.Fatal("invalid model")
 	}
-	batch, err := s.StartBatch(context.Background(), refs, BatchOptions{}, true)
+	batch, err := s.StartBatch(context.Background(), testAccount, refs, BatchOptions{}, true)
 	if err != nil || batch.Items[1].ErrorCode != "unsupported_attachment" || batch.Items[0].Job == nil {
 		t.Fatal("wrong per-item errors")
 	}
-	timed, err := s.WaitBatch(context.Background(), batch, time.Millisecond)
+	timed, err := s.WaitBatch(context.Background(), testAccount, batch, time.Millisecond)
 	if err != nil || !timed.TimedOut || timed.Settled || timed.AllSucceeded {
 		t.Fatal("pending batch called complete")
 	}
-	if _, err := s.WaitBatch(context.Background(), batch, MaxWait+time.Second); err == nil {
+	if _, err := s.WaitBatch(context.Background(), testAccount, batch, MaxWait+time.Second); err == nil {
 		t.Fatal("unbounded wait")
 	}
 	ref := JobReference{Chat: refs[0].Chat, MessageID: 1, JobID: batch.Items[0].Job.ID}
-	if got, err := s.GetBatch(context.Background(), []JobReference{ref}); err != nil || got.Items[0].Job.ID != ref.JobID {
+	if got, err := s.GetBatch(context.Background(), testAccount, []JobReference{ref}); err != nil || got.Items[0].Job.ID != ref.JobID {
 		t.Fatal("batch polling failed")
 	}
 	ref.Chat = "chat:2"
-	if _, err := s.GetBatch(context.Background(), []JobReference{ref}); err == nil {
+	if _, err := s.GetBatch(context.Background(), testAccount, []JobReference{ref}); err == nil {
 		t.Fatal("cross-chat batch polling")
 	}
 }
@@ -231,12 +234,12 @@ func TestParallelWorkersShareBudget(t *testing.T) {
 	p := &concurrentProvider{}
 	s.provider = p
 	refs := []Reference{{Chat: "chat:1", MessageID: 1}, {Chat: "chat:1", MessageID: 2}, {Chat: "chat:1", MessageID: 4}, {Chat: "chat:1", MessageID: 5}}
-	batch, err := s.StartBatch(context.Background(), refs, BatchOptions{}, true)
+	batch, err := s.StartBatch(context.Background(), testAccount, refs, BatchOptions{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	runPool(t, s)
-	batch, err = s.WaitBatch(context.Background(), batch, 5*time.Second)
+	batch, err = s.WaitBatch(context.Background(), testAccount, batch, 5*time.Second)
 	if err != nil || batch.Settled || !batch.TimedOut || batch.AllSucceeded || p.calls.Load() != 2 {
 		t.Fatalf("shared budget failed: calls=%d err=%v", p.calls.Load(), err)
 	}
@@ -257,7 +260,7 @@ func TestParallelWorkersShareBudget(t *testing.T) {
 func TestRateLimitPausesOtherJobsAndSurvivesRecovery(t *testing.T) {
 	s, _, p := testService(t)
 	s.source = &batchSource{}
-	batch, err := s.StartBatch(context.Background(), []Reference{{Chat: "chat:1", MessageID: 1}, {Chat: "chat:1", MessageID: 2}}, BatchOptions{}, true)
+	batch, err := s.StartBatch(context.Background(), testAccount, []Reference{{Chat: "chat:1", MessageID: 1}, {Chat: "chat:1", MessageID: 2}}, BatchOptions{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -283,7 +286,7 @@ func TestRateLimitPausesOtherJobsAndSurvivesRecovery(t *testing.T) {
 	p.err = nil
 	runTestJob(t, s)
 	runTestJob(t, s)
-	batch, err = s.WaitBatch(context.Background(), batch, time.Second)
+	batch, err = s.WaitBatch(context.Background(), testAccount, batch, time.Second)
 	if err != nil || !batch.AllSucceeded || p.calls != 3 {
 		t.Fatal("cooldown did not resume shared jobs")
 	}

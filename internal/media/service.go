@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -85,23 +86,26 @@ func New(cfg config.MediaConfig, store *db.Store, source Source) (*Service, erro
 }
 func (s *Service) Close() error { return s.root.Close() }
 
-func (s *Service) Metadata(ctx context.Context, chat string, id int) (Attachment, error) {
+func (s *Service) Metadata(ctx context.Context, accountID int64, chat string, id int) (Attachment, error) {
+	if accountID <= 0 {
+		return Attachment{}, Fail("telegram_account_unavailable")
+	}
 	if err := ValidateReference(chat, id); err != nil {
 		return Attachment{}, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	a, err := s.source.Attachment(ctx, chat, id)
+	a, err := s.source.Attachment(ctx, accountID, chat, id)
 	if err != nil {
 		return Attachment{}, fault(err)
 	}
-	if a.Chat != chat || a.MessageID != id || a.AccountID != s.source.AccountID() {
+	if a.Chat != chat || a.MessageID != id || a.AccountID != accountID {
 		return Attachment{}, Fail("source_changed")
 	}
 	return a, nil
 }
 
-func (s *Service) Start(ctx context.Context, chat string, id int, operation string, options Options, confirmPaid bool) (Job, error) {
+func (s *Service) Start(ctx context.Context, accountID int64, chat string, id int, operation string, options Options, confirmPaid bool) (Job, error) {
 	if !confirmPaid {
 		return Job{}, Fail("explicit_paid_confirmation_required")
 	}
@@ -116,7 +120,7 @@ func (s *Service) Start(ctx context.Context, chat string, id int, operation stri
 	if err != nil {
 		return Job{}, err
 	}
-	a, err := s.Metadata(ctx, chat, id)
+	a, err := s.Metadata(ctx, accountID, chat, id)
 	if err != nil {
 		return Job{}, err
 	}
@@ -150,7 +154,7 @@ func (s *Service) enqueue(ctx context.Context, a Attachment, operation string, o
 	return decodeJob(j)
 }
 
-func (s *Service) Get(ctx context.Context, chat string, id int, jobID string) (Job, error) {
+func (s *Service) Get(ctx context.Context, accountID int64, chat string, id int, jobID string) (Job, error) {
 	if err := ValidateReference(chat, id); err != nil {
 		return Job{}, err
 	}
@@ -158,7 +162,7 @@ func (s *Service) Get(ctx context.Context, chat string, id int, jobID string) (J
 		return Job{}, Fail("invalid_job_id")
 	}
 	j, err := s.store.MediaJob(ctx, jobID)
-	if err != nil || j.AccountID != s.source.AccountID() || j.Chat != chat || j.MessageID != id {
+	if err != nil || accountID <= 0 || j.AccountID != accountID || j.Chat != chat || j.MessageID != id {
 		return Job{}, Fail("job_not_found")
 	}
 	return decodeJob(j)
@@ -263,7 +267,7 @@ func (s *Service) runWorker(ctx context.Context) error {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
-		if s.cfg.Enabled && s.source.AccountID() != 0 {
+		if s.cfg.Enabled && len(s.source.LiveAccounts()) > 0 {
 			worked, err := s.runOne(ctx)
 			if err != nil && ctx.Err() == nil {
 				return Fail("media_worker_storage_error")
@@ -281,7 +285,8 @@ func (s *Service) runWorker(ctx context.Context) error {
 }
 
 func (s *Service) runOne(ctx context.Context) (bool, error) {
-	j, err := s.store.ClaimMedia(ctx, s.source.AccountID(), s.now())
+	live := s.source.LiveAccounts()
+	j, err := s.store.ClaimMedia(ctx, live, s.now())
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -317,8 +322,11 @@ func (s *Service) runOne(ctx context.Context) (bool, error) {
 	if err := s.waitForProvider(ctx); err != nil {
 		return true, s.finishError(j, err)
 	}
-	if s.source.AccountID() != p.Source.AccountID {
+	if p.Source.AccountID != j.AccountID {
 		return true, s.finishError(j, Fail("telegram_account_changed"))
+	}
+	if !slices.Contains(s.source.LiveAccounts(), j.AccountID) {
+		return true, s.finishError(j, Retry("telegram_account_unavailable", time.Minute))
 	}
 	err = s.store.ReserveMedia(ctx, j.ID, j.Payload, reserve, s.cfg.DailyBudgetMicros, s.cfg.TotalBudgetMicros, s.now())
 	var budget *db.MediaBudget

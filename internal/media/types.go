@@ -37,10 +37,12 @@ type Attachment struct {
 	Fingerprint string    `json:"fingerprint"`
 }
 
+// Source reads Telegram media through one account's own session. Every call
+// names the account; an attachment of another account is never returned.
 type Source interface {
-	Attachment(context.Context, string, int) (Attachment, error)
-	Download(context.Context, Attachment, io.Writer) error
-	AccountID() int64
+	Attachment(ctx context.Context, accountID int64, chat string, id int) (Attachment, error)
+	Download(ctx context.Context, accountID int64, expected Attachment, output io.Writer) error
+	LiveAccounts() []int64
 }
 
 type Options struct {

@@ -38,7 +38,7 @@ type Batch struct {
 	TimedOut     bool        `json:"timed_out"`
 }
 
-func (s *Service) StartBatch(ctx context.Context, refs []Reference, options BatchOptions, confirmPaid bool) (Batch, error) {
+func (s *Service) StartBatch(ctx context.Context, accountID int64, refs []Reference, options BatchOptions, confirmPaid bool) (Batch, error) {
 	if !confirmPaid {
 		return Batch{}, Fail("explicit_paid_confirmation_required")
 	}
@@ -70,7 +70,7 @@ func (s *Service) StartBatch(ctx context.Context, refs []Reference, options Batc
 			continue
 		}
 		item := BatchItem{Chat: ref.Chat, MessageID: ref.MessageID}
-		a, err := s.Metadata(ctx, ref.Chat, ref.MessageID)
+		a, err := s.Metadata(ctx, accountID, ref.Chat, ref.MessageID)
 		if err == nil {
 			operation, settings := "", options.Audio
 			switch a.Kind {
@@ -99,13 +99,13 @@ func (s *Service) StartBatch(ctx context.Context, refs []Reference, options Batc
 	return batch, nil
 }
 
-func (s *Service) GetBatch(ctx context.Context, refs []JobReference) (Batch, error) {
+func (s *Service) GetBatch(ctx context.Context, accountID int64, refs []JobReference) (Batch, error) {
 	if len(refs) < 1 || len(refs) > MaxBatchItems {
 		return Batch{}, Fail("batch_size_limit")
 	}
 	batch := Batch{Items: make([]BatchItem, 0, len(refs))}
 	for _, ref := range refs {
-		job, err := s.Get(ctx, ref.Chat, ref.MessageID, ref.JobID)
+		job, err := s.Get(ctx, accountID, ref.Chat, ref.MessageID, ref.JobID)
 		if err != nil {
 			return Batch{}, err
 		}
@@ -117,7 +117,7 @@ func (s *Service) GetBatch(ctx context.Context, refs []JobReference) (Batch, err
 
 // Waiting only observes durable jobs. Cancellation/disconnection never cancels
 // shared paid work or starts a replacement request.
-func (s *Service) WaitBatch(ctx context.Context, batch Batch, wait time.Duration) (Batch, error) {
+func (s *Service) WaitBatch(ctx context.Context, accountID int64, batch Batch, wait time.Duration) (Batch, error) {
 	if wait < 0 || wait > MaxWait || len(batch.Items) > MaxBatchItems {
 		return Batch{}, Fail("invalid_wait")
 	}
@@ -140,7 +140,7 @@ func (s *Service) WaitBatch(ctx context.Context, batch Batch, wait time.Duration
 			if ctx.Err() != nil {
 				break
 			}
-			job, err := s.Get(ctx, item.Chat, item.MessageID, item.Job.ID)
+			job, err := s.Get(ctx, accountID, item.Chat, item.MessageID, item.Job.ID)
 			if err != nil {
 				if ctx.Err() != nil {
 					break

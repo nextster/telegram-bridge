@@ -219,7 +219,7 @@ func (s *Store) GetOAuthRequestByCode(ctx context.Context, codeHash string) (OAu
 	return scanOAuthRequest(s.db.QueryRowContext(ctx, oauthRequestSelect+` WHERE code_hash = ?`, codeHash))
 }
 
-// DecideOAuthRequest records the administrator's decision. It changes only a
+// DecideOAuthRequest records the approving user's decision. It changes only a
 // pending, unexpired request and reports whether that happened.
 func (s *Store) DecideOAuthRequest(ctx context.Context, id string, approve bool, userID int64, now time.Time) (OAuthRequest, bool, error) {
 	status := OAuthRequestDenied
@@ -362,11 +362,11 @@ func (s *Store) VerifyOAuthAccessToken(ctx context.Context, tokenHash string, no
 	return grant, time.Unix(expiresAt, 0).UTC(), true, nil
 }
 
-func (s *Store) ListOAuthGrants(ctx context.Context) ([]OAuthGrant, error) {
+func (s *Store) ListOAuthGrants(ctx context.Context, userID int64) ([]OAuthGrant, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, client_id, client_name, user_id, resource, created_at, last_used_at
-		FROM oauth_grants WHERE revoked_at = 0 ORDER BY last_used_at DESC
-	`)
+		FROM oauth_grants WHERE user_id = ? AND revoked_at = 0 ORDER BY last_used_at DESC
+	`, userID)
 	if err != nil {
 		return nil, fmt.Errorf("list oauth grants: %w", err)
 	}
@@ -385,14 +385,16 @@ func (s *Store) ListOAuthGrants(ctx context.Context) ([]OAuthGrant, error) {
 	return grants, rows.Err()
 }
 
-func (s *Store) RevokeOAuthGrant(ctx context.Context, grantID string, now time.Time) (OAuthGrant, bool, error) {
+// RevokeOAuthGrant revokes one of the user's grants. Grants of other users are
+// reported as not found.
+func (s *Store) RevokeOAuthGrant(ctx context.Context, userID int64, grantID string, now time.Time) (OAuthGrant, bool, error) {
 	var grant OAuthGrant
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
 		var createdAt, lastUsedAt int64
 		err := tx.QueryRowContext(ctx, `
 			SELECT id, client_id, client_name, user_id, resource, created_at, last_used_at
-			FROM oauth_grants WHERE id = ? AND revoked_at = 0
-		`, grantID).Scan(&grant.ID, &grant.ClientID, &grant.ClientName, &grant.UserID, &grant.Resource, &createdAt, &lastUsedAt)
+			FROM oauth_grants WHERE id = ? AND user_id = ? AND revoked_at = 0
+		`, grantID, userID).Scan(&grant.ID, &grant.ClientID, &grant.ClientName, &grant.UserID, &grant.Resource, &createdAt, &lastUsedAt)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrOAuthInvalidGrant
 		}
@@ -509,4 +511,18 @@ func (s *Store) withTx(ctx context.Context, fn func(*sql.Tx) error) error {
 		return fmt.Errorf("commit transaction: %w", err)
 	}
 	return nil
+}
+
+// RevokeOAuthGrantsForUser revokes every connection of a user, for example on
+// logout.
+func (s *Store) RevokeOAuthGrantsForUser(ctx context.Context, userID int64, now time.Time) error {
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM oauth_tokens WHERE grant_id IN (SELECT id FROM oauth_grants WHERE user_id = ?)`, userID); err != nil {
+			return fmt.Errorf("delete user oauth tokens: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE oauth_grants SET revoked_at = ? WHERE user_id = ? AND revoked_at = 0`, now.Unix(), userID); err != nil {
+			return fmt.Errorf("revoke user oauth grants: %w", err)
+		}
+		return nil
+	})
 }

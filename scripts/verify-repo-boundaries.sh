@@ -42,11 +42,9 @@ assert 'value: "telegram-bridge"' in agent
 assert 'url: "https://telegram-bridge.fly.dev/mcp"' in agent
 for name in (
     "TELEGRAM_BOT_TOKEN",
-    "TELEGRAM_BRIDGE_ADMIN_CHAT_IDS",
     "TELEGRAM_API_ID",
     "TELEGRAM_API_HASH",
-    "TELEGRAM_PHONE",
-    "TELEGRAM_PASSWORD",
+    "TELEGRAM_BRIDGE_SESSION_KEY",
     "TELEGRAM_BRIDGE_MCP_TOKEN",
     "TELEGRAM_BRIDGE_NOTIFICATION_TOKEN",
     "TELEGRAM_BRIDGE_NOTIFICATION_CHAT_IDS",

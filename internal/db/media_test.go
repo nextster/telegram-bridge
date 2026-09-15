@@ -28,7 +28,7 @@ func TestMediaBudgetReservationIsAtomicAndPersistent(t *testing.T) {
 		if _, err := s.EnqueueMedia(ctx, MediaJob{ID: id, AccountID: 1, Chat: "chat:1", MessageID: 1, CreatedAt: now.Unix(), Payload: "{}"}); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := s.ClaimMedia(ctx, 1, now); err != nil {
+		if _, err := s.ClaimMedia(ctx, []int64{1}, now); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -83,7 +83,7 @@ func TestMediaQueueCapacityStillReturnsDuplicates(t *testing.T) {
 	if _, err := s.EnqueueMedia(ctx, MediaJob{ID: "0", AccountID: 1}); err != nil {
 		t.Fatal("full queue rejected cached job")
 	}
-	if _, err := s.ClaimMedia(ctx, 2, time.Now()); err == nil {
+	if _, err := s.ClaimMedia(ctx, []int64{2}, time.Now()); err == nil {
 		t.Fatal("job claimed by wrong account")
 	}
 }

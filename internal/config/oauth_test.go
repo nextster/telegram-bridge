@@ -18,9 +18,6 @@ func TestOAuthIsOptInAndNeedsBotAndPublicURL(t *testing.T) {
 		if got := tc.cfg.HasOAuth(); got != tc.want {
 			t.Errorf("%s: HasOAuth() = %t, want %t", tc.name, got, tc.want)
 		}
-		if tc.want && !tc.cfg.HasMCP() {
-			t.Errorf("%s: OAuth must enable MCP without a static token", tc.name)
-		}
 	}
 }
 

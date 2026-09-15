@@ -25,8 +25,8 @@ type Download struct {
 	Source      Attachment `json:"source"`
 }
 
-func (s *Service) Download(ctx context.Context, chat string, id int) (Download, error) {
-	a, err := s.Metadata(ctx, chat, id)
+func (s *Service) Download(ctx context.Context, accountID int64, chat string, id int) (Download, error) {
+	a, err := s.Metadata(ctx, accountID, chat, id)
 	if err != nil {
 		return Download{}, err
 	}
@@ -50,7 +50,7 @@ func (s *Service) Download(ctx context.Context, chat string, id int) (Download, 
 
 func (s *Service) downloadLocked(ctx context.Context, a Attachment) (db.MediaFile, error) {
 	// Refresh metadata even for cached downloads, including authorization and edits.
-	current, err := s.source.Attachment(ctx, a.Chat, a.MessageID)
+	current, err := s.source.Attachment(ctx, a.AccountID, a.Chat, a.MessageID)
 	if err != nil {
 		return db.MediaFile{}, fault(err)
 	}
@@ -102,7 +102,7 @@ func (s *Service) downloadLocked(ctx context.Context, a Attachment) (db.MediaFil
 	defer s.root.Remove(name)
 	h := sha256.New()
 	w := &limitedWriter{target: io.MultiWriter(file, h), remaining: min(a.Size, s.cfg.MaxBytes)}
-	err = s.source.Download(ctx, a, w)
+	err = s.source.Download(ctx, a.AccountID, a, w)
 	syncErr := file.Sync()
 	closeErr := file.Close()
 	if w.exceeded {
@@ -144,15 +144,16 @@ func (w *limitedWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func (s *Service) OpenDownload(ctx context.Context, id string) (*os.File, db.MediaFile, error) {
+// OpenDownload opens a cached original only for the account that downloaded it.
+func (s *Service) OpenDownload(ctx context.Context, accountID int64, id string) (*os.File, db.MediaFile, error) {
 	if !idPattern.MatchString(id) {
 		return nil, db.MediaFile{}, Fail("file_not_found")
 	}
 	f, err := s.store.MediaFile(ctx, id)
-	if err != nil || f.AccountID != s.source.AccountID() || f.ExpiresAt <= s.now().Unix() {
+	if err != nil || accountID <= 0 || f.AccountID != accountID || f.ExpiresAt <= s.now().Unix() {
 		return nil, db.MediaFile{}, Fail("file_not_found")
 	}
-	a, err := s.Metadata(ctx, f.Chat, f.MessageID)
+	a, err := s.Metadata(ctx, accountID, f.Chat, f.MessageID)
 	if err != nil || a.AccountID != f.AccountID || a.Fingerprint != f.Fingerprint {
 		return nil, db.MediaFile{}, Fail("file_not_found")
 	}

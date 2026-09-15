@@ -22,6 +22,7 @@ import (
 
 	"github.com/nextster/telegram-bridge/internal/db"
 	"github.com/nextster/telegram-bridge/internal/mcpserver"
+	"github.com/nextster/telegram-bridge/internal/monitor"
 	"github.com/nextster/telegram-bridge/internal/oauth"
 )
 
@@ -43,7 +44,7 @@ func (f *fakeApprover) OAuthApprovalLink(_ context.Context, requestID string) (s
 	return "https://t.me/bridge_test_bot?start=oauth_" + requestID, nil
 }
 
-func (f *fakeApprover) OAuthConnectionRevoked(_ context.Context, clientName, _ string) error {
+func (f *fakeApprover) OAuthConnectionRevoked(_ context.Context, _ int64, clientName, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.revoked = append(f.revoked, clientName)
@@ -94,8 +95,26 @@ func newHarness(t *testing.T) *harness {
 	}
 	mux := http.NewServeMux()
 	h.oauth.Register(mux)
-	mux.Handle("/mcp", mcpserver.New(nil, "static-secret", mcpserver.Options{
-		VerifyToken:         h.oauth.VerifyAccessToken,
+	mux.Handle("/mcp", mcpserver.New(mcpserver.Options{
+		VerifyToken: func(ctx context.Context, token string) (int64, time.Time, error) {
+			if token == "static-secret" {
+				return adminUserID, time.Now().Add(time.Hour), nil
+			}
+			userID, expires, ok, err := h.oauth.VerifyAccessToken(ctx, token)
+			if err != nil {
+				return 0, time.Time{}, err
+			}
+			if !ok {
+				return 0, time.Time{}, auth.ErrInvalidToken
+			}
+			return userID, expires, nil
+		},
+		Accounts: func(userID int64) (mcpserver.Monitor, error) {
+			if userID != adminUserID {
+				return nil, fmt.Errorf("user %d is not connected", userID)
+			}
+			return emptyAccount{}, nil
+		},
 		ResourceMetadataURL: h.oauth.ResourceMetadataURL(),
 	}))
 	handler = mux
@@ -212,6 +231,18 @@ func (h *harness) mcpStatus(token string) (int, string) {
 
 func pickCorrect(correct string) string { return correct }
 
+type emptyAccount struct{}
+
+func (emptyAccount) ListDialogs(context.Context, string, int) ([]monitor.TelegramDialog, error) {
+	return nil, nil
+}
+func (emptyAccount) SearchMessages(context.Context, monitor.MessageSearchOptions) ([]monitor.TelegramMessage, error) {
+	return nil, nil
+}
+func (emptyAccount) GetHistoryPage(context.Context, monitor.HistoryOptions) (monitor.HistoryPage, error) {
+	return monitor.HistoryPage{}, nil
+}
+
 func TestSDKClientConnectsAfterTelegramApproval(t *testing.T) {
 	for _, method := range []string{"", "none", "client_secret_post"} {
 		t.Run("auth_method="+method, func(t *testing.T) {
@@ -254,7 +285,7 @@ func TestSDKClientConnectsAfterTelegramApproval(t *testing.T) {
 			if len(tools.Tools) != 3 {
 				t.Fatalf("tool count = %d", len(tools.Tools))
 			}
-			grants, err := h.store.ListOAuthGrants(context.Background())
+			grants, err := h.store.ListOAuthGrants(context.Background(), adminUserID)
 			if err != nil || len(grants) != 1 || grants[0].ClientName != "Claude Code (telegram-bridge)" || grants[0].UserID != adminUserID {
 				t.Fatalf("grants = %+v err=%v", grants, err)
 			}
