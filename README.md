@@ -164,7 +164,7 @@ authenticate with OAuth approved in the bot, or with a personal MCP token from
 the dashboard. Either way the tools act only on the account that owns the
 credential.
 
-### OAuth with bot approval
+### OAuth with Telegram sign-in
 
 OAuth is opt-in. It needs `TELEGRAM_BRIDGE_OAUTH=on`, the bot token,
 `TELEGRAM_BRIDGE_PUBLIC_URL`, and Telegram Login for the bot:
@@ -186,17 +186,17 @@ claude mcp login telegram-bridge
 Claude Desktop and claude.ai custom connectors use the same URL; their callback
 is allowlisted.
 
-The client opens an authorization page with **Войти через Telegram**. After
-signing in on oauth.telegram.org, the bot sends that user the client name, IP
-address, and browser with **Разрешить** and **Отклонить**.
+The client opens an authorization page with **Войти через Telegram**. Signing
+in on oauth.telegram.org in that browser connects the client to that user's own
+account and returns to the client; there is no separate approval step.
 
-- Signing in binds the request to the Telegram user of the browser that opened
-  it. Only that user is asked and can approve, for their own connected account.
-  A link forwarded to someone else fails in their browser, and the bot warns
-  them instead of showing the prompt, so a user cannot be talked into approving
-  a request somebody else opened.
-- The bot reports every new connection with its client name and IP address, so
-  an unexpected one can be revoked at once.
+- The connection goes to the Telegram user who signed in from the browser that
+  opened the request, and only if they have connected their account with
+  `/login`. A link forwarded to someone else fails in their browser.
+- The bot reports every new connection with its client name, IP address, and an
+  **Отключить** button, so an unexpected one can be cut off at once. If someone
+  talks a user into confirming a Telegram sign-in from their browser, this alert
+  is the user's chance to notice.
 - Codes and tokens never pass through Telegram. Only the browser that opened the
   page receives the single authorization code.
 - Redirects are limited to loopback addresses and the Claude connector callback;

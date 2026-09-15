@@ -22,9 +22,8 @@ import (
 	"github.com/nextster/telegram-bridge/internal/db"
 )
 
-// Telegram Login (OpenID Connect) binds an authorization request to the
-// Telegram user signed in to the browser that opened it. Without it, anyone
-// could open a request and talk another user into approving it in the bot.
+// Telegram Login (OpenID Connect) approves an authorization request for the
+// Telegram user who signs in in the browser that opened it.
 const (
 	telegramIssuer   = "https://oauth.telegram.org"
 	telegramAuthURL  = "https://oauth.telegram.org/auth"
@@ -106,6 +105,18 @@ func (s *Server) setBrowserCookie(w http.ResponseWriter, requestID, secret strin
 	})
 }
 
+func (s *Server) clearBrowserCookie(w http.ResponseWriter, requestID string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     browserCookieName(requestID),
+		Value:    "",
+		Path:     "/oauth/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   strings.HasPrefix(s.issuer, "https://"),
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
 // browserRequest loads a pending request that was opened in this browser.
 func (s *Server) browserRequest(w http.ResponseWriter, r *http.Request, requestID string) (requestView, bool) {
 	cookie, err := r.Cookie(browserCookieName(requestID))
@@ -167,8 +178,8 @@ func (s *Server) telegramStart(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, s.telegram.authURL+"?"+query.Encode(), http.StatusFound)
 }
 
-// telegramCallback finishes the sign-in, binds the request to the signed-in
-// user, and asks that user to approve it in the bot.
+// telegramCallback finishes the sign-in, approves the request for the
+// signed-in user, and returns the browser to the client with a code.
 func (s *Server) telegramCallback(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	requestID, state, _ := strings.Cut(query.Get("state"), ".")
@@ -176,7 +187,8 @@ func (s *Server) telegramCallback(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	nonce, verifier, found, err := s.store.FinishOAuthTelegramLogin(r.Context(), view.request.ID, hashSecret(state), s.now())
+	ctx := r.Context()
+	nonce, verifier, found, err := s.store.FinishOAuthTelegramLogin(ctx, view.request.ID, hashSecret(state), s.now())
 	if err != nil {
 		log.Printf("oauth telegram login finish failed: %v", err)
 		s.renderError(w, http.StatusInternalServerError, "Не удалось завершить вход. Попробуйте ещё раз.")
@@ -187,58 +199,55 @@ func (s *Server) telegramCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if query.Get("error") != "" || query.Get("code") == "" {
-		s.renderError(w, http.StatusBadRequest, "Вход через Telegram отменён. Запустите подключение заново.")
+		if _, _, err := s.store.DecideOAuthRequest(ctx, view.request.ID, false, 0, s.now()); err != nil {
+			log.Printf("oauth request deny failed: %v", err)
+		}
+		s.clearBrowserCookie(w, view.request.ID)
+		http.Redirect(w, r, s.errorRedirect(view.request.RedirectURI, view.request.State, "access_denied", "Telegram sign-in was cancelled"), http.StatusSeeOther)
 		return
 	}
-	userID, err := s.telegram.userID(r.Context(), query.Get("code"), s.issuer+telegramCallback, verifier, nonce)
+	userID, err := s.telegram.userID(ctx, query.Get("code"), s.issuer+telegramCallback, verifier, nonce)
 	if err != nil {
 		log.Printf("oauth telegram login failed: %v", err)
 		s.renderError(w, http.StatusBadGateway, "Telegram не подтвердил вход. Попробуйте ещё раз.")
 		return
 	}
-	bound, err := s.store.BindOAuthRequest(r.Context(), view.request.ID, userID, s.now())
-	if err != nil || !bound {
+	connected, err := s.approver.OAuthAccountConnected(ctx, userID)
+	if err != nil {
+		log.Printf("oauth account check failed: %v", err)
+		s.renderError(w, http.StatusServiceUnavailable, "Не удалось проверить аккаунт. Попробуйте ещё раз.")
+		return
+	}
+	if !connected {
+		link, err := s.approver.OAuthBotLink(ctx)
 		if err != nil {
-			log.Printf("oauth request bind failed: %v", err)
+			log.Printf("oauth bot link failed: %v", err)
+		}
+		s.writePage(w, http.StatusForbidden, approvalPage{
+			Error:   "Сначала подключите свой Telegram: отправьте /login боту, затем запустите подключение заново.",
+			BotLink: link,
+		})
+		return
+	}
+	now := s.now()
+	if _, approved, err := s.store.DecideOAuthRequest(ctx, view.request.ID, true, userID, now); err != nil || !approved {
+		if err != nil {
+			log.Printf("oauth request approve failed: %v", err)
 		}
 		s.renderError(w, http.StatusBadRequest, "Запрос на подключение устарел. Запустите подключение заново.")
 		return
 	}
-	if err := s.approver.OAuthApprovalRequested(context.WithoutCancel(r.Context()), userID, view.request.ID); err != nil {
-		log.Printf("oauth approval prompt failed: %v", err)
+	code := randomToken(32)
+	if issued, err := s.store.IssueOAuthCode(ctx, view.request.ID, hashSecret(code), now.Add(codeTTL), now); err != nil || !issued {
+		if err != nil {
+			log.Printf("oauth code issue failed: %v", err)
+		}
+		s.renderError(w, http.StatusInternalServerError, "Не удалось завершить подключение. Запустите его заново.")
+		return
 	}
+	s.clearBrowserCookie(w, view.request.ID)
 	w.Header().Set("Cache-Control", "no-store")
-	http.Redirect(w, r, "/oauth/authorize/continue?request="+url.QueryEscape(view.request.ID), http.StatusSeeOther)
-}
-
-// authorizeContinue shows the approval step to the browser that signed in.
-func (s *Server) authorizeContinue(w http.ResponseWriter, r *http.Request) {
-	view, ok := s.browserRequest(w, r, r.URL.Query().Get("request"))
-	if !ok {
-		return
-	}
-	if view.request.BoundUserID <= 0 {
-		http.Redirect(w, r, "/oauth/telegram/start?request="+url.QueryEscape(view.request.ID), http.StatusSeeOther)
-		return
-	}
-	client, found, err := s.store.GetOAuthClient(r.Context(), view.request.ClientID)
-	if err != nil || !found {
-		s.renderError(w, http.StatusBadRequest, "Клиент не зарегистрирован. Запустите подключение заново из Claude или Codex.")
-		return
-	}
-	link, err := s.approver.OAuthApprovalLink(r.Context(), view.request.ID)
-	if err != nil {
-		log.Printf("oauth approval link failed: %v", err)
-		s.renderError(w, http.StatusServiceUnavailable, "Telegram-бот недоступен. Попробуйте позже.")
-		return
-	}
-	s.renderApproval(w, approvalPage{
-		ClientName:    displayClientName(client.Name),
-		ApprovalLink:  link,
-		RequestID:     view.request.ID,
-		BrowserSecret: view.secret,
-		SignedIn:      true,
-	})
+	http.Redirect(w, r, s.successRedirect(view.request.RedirectURI, view.request.State, code), http.StatusSeeOther)
 }
 
 type requestView struct {

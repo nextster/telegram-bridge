@@ -8,14 +8,10 @@ import (
 )
 
 type approvalPage struct {
-	ClientName    string
-	SignInLink    string
-	SignedIn      bool
-	ApprovalLink  string
-	RequestID     string
-	BrowserSecret string
-	Nonce         string
-	Error         string
+	ClientName string
+	SignInLink string
+	BotLink    string
+	Error      string
 }
 
 type pageRenderer struct {
@@ -24,11 +20,6 @@ type pageRenderer struct {
 
 func newPageRenderer() pageRenderer {
 	return pageRenderer{template: template.Must(template.New("oauth").Parse(pageTemplate))}
-}
-
-func (s *Server) renderApproval(w http.ResponseWriter, page approvalPage) {
-	page.Nonce = randomToken(16)
-	s.writePage(w, http.StatusOK, page)
 }
 
 func (s *Server) renderError(w http.ResponseWriter, status int, message string) {
@@ -42,13 +33,9 @@ func (s *Server) writePage(w http.ResponseWriter, status int, page approvalPage)
 		http.Error(w, "could not render authorization page", http.StatusInternalServerError)
 		return
 	}
-	script := "'none'"
-	if page.Nonce != "" {
-		script = "'nonce-" + page.Nonce + "'"
-	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src "+script+"; connect-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
@@ -88,55 +75,13 @@ const pageTemplate = `<!doctype html>
   {{if .Error}}
     <h1>Подключение не удалось</h1>
     <p class="status bad">{{.Error}}</p>
-  {{else if .SignInLink}}
-    <h1>Подключение к Telegram Bridge</h1>
-    <p><b>{{.ClientName}}</b> запрашивает доступ к вашему Telegram через MCP.</p>
-    <p>Сначала войдите через Telegram в этом браузере. Доступ получит только аккаунт, под которым вы войдёте, и только после подтверждения в боте.</p>
-    <a class="button" href="{{.SignInLink}}">Войти через Telegram</a>
-    <p class="muted">Если эту ссылку вам прислал кто-то другой, закройте страницу: так пытаются получить доступ к чужой переписке.</p>
+    {{if .BotLink}}<a class="button" href="{{.BotLink}}" target="_blank" rel="noopener noreferrer">Открыть бота</a>{{end}}
   {{else}}
     <h1>Подключение к Telegram Bridge</h1>
     <p><b>{{.ClientName}}</b> запрашивает доступ к вашему Telegram через MCP.</p>
-    <p>Бот прислал вам запрос. Нажмите в нём «Разрешить».</p>
-    <a class="button" href="{{.ApprovalLink}}" target="_blank" rel="noopener noreferrer">Открыть бота</a>
-    <p id="status" class="status" role="status">Ждём подтверждения в Telegram…</p>
-    <p class="muted">Если сообщение от бота не пришло, откройте бота кнопкой выше. Сначала подключите в нём свой Telegram командой /login.</p>
-    <script nonce="{{.Nonce}}">
-      (() => {
-        const status = document.getElementById('status');
-        const body = JSON.stringify({request: {{.RequestID}}, secret: {{.BrowserSecret}}});
-        const show = (text, kind) => { status.textContent = text; status.className = 'status ' + (kind || ''); };
-        const poll = async () => {
-          let result;
-          try {
-            const response = await fetch('/oauth/authorize/status', {method: 'POST', headers: {'Content-Type': 'application/json'}, body, cache: 'no-store'});
-            result = await response.json();
-          } catch (_) {
-            setTimeout(poll, 3000);
-            return;
-          }
-          switch (result.status) {
-            case 'pending':
-              setTimeout(poll, 1500);
-              return;
-            case 'approved':
-              show('Доступ разрешён. Возвращаемся в приложение…', 'ok');
-              window.location.replace(result.redirect);
-              return;
-            case 'denied':
-              show('Доступ отклонён.', 'bad');
-              window.location.replace(result.redirect);
-              return;
-            case 'done':
-              show('Подключение уже завершено. Эту страницу можно закрыть.', 'ok');
-              return;
-            default:
-              show('Запрос устарел. Запустите подключение заново.', 'bad');
-          }
-        };
-        poll();
-      })();
-    </script>
+    <p>Войдите через Telegram в этом браузере. Доступ получит только аккаунт, под которым вы войдёте.</p>
+    <a class="button" href="{{.SignInLink}}">Войти через Telegram</a>
+    <p class="muted">Если эту ссылку вам прислал кто-то другой, закройте страницу: так пытаются получить доступ к чужой переписке.</p>
   {{end}}
   </div>
 </main>

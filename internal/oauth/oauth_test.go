@@ -41,18 +41,20 @@ const (
 )
 
 type fakeApprover struct {
-	mu       sync.Mutex
-	requests []string
-	revoked  []string
-	created  []int64
-	prompted []string
+	mu           sync.Mutex
+	disconnected map[int64]bool
+	revoked      []string
+	created      []string
 }
 
-func (f *fakeApprover) OAuthApprovalRequested(_ context.Context, userID int64, requestID string) error {
+func (f *fakeApprover) OAuthAccountConnected(_ context.Context, userID int64) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.prompted = append(f.prompted, fmt.Sprintf("%d:%s", userID, requestID))
-	return nil
+	return userID > 0 && !f.disconnected[userID], nil
+}
+
+func (f *fakeApprover) OAuthBotLink(context.Context) (string, error) {
+	return "https://t.me/bridge_test_bot", nil
 }
 
 // fakeTelegramLogin is the token endpoint of Telegram Login. Codes are handed
@@ -106,13 +108,6 @@ func (f *fakeTelegramLogin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"access_token": "telegram-access", "token_type": "Bearer", "id_token": token})
 }
 
-func (f *fakeApprover) OAuthApprovalLink(_ context.Context, requestID string) (string, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.requests = append(f.requests, requestID)
-	return "https://t.me/bridge_test_bot?start=oauth_" + requestID, nil
-}
-
 func (f *fakeApprover) OAuthConnectionRevoked(_ context.Context, _ int64, clientName, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -120,10 +115,10 @@ func (f *fakeApprover) OAuthConnectionRevoked(_ context.Context, _ int64, client
 	return nil
 }
 
-func (f *fakeApprover) OAuthConnectionCreated(_ context.Context, userID int64, _, _ string) error {
+func (f *fakeApprover) OAuthConnectionCreated(_ context.Context, userID int64, grantID, _, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.created = append(f.created, userID)
+	f.created = append(f.created, fmt.Sprintf("%d:%s", userID, grantID))
 	return nil
 }
 
@@ -217,13 +212,7 @@ func newBrowser() *http.Client {
 	return &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }
 
-var pageSecrets = regexp.MustCompile(`JSON\.stringify\(\{request: "([^"]+)", secret: "([^"]+)"\}\)`)
 var pageSignIn = regexp.MustCompile(`href="/oauth/telegram/start\?request=([^"]+)"`)
-var pageLink = regexp.MustCompile(`href="https://t\.me/bridge_test_bot\?start=oauth_([^"]+)"`)
-
-type pageRequest struct {
-	id, secret string
-}
 
 // openPage loads the authorization page like a browser and returns the
 // request ID from its sign-in link.
@@ -280,61 +269,28 @@ func (h *harness) startSignIn(browser *http.Client, requestID string, userID int
 	return query.Get("redirect_uri") + "?" + url.Values{"code": {code}, "state": {query.Get("state")}}.Encode(), status, body
 }
 
-// openApproval opens the authorization page, signs in with Telegram as
-// userID, and returns the approval step.
-func (h *harness) openApproval(authURL string, userID int64) pageRequest {
+// approve opens the authorization page, signs in with Telegram as the admin
+// user or cancels the sign-in, and returns the redirect to the client.
+func (h *harness) approve(authURL string, allow bool) string {
 	h.t.Helper()
 	requestID := h.openPage(authURL)
-	callback, status, body := h.startSignIn(h.client, requestID, userID)
+	callback, status, body := h.startSignIn(h.client, requestID, adminUserID)
 	if callback == "" {
 		h.t.Fatalf("sign-in start status=%d body=%s", status, body)
 	}
+	if !allow {
+		parsed, _ := url.Parse(callback)
+		query := parsed.Query()
+		query.Del("code")
+		query.Set("error", "access_denied")
+		parsed.RawQuery = query.Encode()
+		callback = parsed.String()
+	}
 	status, location, body := h.browse(h.client, callback)
-	if status != http.StatusSeeOther || !strings.HasPrefix(location, "/oauth/authorize/continue?") {
+	if status != http.StatusSeeOther || !strings.HasPrefix(location, testRedirect) {
 		h.t.Fatalf("callback status=%d location=%q body=%s", status, location, body)
 	}
-	status, _, body = h.browse(h.client, location)
-	if status != http.StatusOK {
-		h.t.Fatalf("continue status=%d body=%s", status, body)
-	}
-	secrets := pageSecrets.FindStringSubmatch(body)
-	link := pageLink.FindStringSubmatch(body)
-	if secrets == nil || link == nil || link[1] != secrets[1] || secrets[1] != requestID {
-		h.t.Fatalf("authorization page is missing request data: %s", body)
-	}
-	return pageRequest{id: secrets[1], secret: secrets[2]}
-}
-
-// approve opens the authorization page, lets the bot allow or deny, and
-// returns the redirect the browser page would follow.
-func (h *harness) approve(authURL string, allow bool) string {
-	h.t.Helper()
-	page := h.openApproval(authURL, adminUserID)
-	if status := h.status(page.id, page.secret); status["status"] != "pending" {
-		h.t.Fatalf("status before decision = %v", status)
-	}
-	if _, changed, err := h.store.DecideOAuthRequest(context.Background(), page.id, allow, adminUserID, h.clock.Now()); err != nil || !changed {
-		h.t.Fatalf("decide changed=%t err=%v", changed, err)
-	}
-	if status := h.status(page.id, "wrong-secret"); status["status"] != "expired" {
-		h.t.Fatalf("status with a foreign browser secret = %v", status)
-	}
-	return h.status(page.id, page.secret)["redirect"]
-}
-
-func (h *harness) status(requestID, secret string) map[string]string {
-	h.t.Helper()
-	payload, _ := json.Marshal(map[string]string{"request": requestID, "secret": secret})
-	response, err := h.client.Post(h.server.URL+"/oauth/authorize/status", "application/json", strings.NewReader(string(payload)))
-	if err != nil {
-		h.t.Fatal(err)
-	}
-	defer response.Body.Close()
-	var result map[string]string
-	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
-		h.t.Fatal(err)
-	}
-	return result
+	return location
 }
 
 func (h *harness) register(metadata map[string]any) (int, map[string]any) {
@@ -510,7 +466,7 @@ func TestAuthorizationCodeIsSingleUseAndBoundToPKCE(t *testing.T) {
 	}
 	h.approver.mu.Lock()
 	defer h.approver.mu.Unlock()
-	if len(h.approver.created) != 1 || h.approver.created[0] != adminUserID {
+	if len(h.approver.created) != 1 || !strings.HasPrefix(h.approver.created[0], fmt.Sprintf("%d:", adminUserID)) {
 		t.Fatalf("connection alerts = %v", h.approver.created)
 	}
 }
@@ -583,9 +539,6 @@ func TestAuthorizeRejectsMismatchedRedirectAndMissingPKCE(t *testing.T) {
 	response := h.get("/oauth/authorize?" + query.Encode())
 	if response.StatusCode != http.StatusBadRequest || response.Header.Get("Location") != "" {
 		t.Fatalf("missing PKCE must not redirect: status=%d location=%q", response.StatusCode, response.Header.Get("Location"))
-	}
-	if len(h.approver.requests) != 0 {
-		t.Fatal("an invalid request produced an approval link")
 	}
 }
 
@@ -676,28 +629,30 @@ func TestAuthorizeRejectsHEADAndLimitsRequestsPerIP(t *testing.T) {
 	h.openPage(h.authorizeURL(clientID, strings.Repeat("v", 64)))
 }
 
-func TestApprovedRequestMintsOneCodeOnlyBeforeExpiry(t *testing.T) {
+func TestSignInOnlyBeforeTheRequestExpires(t *testing.T) {
 	h := newHarness(t)
-	clientID := h.registerPublicClient()
-
-	page := h.openApproval(h.authorizeURL(clientID, strings.Repeat("v", 64)), adminUserID)
-	if _, changed, err := h.store.DecideOAuthRequest(context.Background(), page.id, true, adminUserID, h.clock.Now()); err != nil || !changed {
-		t.Fatalf("decide changed=%t err=%v", changed, err)
-	}
-	if status := h.status(page.id, page.secret); status["status"] != "approved" || !strings.Contains(status["redirect"], "code=") {
-		t.Fatalf("first status = %v", status)
-	}
-	if status := h.status(page.id, page.secret); status["status"] != "done" || status["redirect"] != "" {
-		t.Fatalf("second status minted another code: %v", status)
-	}
-
-	late := h.openApproval(h.authorizeURL(clientID, strings.Repeat("v", 64)), adminUserID)
-	if _, changed, err := h.store.DecideOAuthRequest(context.Background(), late.id, true, adminUserID, h.clock.Now()); err != nil || !changed {
-		t.Fatalf("decide changed=%t err=%v", changed, err)
-	}
+	requestID := h.openPage(h.authorizeURL(h.registerPublicClient(), strings.Repeat("v", 64)))
+	callback, _, _ := h.startSignIn(h.client, requestID, adminUserID)
 	h.clock.Advance(11 * time.Minute)
-	if status := h.status(late.id, late.secret); status["status"] != "expired" {
-		t.Fatalf("expired approved request status = %v", status)
+	if status, _, body := h.browse(h.client, callback); status != http.StatusBadRequest || !strings.Contains(body, "устарел") {
+		t.Fatalf("expired request callback status=%d body=%s", status, body)
+	}
+	if request, _, _ := h.store.GetOAuthRequest(context.Background(), requestID); request.Status != db.OAuthRequestPending || request.CodeHash != "" {
+		t.Fatalf("expired request changed: %+v", request)
+	}
+}
+
+func TestSignInRequiresAConnectedAccount(t *testing.T) {
+	h := newHarness(t)
+	h.approver.disconnected = map[int64]bool{777: true}
+	requestID := h.openPage(h.authorizeURL(h.registerPublicClient(), strings.Repeat("v", 64)))
+	callback, _, _ := h.startSignIn(h.client, requestID, 777)
+	status, location, body := h.browse(h.client, callback)
+	if status != http.StatusForbidden || location != "" || !strings.Contains(body, "/login") || !strings.Contains(body, "https://t.me/bridge_test_bot") {
+		t.Fatalf("disconnected sign-in status=%d location=%q body=%s", status, location, body)
+	}
+	if request, _, _ := h.store.GetOAuthRequest(context.Background(), requestID); request.Status != db.OAuthRequestPending || request.BoundUserID != 0 {
+		t.Fatalf("request approved for a disconnected account: %+v", request)
 	}
 }
 
@@ -761,35 +716,19 @@ func TestSignInBindsTheRequestToTheBrowserThatOpenedIt(t *testing.T) {
 		t.Fatalf("request bound through another browser: %+v", request)
 	}
 
-	// The owner of the browser signs in as 777; only 777 is asked and can decide.
+	// The browser that opened the request signs in as 777 and gets the code.
 	status, location, _ := h.browse(h.client, callback)
-	if status != http.StatusSeeOther {
-		t.Fatalf("callback status = %d", status)
+	if status != http.StatusSeeOther || !strings.HasPrefix(location, testRedirect) {
+		t.Fatalf("callback status=%d location=%q", status, location)
 	}
 	if status, _, _ := h.browse(h.client, callback); status != http.StatusBadRequest {
 		t.Fatalf("replayed callback status = %d", status)
 	}
-	h.approver.mu.Lock()
-	prompted := append([]string(nil), h.approver.prompted...)
-	h.approver.mu.Unlock()
-	if len(prompted) != 1 || prompted[0] != "777:"+requestID {
-		t.Fatalf("prompts = %v", prompted)
+	request, _, _ := h.store.GetOAuthRequest(context.Background(), requestID)
+	if request.Status != db.OAuthRequestApproved || request.BoundUserID != 777 || request.DecidedBy != 777 {
+		t.Fatalf("approved request = %+v", request)
 	}
-	_, _, body := h.browse(h.client, location)
-	secrets := pageSecrets.FindStringSubmatch(body)
-	if secrets == nil {
-		t.Fatalf("continue page = %s", body)
-	}
-	if status, _, _ := h.browse(stranger, location); status != http.StatusBadRequest {
-		t.Fatalf("foreign browser continue status = %d", status)
-	}
-	if _, changed, err := h.store.DecideOAuthRequest(context.Background(), requestID, true, adminUserID, h.clock.Now()); err != nil || changed {
-		t.Fatalf("another user decided the request: changed=%t err=%v", changed, err)
-	}
-	if _, changed, err := h.store.DecideOAuthRequest(context.Background(), requestID, true, 777, h.clock.Now()); err != nil || !changed {
-		t.Fatalf("signed-in user could not decide: changed=%t err=%v", changed, err)
-	}
-	redirect, err := url.Parse(h.status(requestID, secrets[2])["redirect"])
+	redirect, err := url.Parse(location)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -803,6 +742,11 @@ func TestSignInBindsTheRequestToTheBrowserThatOpenedIt(t *testing.T) {
 	if grants, _ := h.store.ListOAuthGrants(context.Background(), adminUserID); len(grants) != 0 {
 		t.Fatalf("grant went to another user: %v", grants)
 	}
+	h.approver.mu.Lock()
+	defer h.approver.mu.Unlock()
+	if len(h.approver.created) != 1 || !strings.HasPrefix(h.approver.created[0], "777:") {
+		t.Fatalf("connection alerts = %v", h.approver.created)
+	}
 }
 
 func TestSignInAcceptsTheUserIDAsAString(t *testing.T) {
@@ -813,8 +757,8 @@ func TestSignInAcceptsTheUserIDAsAString(t *testing.T) {
 	if status, _, body := h.browse(h.client, callback); status != http.StatusSeeOther {
 		t.Fatalf("callback status=%d body=%s", status, body)
 	}
-	if request, _, _ := h.store.GetOAuthRequest(context.Background(), requestID); request.BoundUserID != 777 {
-		t.Fatalf("bound user = %d", request.BoundUserID)
+	if request, _, _ := h.store.GetOAuthRequest(context.Background(), requestID); request.BoundUserID != 777 || request.Status != db.OAuthRequestApproved {
+		t.Fatalf("request = %+v", request)
 	}
 }
 
@@ -836,11 +780,8 @@ func TestSignInRejectsInvalidIDTokens(t *testing.T) {
 			if status, _, _ := h.browse(h.client, callback); status != http.StatusBadGateway {
 				t.Fatalf("callback status = %d", status)
 			}
-			if request, _, _ := h.store.GetOAuthRequest(context.Background(), requestID); request.BoundUserID != 0 {
-				t.Fatalf("request bound with an invalid token: %+v", request)
-			}
-			if len(h.approver.prompted) != 0 {
-				t.Fatalf("prompt sent for an invalid token: %v", h.approver.prompted)
+			if request, _, _ := h.store.GetOAuthRequest(context.Background(), requestID); request.BoundUserID != 0 || request.Status != db.OAuthRequestPending {
+				t.Fatalf("request approved with an invalid token: %+v", request)
 			}
 		})
 	}
