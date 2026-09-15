@@ -11,7 +11,6 @@ type approvalPage struct {
 	ClientName    string
 	SignInLink    string
 	SignedIn      bool
-	Code          string
 	ApprovalLink  string
 	RequestID     string
 	BrowserSecret string
@@ -74,7 +73,6 @@ const pageTemplate = `<!doctype html>
     h1 { margin: 0 0 6px; font-size: 21px; line-height: 1.2; }
     p { margin: 10px 0 0; }
     .muted { color: var(--muted); font-size: 13px; }
-    .code { margin: 18px 0 4px; font-size: 56px; font-weight: 700; letter-spacing: .08em; text-align: center; font-variant-numeric: tabular-nums; }
     .status { margin-top: 16px; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line); }
     .status.ok { border-color: var(--accent); color: var(--accent); }
     .status.bad { border-color: var(--danger); color: var(--danger); }
@@ -99,8 +97,7 @@ const pageTemplate = `<!doctype html>
   {{else}}
     <h1>Подключение к Telegram Bridge</h1>
     <p><b>{{.ClientName}}</b> запрашивает доступ к вашему Telegram через MCP.</p>
-    <p>Бот прислал вам запрос. Выберите в нём это число:</p>
-    <div class="code" aria-label="Код подтверждения">{{.Code}}</div>
+    <p>Бот прислал вам запрос. Нажмите в нём «Разрешить».</p>
     <a class="button" href="{{.ApprovalLink}}" target="_blank" rel="noopener noreferrer">Открыть бота</a>
     <p id="status" class="status" role="status">Ждём подтверждения в Telegram…</p>
     <p class="muted">Если сообщение от бота не пришло, откройте бота кнопкой выше. Сначала подключите в нём свой Telegram командой /login.</p>

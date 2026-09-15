@@ -2,13 +2,10 @@ package bot
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/subtle"
 	"errors"
 	"fmt"
 	"html"
 	"log"
-	"math/big"
 	"strings"
 	"sync"
 	"time"
@@ -21,8 +18,8 @@ const (
 	oauthStartPrefix          = "oauth_"
 	oauthCallbackPrefix       = "oauth:"
 	oauthRevokeCallbackPrefix = "oauthrevoke:"
+	oauthAllowChoice          = "allow"
 	oauthDenyChoice           = "deny"
-	oauthChoiceCount          = 4
 )
 
 // botIdentity caches the bot username used in approval deep links.
@@ -125,19 +122,11 @@ func (s *Service) sendOAuthPrompt(ctx context.Context, userID int64, requestID s
 	if client, ok, err := s.store.GetOAuthClient(ctx, request.ClientID); err == nil && ok && client.Name != "" {
 		clientName = client.Name
 	}
-	choices, err := approvalChoices(request.ApprovalCode, oauthChoiceCount)
-	if err != nil {
-		return err
-	}
-	numbers := make([]telego.InlineKeyboardButton, 0, len(choices))
-	for _, choice := range choices {
-		numbers = append(numbers, tu.InlineKeyboardButton(choice).WithCallbackData(oauthCallbackPrefix+request.ID+":"+choice))
-	}
-	markup := tu.InlineKeyboard(
-		tu.InlineKeyboardRow(numbers...),
-		tu.InlineKeyboardRow(tu.InlineKeyboardButton("Отклонить").WithCallbackData(oauthCallbackPrefix+request.ID+":"+oauthDenyChoice)),
-	)
-	text := fmt.Sprintf("🔐 <b>Доступ к вашему Telegram через MCP</b>\n\nКлиент: %s (название задаёт сам клиент)\nIP: %s\nБраузер: %s\n\nВы вошли через Telegram на странице подключения. Нажмите число с этой страницы. Если подключение запускали не вы, нажмите «Отклонить».",
+	markup := tu.InlineKeyboard(tu.InlineKeyboardRow(
+		tu.InlineKeyboardButton("✅ Разрешить").WithCallbackData(oauthCallbackPrefix+request.ID+":"+oauthAllowChoice),
+		tu.InlineKeyboardButton("Отклонить").WithCallbackData(oauthCallbackPrefix+request.ID+":"+oauthDenyChoice),
+	))
+	text := fmt.Sprintf("🔐 <b>Доступ к вашему Telegram через MCP</b>\n\nКлиент: %s (название задаёт сам клиент)\nIP: %s\nБраузер: %s\n\nВы вошли через Telegram на странице подключения. Разрешите доступ, только если подключение запускали вы.",
 		codeHTML(clientName), codeHTML(request.ClientIP), codeHTML(request.UserAgent))
 	return s.sendHTML(ctx, userID, text, markup)
 }
@@ -151,8 +140,8 @@ func (s *Service) handleOAuthCallback(ctx context.Context, query *telego.Callbac
 		return s.answerCallback(ctx, query.ID, "Сначала подключите свой Telegram: /login.")
 	}
 	requestID, choice, ok := strings.Cut(payload, ":")
-	if !ok || requestID == "" || choice == "" {
-		return s.answerCallback(ctx, query.ID, "Кнопка устарела.")
+	if !ok || requestID == "" || (choice != oauthAllowChoice && choice != oauthDenyChoice) {
+		return s.answerCallback(ctx, query.ID, "Кнопка устарела. Запустите подключение заново.")
 	}
 	request, found, err := s.store.GetOAuthRequest(ctx, requestID)
 	if err != nil {
@@ -167,7 +156,7 @@ func (s *Service) handleOAuthCallback(ctx context.Context, query *telego.Callbac
 		s.finishOAuthPrompt(ctx, query, oauthForeignRequestText)
 		return s.answerCallback(ctx, query.ID, "Запрос открыт под другим аккаунтом.")
 	}
-	approve := choice != oauthDenyChoice && subtle.ConstantTimeCompare([]byte(choice), []byte(request.ApprovalCode)) == 1
+	approve := choice == oauthAllowChoice
 	_, changed, err := s.store.DecideOAuthRequest(ctx, request.ID, approve, userID, time.Now())
 	if err != nil {
 		_ = s.answerCallback(ctx, query.ID, "Не удалось сохранить решение.")
@@ -177,17 +166,12 @@ func (s *Service) handleOAuthCallback(ctx context.Context, query *telego.Callbac
 		s.finishOAuthPrompt(ctx, query, "⌛ Запрос уже обработан или устарел.")
 		return s.answerCallback(ctx, query.ID, "Запрос уже обработан или устарел.")
 	}
-	switch {
-	case approve:
+	if approve {
 		s.finishOAuthPrompt(ctx, query, "✅ Доступ разрешён. Вернитесь в браузер. Отключить можно через /connections.")
 		return s.answerCallback(ctx, query.ID, "Доступ разрешён.")
-	case choice == oauthDenyChoice:
-		s.finishOAuthPrompt(ctx, query, "⛔ Подключение отклонено.")
-		return s.answerCallback(ctx, query.ID, "Отклонено.")
-	default:
-		s.finishOAuthPrompt(ctx, query, "⛔ Выбрано неверное число, подключение отклонено.")
-		return s.answerCallback(ctx, query.ID, "Неверное число. Запрос отклонён.")
 	}
+	s.finishOAuthPrompt(ctx, query, "⛔ Подключение отклонено.")
+	return s.answerCallback(ctx, query.ID, "Отклонено.")
 }
 
 func (s *Service) finishOAuthPrompt(ctx context.Context, query *telego.CallbackQuery, text string) {
@@ -265,38 +249,4 @@ func codeHTML(value string) string {
 		value = "—"
 	}
 	return "<code>" + html.EscapeString(value) + "</code>"
-}
-
-// approvalChoices returns the correct code and distinct two-digit decoys in
-// random order.
-func approvalChoices(correct string, count int) ([]string, error) {
-	choices := []string{correct}
-	for len(choices) < count {
-		value, err := rand.Int(rand.Reader, big.NewInt(90))
-		if err != nil {
-			return nil, err
-		}
-		decoy := fmt.Sprintf("%02d", value.Int64()+10)
-		if !containsString(choices, decoy) {
-			choices = append(choices, decoy)
-		}
-	}
-	for i := len(choices) - 1; i > 0; i-- {
-		value, err := rand.Int(rand.Reader, big.NewInt(int64(i+1)))
-		if err != nil {
-			return nil, err
-		}
-		j := int(value.Int64())
-		choices[i], choices[j] = choices[j], choices[i]
-	}
-	return choices, nil
-}
-
-func containsString(values []string, target string) bool {
-	for _, value := range values {
-		if value == target {
-			return true
-		}
-	}
-	return false
 }

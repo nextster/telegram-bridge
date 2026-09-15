@@ -4,8 +4,8 @@
 // A request is first bound to the Telegram user who signs in with Telegram in
 // the browser that opened it, so nobody can talk another user into approving a
 // request they opened themselves. The bot then asks that user, and only that
-// user, to pick the number shown on the page. Codes and tokens never pass
-// through Telegram; only SHA-256 hashes of them are stored.
+// user, to allow the client. Codes and tokens never pass through Telegram;
+// only SHA-256 hashes of them are stored.
 package oauth
 
 import (
@@ -19,7 +19,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -374,7 +373,6 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 		State:         query.Get("state"),
 		CodeChallenge: challenge,
 		Resource:      s.resource,
-		ApprovalCode:  fmt.Sprintf("%02d", randomInt(90)+10),
 		ClientIP:      clientIP(r),
 		UserAgent:     truncateRunes(cleanClientName(r.UserAgent()), maxUserAgentLen),
 		ExpiresAt:     now.Add(requestTTL),
@@ -783,14 +781,6 @@ func displayClientName(name string) string {
 		return "MCP-клиент"
 	}
 	return name
-}
-
-func randomInt(limit int) int {
-	value, err := rand.Int(rand.Reader, big.NewInt(int64(limit)))
-	if err != nil {
-		panic(fmt.Sprintf("crypto/rand failed: %v", err))
-	}
-	return int(value.Int64())
 }
 
 func randomToken(bytes int) string {

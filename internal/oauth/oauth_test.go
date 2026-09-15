@@ -219,11 +219,10 @@ func newBrowser() *http.Client {
 
 var pageSecrets = regexp.MustCompile(`JSON\.stringify\(\{request: "([^"]+)", secret: "([^"]+)"\}\)`)
 var pageSignIn = regexp.MustCompile(`href="/oauth/telegram/start\?request=([^"]+)"`)
-var pageCode = regexp.MustCompile(`<div class="code"[^>]*>(\d+)</div>`)
 var pageLink = regexp.MustCompile(`href="https://t\.me/bridge_test_bot\?start=oauth_([^"]+)"`)
 
 type pageRequest struct {
-	id, secret, code string
+	id, secret string
 }
 
 // openPage loads the authorization page like a browser and returns the
@@ -299,28 +298,22 @@ func (h *harness) openApproval(authURL string, userID int64) pageRequest {
 		h.t.Fatalf("continue status=%d body=%s", status, body)
 	}
 	secrets := pageSecrets.FindStringSubmatch(body)
-	code := pageCode.FindStringSubmatch(body)
 	link := pageLink.FindStringSubmatch(body)
-	if secrets == nil || code == nil || link == nil || link[1] != secrets[1] || secrets[1] != requestID {
+	if secrets == nil || link == nil || link[1] != secrets[1] || secrets[1] != requestID {
 		h.t.Fatalf("authorization page is missing request data: %s", body)
 	}
-	return pageRequest{id: secrets[1], secret: secrets[2], code: code[1]}
+	return pageRequest{id: secrets[1], secret: secrets[2]}
 }
 
-// approve opens the authorization page, lets the bot decide with the picked
-// number, and returns the redirect the browser page would follow.
-func (h *harness) approve(authURL string, pick func(correct string) string) string {
+// approve opens the authorization page, lets the bot allow or deny, and
+// returns the redirect the browser page would follow.
+func (h *harness) approve(authURL string, allow bool) string {
 	h.t.Helper()
 	page := h.openApproval(authURL, adminUserID)
-	stored, ok, err := h.store.GetOAuthRequest(context.Background(), page.id)
-	if err != nil || !ok || stored.ApprovalCode != page.code {
-		h.t.Fatalf("stored request does not match page: %+v err=%v", stored, err)
-	}
 	if status := h.status(page.id, page.secret); status["status"] != "pending" {
 		h.t.Fatalf("status before decision = %v", status)
 	}
-	choice := pick(page.code)
-	if _, changed, err := h.store.DecideOAuthRequest(context.Background(), page.id, choice == page.code, adminUserID, h.clock.Now()); err != nil || !changed {
+	if _, changed, err := h.store.DecideOAuthRequest(context.Background(), page.id, allow, adminUserID, h.clock.Now()); err != nil || !changed {
 		h.t.Fatalf("decide changed=%t err=%v", changed, err)
 	}
 	if status := h.status(page.id, "wrong-secret"); status["status"] != "expired" {
@@ -385,8 +378,6 @@ func (h *harness) mcpStatus(token string) (int, string) {
 	return response.StatusCode, response.Header.Get("WWW-Authenticate")
 }
 
-func pickCorrect(correct string) string { return correct }
-
 type emptyAccount struct{}
 
 func (emptyAccount) ListDialogs(context.Context, string, int) ([]monitor.TelegramDialog, error) {
@@ -411,7 +402,7 @@ func TestSDKClientConnectsAfterTelegramApproval(t *testing.T) {
 				}},
 				RedirectURL: testRedirect,
 				AuthorizationCodeFetcher: func(_ context.Context, args *auth.AuthorizationArgs) (*auth.AuthorizationResult, error) {
-					redirect, err := url.Parse(h.approve(args.URL, pickCorrect))
+					redirect, err := url.Parse(h.approve(args.URL, true))
 					if err != nil {
 						return nil, err
 					}
@@ -495,7 +486,7 @@ func TestRegistrationAcceptsOnlyLoopbackAndTrustedCallbacks(t *testing.T) {
 
 func TestAuthorizationCodeIsSingleUseAndBoundToPKCE(t *testing.T) {
 	h := newHarness(t)
-	clientID, verifier, redirect := h.authorizeManually(pickCorrect)
+	clientID, verifier, redirect := h.authorizeManually(true)
 	code := redirect.Query().Get("code")
 	if redirect.Query().Get("state") != "state-1" || code == "" {
 		t.Fatalf("redirect = %s", redirect)
@@ -526,7 +517,7 @@ func TestAuthorizationCodeIsSingleUseAndBoundToPKCE(t *testing.T) {
 
 func TestLogoutCancelsApprovedButUnexchangedCode(t *testing.T) {
 	h := newHarness(t)
-	clientID, verifier, redirect := h.authorizeManually(pickCorrect)
+	clientID, verifier, redirect := h.authorizeManually(true)
 	if err := h.store.RevokeOAuthGrantsForUser(context.Background(), adminUserID, h.clock.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -539,10 +530,9 @@ func TestLogoutCancelsApprovedButUnexchangedCode(t *testing.T) {
 	}
 }
 
-func TestWrongNumberOrDenyRedirectsWithAccessDenied(t *testing.T) {
+func TestDenyRedirectsWithAccessDenied(t *testing.T) {
 	h := newHarness(t)
-	wrong := func(correct string) string { return correct + "0" }
-	_, _, redirect := h.authorizeManually(wrong)
+	_, _, redirect := h.authorizeManually(false)
 	if redirect.Query().Get("error") != "access_denied" || redirect.Query().Get("code") != "" || redirect.Query().Get("state") != "state-1" {
 		t.Fatalf("redirect = %s", redirect)
 	}
@@ -550,7 +540,7 @@ func TestWrongNumberOrDenyRedirectsWithAccessDenied(t *testing.T) {
 
 func TestRefreshRotatesTokensAndRevokeDisconnects(t *testing.T) {
 	h := newHarness(t)
-	clientID, verifier, redirect := h.authorizeManually(pickCorrect)
+	clientID, verifier, redirect := h.authorizeManually(true)
 	_, first := h.tokenRequest(url.Values{"grant_type": {"authorization_code"}, "client_id": {clientID}, "code": {redirect.Query().Get("code")}, "code_verifier": {verifier}})
 	refreshForm := url.Values{"grant_type": {"refresh_token"}, "client_id": {clientID}, "refresh_token": {first["refresh_token"].(string)}}
 	status, second := h.tokenRequest(refreshForm)
@@ -609,7 +599,7 @@ func (h *harness) get(path string) *http.Response {
 	return response
 }
 
-func (h *harness) authorizeManually(pick func(string) string) (string, string, *url.URL) {
+func (h *harness) authorizeManually(allow bool) (string, string, *url.URL) {
 	h.t.Helper()
 	status, registered := h.register(map[string]any{
 		"client_name": "Codex", "redirect_uris": []string{testRedirect}, "token_endpoint_auth_method": "none",
@@ -619,7 +609,7 @@ func (h *harness) authorizeManually(pick func(string) string) (string, string, *
 	}
 	clientID := registered["client_id"].(string)
 	verifier := strings.Repeat("v", 64)
-	redirect, err := url.Parse(h.approve(h.authorizeURL(clientID, verifier), pick))
+	redirect, err := url.Parse(h.approve(h.authorizeURL(clientID, verifier), allow))
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -713,7 +703,7 @@ func TestApprovedRequestMintsOneCodeOnlyBeforeExpiry(t *testing.T) {
 
 func TestReusedRefreshTokenRevokesConnectionAfterGrace(t *testing.T) {
 	h := newHarness(t)
-	clientID, verifier, redirect := h.authorizeManually(pickCorrect)
+	clientID, verifier, redirect := h.authorizeManually(true)
 	_, first := h.tokenRequest(url.Values{"grant_type": {"authorization_code"}, "client_id": {clientID}, "code": {redirect.Query().Get("code")}, "code_verifier": {verifier}})
 	oldRefresh := url.Values{"grant_type": {"refresh_token"}, "client_id": {clientID}, "refresh_token": {first["refresh_token"].(string)}}
 	status, second := h.tokenRequest(oldRefresh)

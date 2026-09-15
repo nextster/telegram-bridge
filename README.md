@@ -187,10 +187,8 @@ Claude Desktop and claude.ai custom connectors use the same URL; their callback
 is allowlisted.
 
 The client opens an authorization page with **Войти через Telegram**. After
-signing in on oauth.telegram.org, the page shows a two-digit number, and the bot
-sends that user the client name, IP address, and browser with four numbers and
-**Отклонить**. Pressing the number from the page approves; any other button
-denies the request.
+signing in on oauth.telegram.org, the bot sends that user the client name, IP
+address, and browser with **Разрешить** and **Отклонить**.
 
 - Signing in binds the request to the Telegram user of the browser that opened
   it. Only that user is asked and can approve, for their own connected account.

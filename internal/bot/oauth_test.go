@@ -87,7 +87,7 @@ func createPendingOAuthRequest(t *testing.T, store *db.Store, id, clientName str
 	}
 	if err := store.CreateOAuthRequest(ctx, db.OAuthRequest{
 		ID: id, BrowserHash: "hash", ClientID: clientID, RedirectURI: "http://127.0.0.1:1/cb",
-		CodeChallenge: strings.Repeat("c", 43), Resource: "https://example/mcp", ApprovalCode: "42",
+		CodeChallenge: strings.Repeat("c", 43), Resource: "https://example/mcp",
 		ClientIP: "203.0.113.7", UserAgent: "Mozilla/5.0 <script>", ExpiresAt: now.Add(time.Minute),
 	}, 10, now); err != nil {
 		t.Fatal(err)
@@ -133,7 +133,7 @@ func TestOAuthStartShowsPromptOnlyToAccountOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 	calls := api.take()
-	if len(calls) != 1 || strings.Contains(calls[0].Body["text"].(string), "42") || calls[0].Body["reply_markup"] != nil {
+	if len(calls) != 1 || calls[0].Body["reply_markup"] != nil {
 		t.Fatalf("a user without a connected account received a prompt: %#v", calls)
 	}
 	if subscribed, _ := store.IsSubscribed(ctx, 222); subscribed {
@@ -154,40 +154,49 @@ func TestOAuthStartShowsPromptOnlyToAccountOwner(t *testing.T) {
 		}
 	}
 	markup, _ := json.Marshal(calls[0].Body["reply_markup"])
-	if !strings.Contains(string(markup), `"oauth:req1:42"`) || !strings.Contains(string(markup), `"oauth:req1:deny"`) || strings.Count(string(markup), `"oauth:req1:`) != 5 {
+	if !strings.Contains(string(markup), `"oauth:req1:allow"`) || !strings.Contains(string(markup), `"oauth:req1:deny"`) || strings.Count(string(markup), `"oauth:req1:`) != 2 {
 		t.Fatalf("markup = %s", markup)
 	}
 }
 
-func TestOAuthCallbackRequiresOwnerAndMatchingNumber(t *testing.T) {
+func TestOAuthCallbackRequiresTheSignedInOwner(t *testing.T) {
 	service, store, api := newOAuthTestService(t)
 	ctx := context.Background()
 
 	createPendingOAuthRequest(t, store, "stranger", "Codex")
-	if err := service.handleUpdate(ctx, oauthCallback(222, 222, "oauth:stranger:42")); err != nil {
+	if err := service.handleUpdate(ctx, oauthCallback(222, 222, "oauth:stranger:allow")); err != nil {
 		t.Fatal(err)
 	}
 	if request, _, _ := store.GetOAuthRequest(ctx, "stranger"); request.Status != db.OAuthRequestPending {
 		t.Fatalf("a user without a connected account changed status to %s", request.Status)
 	}
-	if err := service.handleUpdate(ctx, oauthCallback(testOwnerID, 333, "oauth:stranger:42")); err != nil {
+	if err := service.handleUpdate(ctx, oauthCallback(testOwnerID, 333, "oauth:stranger:allow")); err != nil {
 		t.Fatal(err)
 	}
 	if request, _, _ := store.GetOAuthRequest(ctx, "stranger"); request.Status != db.OAuthRequestPending {
 		t.Fatalf("a press outside the private chat changed status to %s", request.Status)
 	}
 
-	createPendingOAuthRequest(t, store, "wrong", "Codex")
-	if err := service.handleUpdate(ctx, oauthCallback(testOwnerID, testOwnerID, "oauth:wrong:17")); err != nil {
+	// Buttons from an older prompt, such as number choices, decide nothing.
+	createPendingOAuthRequest(t, store, "stale", "Codex")
+	if err := service.handleUpdate(ctx, oauthCallback(testOwnerID, testOwnerID, "oauth:stale:17")); err != nil {
 		t.Fatal(err)
 	}
-	if request, _, _ := store.GetOAuthRequest(ctx, "wrong"); request.Status != db.OAuthRequestDenied {
-		t.Fatalf("wrong number status = %s", request.Status)
+	if request, _, _ := store.GetOAuthRequest(ctx, "stale"); request.Status != db.OAuthRequestPending {
+		t.Fatalf("stale button status = %s", request.Status)
+	}
+
+	createPendingOAuthRequest(t, store, "denied", "Codex")
+	if err := service.handleUpdate(ctx, oauthCallback(testOwnerID, testOwnerID, "oauth:denied:deny")); err != nil {
+		t.Fatal(err)
+	}
+	if request, _, _ := store.GetOAuthRequest(ctx, "denied"); request.Status != db.OAuthRequestDenied {
+		t.Fatalf("deny status = %s", request.Status)
 	}
 
 	createPendingOAuthRequest(t, store, "right", "Codex")
 	api.take()
-	if err := service.handleUpdate(ctx, oauthCallback(testOwnerID, testOwnerID, "oauth:right:42")); err != nil {
+	if err := service.handleUpdate(ctx, oauthCallback(testOwnerID, testOwnerID, "oauth:right:allow")); err != nil {
 		t.Fatal(err)
 	}
 	request, _, _ := store.GetOAuthRequest(ctx, "right")
@@ -229,7 +238,7 @@ func TestOAuthPromptGoesOnlyToTheSignedInUser(t *testing.T) {
 	if len(calls) != 1 || calls[0].Body["reply_markup"] != nil || !strings.Contains(calls[0].Body["text"].(string), "другим аккаунтом") {
 		t.Fatalf("foreign user start = %#v", calls)
 	}
-	if err := service.handleUpdate(ctx, oauthCallback(222, 222, "oauth:req1:42")); err != nil {
+	if err := service.handleUpdate(ctx, oauthCallback(222, 222, "oauth:req1:allow")); err != nil {
 		t.Fatal(err)
 	}
 	if request, _, _ := store.GetOAuthRequest(ctx, "req1"); request.Status != db.OAuthRequestPending {
@@ -242,7 +251,7 @@ func TestNoOAuthApprovalWithoutConnectedAccount(t *testing.T) {
 	service.accounts = &fakeAccounts{connected: map[int64]bool{}}
 	ctx := context.Background()
 	createPendingOAuthRequest(t, store, "orphan", "Codex")
-	if err := service.handleUpdate(ctx, oauthCallback(testOwnerID, testOwnerID, "oauth:orphan:42")); err != nil {
+	if err := service.handleUpdate(ctx, oauthCallback(testOwnerID, testOwnerID, "oauth:orphan:allow")); err != nil {
 		t.Fatal(err)
 	}
 	if request, _, _ := store.GetOAuthRequest(ctx, "orphan"); request.Status != db.OAuthRequestPending {

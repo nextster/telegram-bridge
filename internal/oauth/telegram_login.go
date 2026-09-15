@@ -234,7 +234,6 @@ func (s *Server) authorizeContinue(w http.ResponseWriter, r *http.Request) {
 	}
 	s.renderApproval(w, approvalPage{
 		ClientName:    displayClientName(client.Name),
-		Code:          view.request.ApprovalCode,
 		ApprovalLink:  link,
 		RequestID:     view.request.ID,
 		BrowserSecret: view.secret,
