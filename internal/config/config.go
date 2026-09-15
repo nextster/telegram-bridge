@@ -21,6 +21,9 @@ type Config struct {
 	// OAuthMode "on" enables OAuth for MCP clients; it is off by default.
 	OAuthMode              string
 	OAuthExtraRedirectURIs []string
+	// TelegramLoginSecret is the client secret from the Login Widget settings
+	// of the bot in BotFather. OAuth needs it to bind requests to a user.
+	TelegramLoginSecret string
 
 	BotToken string
 
@@ -40,14 +43,15 @@ func Load() (Config, error) {
 	loadDotenvFiles(".env.local", ".env")
 
 	cfg := Config{
-		Addr:              envFirst("TELEGRAM_BRIDGE_ADDR", "ADDR"),
-		DBPath:            envFirstDefault("TELEGRAM_BRIDGE_DB", "/data/telegram-bridge.db", "DB_PATH", "data/telegram-bridge.db"),
-		SessionPath:       envFirstDefault("TELEGRAM_BRIDGE_SESSION", "/data/telegram.session", "TG_SESSION_PATH", "data/telegram.session"),
-		PublicBaseURL:     strings.TrimRight(envFirst("TELEGRAM_BRIDGE_PUBLIC_URL", "PUBLIC_BASE_URL"), "/"),
-		MCPToken:          envFirst("TELEGRAM_BRIDGE_MCP_TOKEN", "MCP_TOKEN"),
-		NotificationToken: envFirst("TELEGRAM_BRIDGE_NOTIFICATION_TOKEN"),
-		OAuthMode:         strings.ToLower(strings.TrimSpace(envFirst("TELEGRAM_BRIDGE_OAUTH"))),
-		BotToken:          envFirst("TELEGRAM_BOT_TOKEN", "BOT_TOKEN"),
+		Addr:                envFirst("TELEGRAM_BRIDGE_ADDR", "ADDR"),
+		DBPath:              envFirstDefault("TELEGRAM_BRIDGE_DB", "/data/telegram-bridge.db", "DB_PATH", "data/telegram-bridge.db"),
+		SessionPath:         envFirstDefault("TELEGRAM_BRIDGE_SESSION", "/data/telegram.session", "TG_SESSION_PATH", "data/telegram.session"),
+		PublicBaseURL:       strings.TrimRight(envFirst("TELEGRAM_BRIDGE_PUBLIC_URL", "PUBLIC_BASE_URL"), "/"),
+		MCPToken:            envFirst("TELEGRAM_BRIDGE_MCP_TOKEN", "MCP_TOKEN"),
+		NotificationToken:   envFirst("TELEGRAM_BRIDGE_NOTIFICATION_TOKEN"),
+		OAuthMode:           strings.ToLower(strings.TrimSpace(envFirst("TELEGRAM_BRIDGE_OAUTH"))),
+		TelegramLoginSecret: strings.TrimSpace(envFirst("TELEGRAM_LOGIN_CLIENT_SECRET")),
+		BotToken:            envFirst("TELEGRAM_BOT_TOKEN", "BOT_TOKEN"),
 		TelegramAPIHash: envFirst(
 			"TELEGRAM_API_HASH",
 			"TG_API_HASH",
@@ -156,10 +160,21 @@ func (c Config) HasTelegramUserAPI() bool {
 	return c.TelegramAPIID != 0 && strings.TrimSpace(c.TelegramAPIHash) != ""
 }
 
+// TelegramLoginClientID is the bot ID, the client ID of Telegram Login.
+func (c Config) TelegramLoginClientID() string {
+	id, _, _ := strings.Cut(strings.TrimSpace(c.BotToken), ":")
+	if parsed, err := strconv.ParseInt(id, 10, 64); err != nil || parsed <= 0 {
+		return ""
+	}
+	return id
+}
+
 // HasOAuth reports whether MCP clients may authorize through the bot. OAuth
-// is opt-in and needs the bot for approvals and a public URL for redirects.
+// is opt-in and needs the bot for approvals, a public URL for redirects, and
+// Telegram Login to bind each request to the user who opened it.
 func (c Config) HasOAuth() bool {
-	return c.OAuthMode == "on" && c.HasBot() && c.PublicBaseURL != ""
+	return c.OAuthMode == "on" && c.HasBot() && c.PublicBaseURL != "" &&
+		c.TelegramLoginClientID() != "" && c.TelegramLoginSecret != ""
 }
 
 // parseSessionKey accepts 32 bytes encoded as base64 or hex, for example

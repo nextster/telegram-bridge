@@ -196,8 +196,14 @@ func serve(ctx context.Context, cfg config.Config) error {
 	if err != nil {
 		return err
 	}
+	if cfg.OAuthMode == "on" && !cfg.HasOAuth() {
+		log.Print("MCP OAuth disabled: it needs TELEGRAM_BOT_TOKEN, TELEGRAM_BRIDGE_PUBLIC_URL and TELEGRAM_LOGIN_CLIENT_SECRET")
+	}
 	if cfg.HasOAuth() && botService != nil && manager != nil {
-		oauthServer, err := oauth.New(cfg.PublicBaseURL, store, botService, oauth.Options{ExtraRedirectURIs: cfg.OAuthExtraRedirectURIs})
+		oauthServer, err := oauth.New(cfg.PublicBaseURL, store, botService, oauth.Options{
+			ExtraRedirectURIs: cfg.OAuthExtraRedirectURIs,
+			TelegramLogin:     oauth.TelegramLogin{ClientID: cfg.TelegramLoginClientID(), ClientSecret: cfg.TelegramLoginSecret},
+		})
 		if err != nil {
 			log.Printf("MCP OAuth disabled: %v", err)
 		} else {

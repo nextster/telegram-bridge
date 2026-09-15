@@ -166,9 +166,16 @@ credential.
 
 ### OAuth with bot approval
 
-OAuth is opt-in. Enable it with `TELEGRAM_BRIDGE_OAUTH=on` together with the bot
-token and `TELEGRAM_BRIDGE_PUBLIC_URL`. Clients discover it from the `/mcp` 401
-challenge, register dynamically, and use PKCE:
+OAuth is opt-in. It needs `TELEGRAM_BRIDGE_OAUTH=on`, the bot token,
+`TELEGRAM_BRIDGE_PUBLIC_URL`, and Telegram Login for the bot:
+
+1. In @BotFather, open the bot, choose **Login Widget**, and add the allowed
+   URL `https://<your-host>/oauth/telegram/callback`.
+2. Store the client secret it shows as `TELEGRAM_LOGIN_CLIENT_SECRET`, for
+   example with `fly secrets import`. The client ID is the bot ID from the token.
+
+Clients discover OAuth from the `/mcp` 401 challenge, register dynamically, and
+use PKCE:
 
 ```sh
 codex mcp add telegram-bridge --url https://telegram-bridge.fly.dev/mcp
@@ -179,19 +186,19 @@ claude mcp login telegram-bridge
 Claude Desktop and claude.ai custom connectors use the same URL; their callback
 is allowlisted.
 
-The client opens an authorization page with a two-digit number and a
-**Подтвердить в Telegram** button. The button opens the bot, which shows the
-client name, IP address, and browser with four numbers and **Отклонить**.
-Pressing the number from the page approves; any other button denies the
-request.
+The client opens an authorization page with **Войти через Telegram**. After
+signing in on oauth.telegram.org, the page shows a two-digit number, and the bot
+sends that user the client name, IP address, and browser with four numbers and
+**Отклонить**. Pressing the number from the page approves; any other button
+denies the request.
 
-- The bot never sends approval prompts on its own, so nobody can push prompts
-  to a user by opening authorization pages.
-- The connection is granted to whoever confirms it, for their own connected
-  account, in their private chat with the bot. Confirming a request somebody
-  else opened gives that person access to your account, so press only the
-  number shown on your own screen. The bot reports every new connection with
-  its client name and IP address, so an unexpected one can be revoked at once.
+- Signing in binds the request to the Telegram user of the browser that opened
+  it. Only that user is asked and can approve, for their own connected account.
+  A link forwarded to someone else fails in their browser, and the bot warns
+  them instead of showing the prompt, so a user cannot be talked into approving
+  a request somebody else opened.
+- The bot reports every new connection with its client name and IP address, so
+  an unexpected one can be revoked at once.
 - Codes and tokens never pass through Telegram. Only the browser that opened the
   page receives the single authorization code.
 - Redirects are limited to loopback addresses and the Claude connector callback;

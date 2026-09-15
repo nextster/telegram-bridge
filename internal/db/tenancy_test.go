@@ -201,6 +201,9 @@ func TestOAuthGrantsAreListedAndRevokedPerUser(t *testing.T) {
 		if err := store.CreateOAuthRequest(ctx, OAuthRequest{ID: grant.request, BrowserHash: "b", ClientID: "c", RedirectURI: "http://127.0.0.1/cb", CodeChallenge: "x", Resource: "r", ApprovalCode: "42", ExpiresAt: now.Add(time.Minute)}, 10, now); err != nil {
 			t.Fatal(err)
 		}
+		if _, err := store.BindOAuthRequest(ctx, grant.request, grant.user, now); err != nil {
+			t.Fatal(err)
+		}
 		if _, _, err := store.DecideOAuthRequest(ctx, grant.request, true, grant.user, now); err != nil {
 			t.Fatal(err)
 		}

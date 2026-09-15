@@ -92,6 +92,10 @@ func createPendingOAuthRequest(t *testing.T, store *db.Store, id, clientName str
 	}, 10, now); err != nil {
 		t.Fatal(err)
 	}
+	// The browser that opened the request signed in with Telegram as the owner.
+	if _, err := store.BindOAuthRequest(ctx, id, testOwnerID, now); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func startMessage(from, chat int64, text string) telego.Update {
@@ -200,6 +204,36 @@ func TestOAuthCallbackRequiresOwnerAndMatchingNumber(t *testing.T) {
 	}
 	if request, _, _ := store.GetOAuthRequest(ctx, "right"); request.Status != db.OAuthRequestApproved {
 		t.Fatalf("second press changed a decided request to %s", request.Status)
+	}
+}
+
+func TestOAuthPromptGoesOnlyToTheSignedInUser(t *testing.T) {
+	service, store, api := newOAuthTestService(t)
+	service.accounts = &fakeAccounts{connected: map[int64]bool{testOwnerID: true, 222: true}}
+	ctx := context.Background()
+	createPendingOAuthRequest(t, store, "req1", "Codex")
+
+	if err := service.OAuthApprovalRequested(ctx, testOwnerID, "req1"); err != nil {
+		t.Fatal(err)
+	}
+	calls := api.take()
+	if len(calls) != 1 || calls[0].Body["chat_id"] != float64(testOwnerID) || calls[0].Body["reply_markup"] == nil {
+		t.Fatalf("prompt for the signed-in user = %#v", calls)
+	}
+
+	// Another connected user who got the link cannot see or answer the prompt.
+	if err := service.handleUpdate(ctx, startMessage(222, 222, "/start oauth_req1")); err != nil {
+		t.Fatal(err)
+	}
+	calls = api.take()
+	if len(calls) != 1 || calls[0].Body["reply_markup"] != nil || !strings.Contains(calls[0].Body["text"].(string), "другим аккаунтом") {
+		t.Fatalf("foreign user start = %#v", calls)
+	}
+	if err := service.handleUpdate(ctx, oauthCallback(222, 222, "oauth:req1:42")); err != nil {
+		t.Fatal(err)
+	}
+	if request, _, _ := store.GetOAuthRequest(ctx, "req1"); request.Status != db.OAuthRequestPending {
+		t.Fatalf("a foreign press changed status to %s", request.Status)
 	}
 }
 

@@ -146,6 +146,9 @@ func (s *Store) pingAndMigrate(ctx context.Context) error {
 	if err := s.migrateLegacyTenancy(ctx); err != nil {
 		return err
 	}
+	if err := s.migrateOAuthRequests(ctx); err != nil {
+		return err
+	}
 	for _, statements := range [][]string{schema, oauthSchema, tenancySchema} {
 		for _, stmt := range statements {
 			if _, err := s.db.ExecContext(ctx, stmt); err != nil {

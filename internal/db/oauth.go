@@ -58,6 +58,9 @@ type OAuthRequest struct {
 	ClientIP      string
 	UserAgent     string
 	Status        string
+	// BoundUserID is the Telegram user who signed in with Telegram in the
+	// browser that opened the request. Only that user can approve it.
+	BoundUserID   int64
 	DecidedBy     int64
 	CodeHash      string
 	CodeExpiresAt time.Time
@@ -102,6 +105,10 @@ var oauthSchema = []string{
 		client_ip TEXT NOT NULL DEFAULT '',
 		user_agent TEXT NOT NULL DEFAULT '',
 		status TEXT NOT NULL CHECK(status IN ('pending','approved','denied','exchanged')),
+		bound_user_id INTEGER NOT NULL DEFAULT 0,
+		login_state_hash TEXT NOT NULL DEFAULT '',
+		login_nonce TEXT NOT NULL DEFAULT '',
+		login_verifier TEXT NOT NULL DEFAULT '',
 		decided_by INTEGER NOT NULL DEFAULT 0,
 		code_hash TEXT NOT NULL DEFAULT '',
 		code_expires_at INTEGER NOT NULL DEFAULT 0,
@@ -127,6 +134,28 @@ var oauthSchema = []string{
 		used_at INTEGER NOT NULL DEFAULT 0
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_oauth_tokens_grant ON oauth_tokens(grant_id)`,
+}
+
+// migrateOAuthRequests drops an oauth_requests table created before requests
+// were bound to a Telegram user. Requests expire within minutes, so nothing of
+// value is lost.
+func (s *Store) migrateOAuthRequests(ctx context.Context) error {
+	var bound int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('oauth_requests') WHERE name = 'bound_user_id'`).Scan(&bound)
+	if err != nil {
+		return fmt.Errorf("inspect oauth requests: %w", err)
+	}
+	var exists int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'oauth_requests'`).Scan(&exists); err != nil {
+		return fmt.Errorf("inspect oauth requests: %w", err)
+	}
+	if exists == 0 || bound == 1 {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `DROP TABLE oauth_requests`); err != nil {
+		return fmt.Errorf("drop old oauth requests: %w", err)
+	}
+	return nil
 }
 
 // CreateOAuthClient stores a dynamically registered client. maxClients bounds
@@ -220,7 +249,8 @@ func (s *Store) GetOAuthRequestByCode(ctx context.Context, codeHash string) (OAu
 }
 
 // DecideOAuthRequest records the approving user's decision. It changes only a
-// pending, unexpired request and reports whether that happened.
+// pending, unexpired request bound to that user and reports whether that
+// happened.
 func (s *Store) DecideOAuthRequest(ctx context.Context, id string, approve bool, userID int64, now time.Time) (OAuthRequest, bool, error) {
 	status := OAuthRequestDenied
 	if approve {
@@ -228,8 +258,8 @@ func (s *Store) DecideOAuthRequest(ctx context.Context, id string, approve bool,
 	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE oauth_requests SET status = ?, decided_by = ?
-		WHERE id = ? AND status = 'pending' AND expires_at > ?
-	`, status, userID, id, now.Unix())
+		WHERE id = ? AND status = 'pending' AND expires_at > ? AND bound_user_id = ? AND bound_user_id > 0
+	`, status, userID, id, now.Unix(), userID)
 	if err != nil {
 		return OAuthRequest{}, false, fmt.Errorf("decide oauth request: %w", err)
 	}
@@ -242,6 +272,64 @@ func (s *Store) DecideOAuthRequest(ctx context.Context, id string, approve bool,
 		return OAuthRequest{}, false, err
 	}
 	return request, changed == 1, nil
+}
+
+// StartOAuthTelegramLogin stores the state, nonce, and PKCE verifier of a
+// Telegram sign-in for a pending request, replacing an earlier attempt.
+func (s *Store) StartOAuthTelegramLogin(ctx context.Context, id, stateHash, nonce, verifier string, now time.Time) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE oauth_requests SET login_state_hash = ?, login_nonce = ?, login_verifier = ?
+		WHERE id = ? AND status = 'pending' AND expires_at > ?
+	`, stateHash, nonce, verifier, id, now.Unix())
+	if err != nil {
+		return false, fmt.Errorf("start oauth telegram login: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	return changed == 1, err
+}
+
+// FinishOAuthTelegramLogin consumes the sign-in state of a pending request
+// once and returns its nonce and PKCE verifier.
+func (s *Store) FinishOAuthTelegramLogin(ctx context.Context, id, stateHash string, now time.Time) (string, string, bool, error) {
+	var nonce, verifier string
+	var ok bool
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		err := tx.QueryRowContext(ctx, `
+			SELECT login_nonce, login_verifier FROM oauth_requests
+			WHERE id = ? AND login_state_hash = ? AND login_state_hash != '' AND status = 'pending' AND expires_at > ?
+		`, id, stateHash, now.Unix()).Scan(&nonce, &verifier)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("find oauth telegram login: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE oauth_requests SET login_state_hash = '', login_nonce = '', login_verifier = '' WHERE id = ?
+		`, id); err != nil {
+			return fmt.Errorf("finish oauth telegram login: %w", err)
+		}
+		ok = true
+		return nil
+	})
+	return nonce, verifier, ok, err
+}
+
+// BindOAuthRequest records the Telegram user who signed in for a pending
+// request. Signing in again from the same browser replaces the user.
+func (s *Store) BindOAuthRequest(ctx context.Context, id string, userID int64, now time.Time) (bool, error) {
+	if userID <= 0 {
+		return false, errors.New("bound user is required")
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE oauth_requests SET bound_user_id = ?
+		WHERE id = ? AND status = 'pending' AND expires_at > ?
+	`, userID, id, now.Unix())
+	if err != nil {
+		return false, fmt.Errorf("bind oauth request: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	return changed == 1, err
 }
 
 // IssueOAuthCode attaches the authorization code to an approved request. It
@@ -432,14 +520,14 @@ func (s *Store) RevokeOAuthToken(ctx context.Context, tokenHash, clientID string
 
 const oauthRequestSelect = `
 	SELECT id, browser_hash, client_id, redirect_uri, state, code_challenge, resource, approval_code, client_ip, user_agent, status,
-		decided_by, code_hash, code_expires_at, created_at, expires_at
+		bound_user_id, decided_by, code_hash, code_expires_at, created_at, expires_at
 	FROM oauth_requests`
 
 func scanOAuthRequest(row *sql.Row) (OAuthRequest, bool, error) {
 	var request OAuthRequest
 	var codeExpiresAt, createdAt, expiresAt int64
 	err := row.Scan(&request.ID, &request.BrowserHash, &request.ClientID, &request.RedirectURI, &request.State,
-		&request.CodeChallenge, &request.Resource, &request.ApprovalCode, &request.ClientIP, &request.UserAgent, &request.Status, &request.DecidedBy,
+		&request.CodeChallenge, &request.Resource, &request.ApprovalCode, &request.ClientIP, &request.UserAgent, &request.Status, &request.BoundUserID, &request.DecidedBy,
 		&request.CodeHash, &codeExpiresAt, &createdAt, &expiresAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return OAuthRequest{}, false, nil

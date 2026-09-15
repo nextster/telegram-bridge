@@ -9,6 +9,8 @@ import (
 
 type approvalPage struct {
 	ClientName    string
+	SignInLink    string
+	SignedIn      bool
 	Code          string
 	ApprovalLink  string
 	RequestID     string
@@ -88,17 +90,20 @@ const pageTemplate = `<!doctype html>
   {{if .Error}}
     <h1>Подключение не удалось</h1>
     <p class="status bad">{{.Error}}</p>
+  {{else if .SignInLink}}
+    <h1>Подключение к Telegram Bridge</h1>
+    <p><b>{{.ClientName}}</b> запрашивает доступ к вашему Telegram через MCP.</p>
+    <p>Сначала войдите через Telegram в этом браузере. Доступ получит только аккаунт, под которым вы войдёте, и только после подтверждения в боте.</p>
+    <a class="button" href="{{.SignInLink}}">Войти через Telegram</a>
+    <p class="muted">Если эту ссылку вам прислал кто-то другой, закройте страницу: так пытаются получить доступ к чужой переписке.</p>
   {{else}}
     <h1>Подключение к Telegram Bridge</h1>
     <p><b>{{.ClientName}}</b> запрашивает доступ к вашему Telegram через MCP.</p>
-    <ol>
-      <li>Откройте бота и нажмите «Запустить», если Telegram попросит.</li>
-      <li>Выберите в боте это число:</li>
-    </ol>
+    <p>Бот прислал вам запрос. Выберите в нём это число:</p>
     <div class="code" aria-label="Код подтверждения">{{.Code}}</div>
-    <a class="button" href="{{.ApprovalLink}}" target="_blank" rel="noopener noreferrer">Подтвердить в Telegram</a>
+    <a class="button" href="{{.ApprovalLink}}" target="_blank" rel="noopener noreferrer">Открыть бота</a>
     <p id="status" class="status" role="status">Ждём подтверждения в Telegram…</p>
-    <p class="muted">Доступ получит тот аккаунт Telegram, который подтвердит запрос в боте. Если вы не запускали подключение сами, закройте страницу.</p>
+    <p class="muted">Если сообщение от бота не пришло, откройте бота кнопкой выше. Сначала подключите в нём свой Telegram командой /login.</p>
     <script nonce="{{.Nonce}}">
       (() => {
         const status = document.getElementById('status');

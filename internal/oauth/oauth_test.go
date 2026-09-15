@@ -2,20 +2,27 @@ package oauth_test
 
 import (
 	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/go-jose/go-jose/v4"
 	"github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/modelcontextprotocol/go-sdk/oauthex"
@@ -27,8 +34,10 @@ import (
 )
 
 const (
-	testRedirect = "http://127.0.0.1:43123/callback"
-	adminUserID  = 4242
+	testRedirect    = "http://127.0.0.1:43123/callback"
+	adminUserID     = 4242
+	testBotID       = "123456"
+	testLoginSecret = "login-secret"
 )
 
 type fakeApprover struct {
@@ -36,6 +45,65 @@ type fakeApprover struct {
 	requests []string
 	revoked  []string
 	created  []int64
+	prompted []string
+}
+
+func (f *fakeApprover) OAuthApprovalRequested(_ context.Context, userID int64, requestID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.prompted = append(f.prompted, fmt.Sprintf("%d:%s", userID, requestID))
+	return nil
+}
+
+// fakeTelegramLogin is the token endpoint of Telegram Login. Codes are handed
+// out by the harness in place of the user's consent on oauth.telegram.org.
+type fakeTelegramLogin struct {
+	mu     sync.Mutex
+	key    *rsa.PrivateKey
+	codes  map[string]fakeLoginCode
+	mutate func(claims map[string]any)
+}
+
+type fakeLoginCode struct {
+	userID                        int64
+	nonce, challenge, redirectURI string
+}
+
+func (f *fakeTelegramLogin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	user, password, ok := r.BasicAuth()
+	if !ok || user != testBotID || password != testLoginSecret || r.ParseForm() != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	f.mu.Lock()
+	entry, found := f.codes[r.PostForm.Get("code")]
+	delete(f.codes, r.PostForm.Get("code"))
+	mutate := f.mutate
+	f.mu.Unlock()
+	sum := sha256.Sum256([]byte(r.PostForm.Get("code_verifier")))
+	if !found || entry.redirectURI != r.PostForm.Get("redirect_uri") || base64.RawURLEncoding.EncodeToString(sum[:]) != entry.challenge {
+		http.Error(w, "invalid_grant", http.StatusBadRequest)
+		return
+	}
+	now := time.Now()
+	claims := map[string]any{
+		"iss": "https://oauth.telegram.org", "aud": testBotID, "sub": "1234123412341234123",
+		"iat": now.Unix(), "exp": now.Add(time.Hour).Unix(), "nonce": entry.nonce, "id": entry.userID,
+	}
+	if mutate != nil {
+		mutate(claims)
+	}
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.RS256, Key: f.key}, nil)
+	if err != nil {
+		panic(err)
+	}
+	payload, _ := json.Marshal(claims)
+	object, err := signer.Sign(payload)
+	if err != nil {
+		panic(err)
+	}
+	token, _ := object.CompactSerialize()
+	_ = json.NewEncoder(w).Encode(map[string]string{"access_token": "telegram-access", "token_type": "Bearer", "id_token": token})
 }
 
 func (f *fakeApprover) OAuthApprovalLink(_ context.Context, requestID string) (string, error) {
@@ -80,6 +148,7 @@ type harness struct {
 	t        *testing.T
 	store    *db.Store
 	approver *fakeApprover
+	login    *fakeTelegramLogin
 	clock    *clock
 	server   *httptest.Server
 	oauth    *oauth.Server
@@ -97,7 +166,19 @@ func newHarness(t *testing.T) *harness {
 	var handler http.Handler
 	h.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handler.ServeHTTP(w, r) }))
 	t.Cleanup(h.server.Close)
-	h.oauth, err = oauth.New(h.server.URL, store, h.approver, oauth.Options{Now: h.clock.Now})
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.login = &fakeTelegramLogin{key: key, codes: map[string]fakeLoginCode{}}
+	loginServer := httptest.NewServer(h.login)
+	t.Cleanup(loginServer.Close)
+	h.oauth, err = oauth.New(h.server.URL, store, h.approver, oauth.Options{Now: h.clock.Now, TelegramLogin: oauth.TelegramLogin{
+		ClientID:     testBotID,
+		ClientSecret: testLoginSecret,
+		TokenURL:     loginServer.URL,
+		KeySet:       &oidc.StaticKeySet{PublicKeys: []crypto.PublicKey{&key.PublicKey}},
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,11 +207,18 @@ func newHarness(t *testing.T) *harness {
 		ResourceMetadataURL: h.oauth.ResourceMetadataURL(),
 	}))
 	handler = mux
-	h.client = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	h.client = newBrowser()
 	return h
 }
 
+// newBrowser is a browser with its own cookies that does not follow redirects.
+func newBrowser() *http.Client {
+	jar, _ := cookiejar.New(nil)
+	return &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+}
+
 var pageSecrets = regexp.MustCompile(`JSON\.stringify\(\{request: "([^"]+)", secret: "([^"]+)"\}\)`)
+var pageSignIn = regexp.MustCompile(`href="/oauth/telegram/start\?request=([^"]+)"`)
 var pageCode = regexp.MustCompile(`<div class="code"[^>]*>(\d+)</div>`)
 var pageLink = regexp.MustCompile(`href="https://t\.me/bridge_test_bot\?start=oauth_([^"]+)"`)
 
@@ -138,8 +226,9 @@ type pageRequest struct {
 	id, secret, code string
 }
 
-// openPage loads the authorization page like a browser.
-func (h *harness) openPage(authURL string) pageRequest {
+// openPage loads the authorization page like a browser and returns the
+// request ID from its sign-in link.
+func (h *harness) openPage(authURL string) string {
 	h.t.Helper()
 	response, err := h.client.Get(authURL)
 	if err != nil {
@@ -147,13 +236,72 @@ func (h *harness) openPage(authURL string) pageRequest {
 	}
 	body, _ := io.ReadAll(response.Body)
 	response.Body.Close()
-	if response.StatusCode != http.StatusOK {
+	signIn := pageSignIn.FindStringSubmatch(string(body))
+	if response.StatusCode != http.StatusOK || signIn == nil || strings.Contains(string(body), "t.me/") {
 		h.t.Fatalf("authorize status=%d body=%s", response.StatusCode, body)
 	}
-	secrets := pageSecrets.FindStringSubmatch(string(body))
-	code := pageCode.FindStringSubmatch(string(body))
-	link := pageLink.FindStringSubmatch(string(body))
-	if secrets == nil || code == nil || link == nil || link[1] != secrets[1] {
+	return signIn[1]
+}
+
+// browse sends a GET from browser and returns the status, Location, and body.
+func (h *harness) browse(browser *http.Client, target string) (int, string, string) {
+	h.t.Helper()
+	if strings.HasPrefix(target, "/") {
+		target = h.server.URL + target
+	}
+	response, err := browser.Get(target)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	return response.StatusCode, response.Header.Get("Location"), string(body)
+}
+
+// startSignIn follows the sign-in link to Telegram and returns the callback
+// URL Telegram would redirect to after userID consents.
+func (h *harness) startSignIn(browser *http.Client, requestID string, userID int64) (string, int, string) {
+	h.t.Helper()
+	status, location, body := h.browse(browser, "/oauth/telegram/start?request="+requestID)
+	if status != http.StatusFound {
+		return "", status, body
+	}
+	telegram, err := url.Parse(location)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	query := telegram.Query()
+	if query.Get("client_id") != testBotID || query.Get("scope") != "openid profile" || query.Get("code_challenge_method") != "S256" {
+		h.t.Fatalf("telegram authorization URL = %s", location)
+	}
+	code := "code-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	h.login.mu.Lock()
+	h.login.codes[code] = fakeLoginCode{userID: userID, nonce: query.Get("nonce"), challenge: query.Get("code_challenge"), redirectURI: query.Get("redirect_uri")}
+	h.login.mu.Unlock()
+	return query.Get("redirect_uri") + "?" + url.Values{"code": {code}, "state": {query.Get("state")}}.Encode(), status, body
+}
+
+// openApproval opens the authorization page, signs in with Telegram as
+// userID, and returns the approval step.
+func (h *harness) openApproval(authURL string, userID int64) pageRequest {
+	h.t.Helper()
+	requestID := h.openPage(authURL)
+	callback, status, body := h.startSignIn(h.client, requestID, userID)
+	if callback == "" {
+		h.t.Fatalf("sign-in start status=%d body=%s", status, body)
+	}
+	status, location, body := h.browse(h.client, callback)
+	if status != http.StatusSeeOther || !strings.HasPrefix(location, "/oauth/authorize/continue?") {
+		h.t.Fatalf("callback status=%d location=%q body=%s", status, location, body)
+	}
+	status, _, body = h.browse(h.client, location)
+	if status != http.StatusOK {
+		h.t.Fatalf("continue status=%d body=%s", status, body)
+	}
+	secrets := pageSecrets.FindStringSubmatch(body)
+	code := pageCode.FindStringSubmatch(body)
+	link := pageLink.FindStringSubmatch(body)
+	if secrets == nil || code == nil || link == nil || link[1] != secrets[1] || secrets[1] != requestID {
 		h.t.Fatalf("authorization page is missing request data: %s", body)
 	}
 	return pageRequest{id: secrets[1], secret: secrets[2], code: code[1]}
@@ -163,7 +311,7 @@ func (h *harness) openPage(authURL string) pageRequest {
 // number, and returns the redirect the browser page would follow.
 func (h *harness) approve(authURL string, pick func(correct string) string) string {
 	h.t.Helper()
-	page := h.openPage(authURL)
+	page := h.openApproval(authURL, adminUserID)
 	stored, ok, err := h.store.GetOAuthRequest(context.Background(), page.id)
 	if err != nil || !ok || stored.ApprovalCode != page.code {
 		h.t.Fatalf("stored request does not match page: %+v err=%v", stored, err)
@@ -542,7 +690,7 @@ func TestApprovedRequestMintsOneCodeOnlyBeforeExpiry(t *testing.T) {
 	h := newHarness(t)
 	clientID := h.registerPublicClient()
 
-	page := h.openPage(h.authorizeURL(clientID, strings.Repeat("v", 64)))
+	page := h.openApproval(h.authorizeURL(clientID, strings.Repeat("v", 64)), adminUserID)
 	if _, changed, err := h.store.DecideOAuthRequest(context.Background(), page.id, true, adminUserID, h.clock.Now()); err != nil || !changed {
 		t.Fatalf("decide changed=%t err=%v", changed, err)
 	}
@@ -553,7 +701,7 @@ func TestApprovedRequestMintsOneCodeOnlyBeforeExpiry(t *testing.T) {
 		t.Fatalf("second status minted another code: %v", status)
 	}
 
-	late := h.openPage(h.authorizeURL(clientID, strings.Repeat("v", 64)))
+	late := h.openApproval(h.authorizeURL(clientID, strings.Repeat("v", 64)), adminUserID)
 	if _, changed, err := h.store.DecideOAuthRequest(context.Background(), late.id, true, adminUserID, h.clock.Now()); err != nil || !changed {
 		t.Fatalf("decide changed=%t err=%v", changed, err)
 	}
@@ -593,5 +741,102 @@ func TestReusedRefreshTokenRevokesConnectionAfterGrace(t *testing.T) {
 	}
 	if len(h.approver.revoked) != 1 || h.approver.revoked[0] != "Codex" {
 		t.Fatalf("owner alerts = %v", h.approver.revoked)
+	}
+}
+
+func TestSignInBindsTheRequestToTheBrowserThatOpenedIt(t *testing.T) {
+	h := newHarness(t)
+	clientID := h.registerPublicClient()
+	verifier := strings.Repeat("v", 64)
+	requestID := h.openPage(h.authorizeURL(clientID, verifier))
+
+	// A link forwarded to another browser cannot sign in or finish a sign-in.
+	stranger := newBrowser()
+	if status, _, body := h.browse(stranger, "/oauth/telegram/start?request="+requestID); status != http.StatusBadRequest || !strings.Contains(body, "не в том браузере") {
+		t.Fatalf("foreign browser start status=%d body=%s", status, body)
+	}
+	serverURL, _ := url.Parse(h.server.URL + "/oauth/")
+	forged := newBrowser()
+	forged.Jar.SetCookies(serverURL, []*http.Cookie{{Name: "tb_oauth_" + requestID, Value: "forged", Path: "/oauth/"}})
+	if status, _, _ := h.browse(forged, "/oauth/telegram/start?request="+requestID); status != http.StatusBadRequest {
+		t.Fatalf("forged browser cookie start status = %d", status)
+	}
+	callback, _, _ := h.startSignIn(h.client, requestID, 777)
+	for _, browser := range []*http.Client{stranger, forged} {
+		if status, _, _ := h.browse(browser, callback); status != http.StatusBadRequest {
+			t.Fatalf("foreign browser callback status = %d", status)
+		}
+	}
+	if request, _, _ := h.store.GetOAuthRequest(context.Background(), requestID); request.BoundUserID != 0 {
+		t.Fatalf("request bound through another browser: %+v", request)
+	}
+
+	// The owner of the browser signs in as 777; only 777 is asked and can decide.
+	status, location, _ := h.browse(h.client, callback)
+	if status != http.StatusSeeOther {
+		t.Fatalf("callback status = %d", status)
+	}
+	if status, _, _ := h.browse(h.client, callback); status != http.StatusBadRequest {
+		t.Fatalf("replayed callback status = %d", status)
+	}
+	h.approver.mu.Lock()
+	prompted := append([]string(nil), h.approver.prompted...)
+	h.approver.mu.Unlock()
+	if len(prompted) != 1 || prompted[0] != "777:"+requestID {
+		t.Fatalf("prompts = %v", prompted)
+	}
+	_, _, body := h.browse(h.client, location)
+	secrets := pageSecrets.FindStringSubmatch(body)
+	if secrets == nil {
+		t.Fatalf("continue page = %s", body)
+	}
+	if status, _, _ := h.browse(stranger, location); status != http.StatusBadRequest {
+		t.Fatalf("foreign browser continue status = %d", status)
+	}
+	if _, changed, err := h.store.DecideOAuthRequest(context.Background(), requestID, true, adminUserID, h.clock.Now()); err != nil || changed {
+		t.Fatalf("another user decided the request: changed=%t err=%v", changed, err)
+	}
+	if _, changed, err := h.store.DecideOAuthRequest(context.Background(), requestID, true, 777, h.clock.Now()); err != nil || !changed {
+		t.Fatalf("signed-in user could not decide: changed=%t err=%v", changed, err)
+	}
+	redirect, err := url.Parse(h.status(requestID, secrets[2])["redirect"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{"grant_type": {"authorization_code"}, "client_id": {clientID}, "code": {redirect.Query().Get("code")}, "redirect_uri": {testRedirect}, "code_verifier": {verifier}}
+	if status, body := h.tokenRequest(form); status != http.StatusOK {
+		t.Fatalf("exchange status=%d body=%v", status, body)
+	}
+	if grants, err := h.store.ListOAuthGrants(context.Background(), 777); err != nil || len(grants) != 1 {
+		t.Fatalf("grants for the signed-in user = %v err=%v", grants, err)
+	}
+	if grants, _ := h.store.ListOAuthGrants(context.Background(), adminUserID); len(grants) != 0 {
+		t.Fatalf("grant went to another user: %v", grants)
+	}
+}
+
+func TestSignInRejectsInvalidIDTokens(t *testing.T) {
+	for name, mutate := range map[string]func(map[string]any){
+		"wrong nonce":    func(claims map[string]any) { claims["nonce"] = "other" },
+		"wrong audience": func(claims map[string]any) { claims["aud"] = "999" },
+		"wrong issuer":   func(claims map[string]any) { claims["iss"] = "https://attacker.example" },
+		"expired":        func(claims map[string]any) { claims["exp"] = time.Now().Add(-time.Minute).Unix() },
+		"no user id":     func(claims map[string]any) { delete(claims, "id") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t)
+			h.login.mutate = mutate
+			requestID := h.openPage(h.authorizeURL(h.registerPublicClient(), strings.Repeat("v", 64)))
+			callback, _, _ := h.startSignIn(h.client, requestID, 777)
+			if status, _, _ := h.browse(h.client, callback); status != http.StatusBadGateway {
+				t.Fatalf("callback status = %d", status)
+			}
+			if request, _, _ := h.store.GetOAuthRequest(context.Background(), requestID); request.BoundUserID != 0 {
+				t.Fatalf("request bound with an invalid token: %+v", request)
+			}
+			if len(h.approver.prompted) != 0 {
+				t.Fatalf("prompt sent for an invalid token: %v", h.approver.prompted)
+			}
+		})
 	}
 }

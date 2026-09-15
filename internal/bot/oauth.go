@@ -48,8 +48,8 @@ func (s *Service) botUsername(ctx context.Context) (string, error) {
 	return me.Username, nil
 }
 
-// OAuthApprovalLink returns a deep link that makes the owner's Telegram client
-// send /start oauth_<request>. The bot never pushes approval prompts itself.
+// OAuthApprovalLink returns a deep link that makes the user's Telegram client
+// send /start oauth_<request>, in case the pushed prompt did not arrive.
 func (s *Service) OAuthApprovalLink(ctx context.Context, requestID string) (string, error) {
 	username, err := s.botUsername(ctx)
 	if err != nil {
@@ -87,21 +87,39 @@ func (s *Service) canApproveOAuth(ctx context.Context, chatID, userID int64) (bo
 	return s.connected(ctx, userID)
 }
 
+const oauthForeignRequestText = "⚠️ Этот запрос на подключение открыт под другим аккаунтом Telegram. Если ссылку вам кто-то прислал, он пытается получить доступ к вашей переписке. Ничего не подтверждайте."
+
+// OAuthApprovalRequested sends the approval prompt to the user who signed in
+// with Telegram for the request.
+func (s *Service) OAuthApprovalRequested(ctx context.Context, userID int64, requestID string) error {
+	return s.sendOAuthPrompt(ctx, userID, requestID)
+}
+
 func (s *Service) handleOAuthStart(ctx context.Context, message *telego.Message, requestID string) error {
-	userID, _ := privateSender(message)
-	allowed, err := s.canApproveOAuth(ctx, message.Chat.ID, userID)
+	userID, private := privateSender(message)
+	if !private {
+		return s.reply(ctx, message.Chat.ID, "Подтверждать подключения можно только в личном чате с ботом.", nil)
+	}
+	return s.sendOAuthPrompt(ctx, userID, requestID)
+}
+
+func (s *Service) sendOAuthPrompt(ctx context.Context, userID int64, requestID string) error {
+	allowed, err := s.canApproveOAuth(ctx, userID, userID)
 	if err != nil {
 		return err
 	}
 	if !allowed {
-		return s.reply(ctx, message.Chat.ID, "Сначала подключите свой Telegram: /login. Доступ получит только ваш аккаунт.", nil)
+		return s.reply(ctx, userID, "Сначала подключите свой Telegram: /login. Доступ получит только ваш аккаунт.", nil)
 	}
 	request, found, err := s.store.GetOAuthRequest(ctx, requestID)
 	if err != nil {
 		return err
 	}
 	if !found || request.Status != "pending" || !time.Now().Before(request.ExpiresAt) {
-		return s.reply(ctx, message.Chat.ID, "Запрос на подключение устарел. Запустите подключение заново.", nil)
+		return s.reply(ctx, userID, "Запрос на подключение устарел. Запустите подключение заново.", nil)
+	}
+	if request.BoundUserID != userID {
+		return s.reply(ctx, userID, oauthForeignRequestText, nil)
 	}
 	clientName := "MCP-клиент"
 	if client, ok, err := s.store.GetOAuthClient(ctx, request.ClientID); err == nil && ok && client.Name != "" {
@@ -119,9 +137,9 @@ func (s *Service) handleOAuthStart(ctx context.Context, message *telego.Message,
 		tu.InlineKeyboardRow(numbers...),
 		tu.InlineKeyboardRow(tu.InlineKeyboardButton("Отклонить").WithCallbackData(oauthCallbackPrefix+request.ID+":"+oauthDenyChoice)),
 	)
-	text := fmt.Sprintf("🔐 <b>Доступ к вашему Telegram через MCP</b>\n\nКлиент: %s (название задаёт сам клиент)\nIP: %s\nБраузер: %s\n\nДоступ получит тот, кто открыл страницу подключения. Нажмите число, только если открыли её сами. Если число вам прислал кто-то другой, нажмите «Отклонить»: иначе он получит доступ к вашей переписке.",
+	text := fmt.Sprintf("🔐 <b>Доступ к вашему Telegram через MCP</b>\n\nКлиент: %s (название задаёт сам клиент)\nIP: %s\nБраузер: %s\n\nВы вошли через Telegram на странице подключения. Нажмите число с этой страницы. Если подключение запускали не вы, нажмите «Отклонить».",
 		codeHTML(clientName), codeHTML(request.ClientIP), codeHTML(request.UserAgent))
-	return s.sendHTML(ctx, message.Chat.ID, text, markup)
+	return s.sendHTML(ctx, userID, text, markup)
 }
 
 func (s *Service) handleOAuthCallback(ctx context.Context, query *telego.CallbackQuery, userID int64, payload string) error {
@@ -144,6 +162,10 @@ func (s *Service) handleOAuthCallback(ctx context.Context, query *telego.Callbac
 	if !found {
 		s.finishOAuthPrompt(ctx, query, "⌛ Запрос на подключение устарел.")
 		return s.answerCallback(ctx, query.ID, "Запрос устарел.")
+	}
+	if request.BoundUserID != userID {
+		s.finishOAuthPrompt(ctx, query, oauthForeignRequestText)
+		return s.answerCallback(ctx, query.ID, "Запрос открыт под другим аккаунтом.")
 	}
 	approve := choice != oauthDenyChoice && subtle.ConstantTimeCompare([]byte(choice), []byte(request.ApprovalCode)) == 1
 	_, changed, err := s.store.DecideOAuthRequest(ctx, request.ID, approve, userID, time.Now())

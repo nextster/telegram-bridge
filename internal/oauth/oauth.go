@@ -1,10 +1,11 @@
 // Package oauth implements the OAuth 2.1 authorization server that lets MCP
 // clients such as Claude and Codex connect without a shared bearer token.
 //
-// The owner of the connected Telegram account approves every authorization.
-// The authorization page links to the bot, and the bot asks the owner to pick
-// the number shown on that page. The bot never sends unsolicited prompts, and
-// codes and tokens never pass through Telegram; only SHA-256 hashes are stored.
+// A request is first bound to the Telegram user who signs in with Telegram in
+// the browser that opened it, so nobody can talk another user into approving a
+// request they opened themselves. The bot then asks that user, and only that
+// user, to pick the number shown on the page. Codes and tokens never pass
+// through Telegram; only SHA-256 hashes of them are stored.
 package oauth
 
 import (
@@ -75,6 +76,9 @@ type Store interface {
 	CreateOAuthRequest(context.Context, db.OAuthRequest, int, time.Time) error
 	GetOAuthRequest(context.Context, string) (db.OAuthRequest, bool, error)
 	GetOAuthRequestByCode(context.Context, string) (db.OAuthRequest, bool, error)
+	StartOAuthTelegramLogin(context.Context, string, string, string, string, time.Time) (bool, error)
+	FinishOAuthTelegramLogin(context.Context, string, string, time.Time) (string, string, bool, error)
+	BindOAuthRequest(context.Context, string, int64, time.Time) (bool, error)
 	IssueOAuthCode(context.Context, string, string, time.Time, time.Time) (bool, error)
 	ExchangeOAuthCode(context.Context, string, string, db.OAuthGrant, []db.OAuthToken, time.Time) error
 	RefreshOAuthTokens(context.Context, string, string, []db.OAuthToken, db.OAuthRefreshPolicy, time.Time) (db.OAuthGrant, error)
@@ -87,6 +91,9 @@ type Approver interface {
 	// OAuthApprovalLink returns a link that opens the approval prompt for the
 	// request in the bot.
 	OAuthApprovalLink(ctx context.Context, requestID string) (string, error)
+	// OAuthApprovalRequested sends the approval prompt of a request to the
+	// user it is bound to.
+	OAuthApprovalRequested(ctx context.Context, userID int64, requestID string) error
 	// OAuthConnectionRevoked tells the user that one of their connections was
 	// cut off.
 	OAuthConnectionRevoked(ctx context.Context, userID int64, clientName, reason string) error
@@ -97,6 +104,7 @@ type Approver interface {
 
 type Options struct {
 	ExtraRedirectURIs []string
+	TelegramLogin     TelegramLogin
 	Now               func() time.Time
 }
 
@@ -109,6 +117,7 @@ type Server struct {
 	now          func() time.Time
 	limiter      *limiter
 	pageTemplate pageRenderer
+	telegram     *telegramLogin
 }
 
 func New(publicURL string, store Store, approver Approver, options Options) (*Server, error) {
@@ -119,6 +128,10 @@ func New(publicURL string, store Store, approver Approver, options Options) (*Se
 	}
 	if store == nil || approver == nil {
 		return nil, errors.New("oauth requires a store and a Telegram approver")
+	}
+	telegram, err := newTelegramLogin(options.TelegramLogin)
+	if err != nil {
+		return nil, err
 	}
 	now := options.Now
 	if now == nil {
@@ -139,6 +152,7 @@ func New(publicURL string, store Store, approver Approver, options Options) (*Se
 		now:          now,
 		limiter:      newLimiter(now),
 		pageTemplate: newPageRenderer(),
+		telegram:     telegram,
 	}, nil
 }
 
@@ -148,6 +162,9 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/.well-known/oauth-authorization-server", s.authorizationServerMetadata)
 	mux.HandleFunc("POST /oauth/register", s.register)
 	mux.HandleFunc("GET /oauth/authorize", s.authorize)
+	mux.HandleFunc("GET /oauth/telegram/start", s.telegramStart)
+	mux.HandleFunc("GET "+telegramCallback, s.telegramCallback)
+	mux.HandleFunc("GET /oauth/authorize/continue", s.authorizeContinue)
 	mux.HandleFunc("POST /oauth/authorize/status", s.authorizeStatus)
 	mux.HandleFunc("POST /oauth/token", s.token)
 	mux.HandleFunc("POST /oauth/revoke", s.revoke)
@@ -371,18 +388,10 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 		s.renderError(w, http.StatusInternalServerError, "Не удалось создать запрос. Попробуйте ещё раз.")
 		return
 	}
-	link, err := s.approver.OAuthApprovalLink(r.Context(), request.ID)
-	if err != nil {
-		log.Printf("oauth approval link failed: %v", err)
-		s.renderError(w, http.StatusServiceUnavailable, "Telegram-бот недоступен. Попробуйте позже.")
-		return
-	}
-	s.renderApproval(w, approvalPage{
-		ClientName:    displayClientName(client.Name),
-		Code:          request.ApprovalCode,
-		ApprovalLink:  link,
-		RequestID:     request.ID,
-		BrowserSecret: browserSecret,
+	s.setBrowserCookie(w, request.ID, browserSecret)
+	s.writePage(w, http.StatusOK, approvalPage{
+		ClientName: displayClientName(client.Name),
+		SignInLink: "/oauth/telegram/start?request=" + url.QueryEscape(request.ID),
 	})
 }
 
@@ -477,7 +486,8 @@ func (s *Server) exchangeCode(w http.ResponseWriter, r *http.Request, client db.
 		return
 	}
 	now := s.now()
-	if form.Get("code") == "" || !ok || request.ClientID != client.ClientID || request.Status != db.OAuthRequestApproved || !now.Before(request.CodeExpiresAt) {
+	if form.Get("code") == "" || !ok || request.ClientID != client.ClientID || request.Status != db.OAuthRequestApproved || !now.Before(request.CodeExpiresAt) ||
+		request.BoundUserID <= 0 || request.DecidedBy != request.BoundUserID {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "authorization code is invalid or expired")
 		return
 	}

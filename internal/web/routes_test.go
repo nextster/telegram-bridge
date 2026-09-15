@@ -20,7 +20,9 @@ func TestRoutesMountOAuth(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	oauthServer, err := oauth.New("https://telegram-bridge.example", store, stubApprover{}, oauth.Options{})
+	oauthServer, err := oauth.New("https://telegram-bridge.example", store, stubApprover{}, oauth.Options{
+		TelegramLogin: oauth.TelegramLogin{ClientID: "123", ClientSecret: "secret"},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,6 +61,8 @@ func (stubApprover) OAuthApprovalLink(context.Context, string) (string, error) {
 func (stubApprover) OAuthConnectionRevoked(context.Context, int64, string, string) error { return nil }
 
 func (stubApprover) OAuthConnectionCreated(context.Context, int64, string, string) error { return nil }
+
+func (stubApprover) OAuthApprovalRequested(context.Context, int64, string) error { return nil }
 
 func TestSplitTermGroups(t *testing.T) {
 	got := splitTermGroups("USB-C, Type-C\n1000 lm, 1200 lm\r\n\n31.8")
