@@ -209,11 +209,9 @@ account and returns to the client; there is no separate approval step.
 
 ### Personal MCP token
 
-Clients without OAuth, such as the Codex plugin and the local dev adapter, use
-a personal MCP token created on the dashboard and shown once. Put it in
-`TELEGRAM_BRIDGE_MCP_TOKEN` for the plugin. Clients send
-`Authorization: Bearer <token>` on every request; media download URLs need the
-same credential.
+Clients without OAuth use a personal MCP token created on the dashboard and
+shown once. They send `Authorization: Bearer <token>` on every request; media
+download URLs need the same credential.
 
 The MCP server reuses each user's live gotd client inside `telegram-bridge serve`,
 so it does not create a second Telegram session or require another login.
@@ -266,27 +264,6 @@ The reload command intentionally changes the tracked plugin version. Commit
 that cachebuster with the plugin change. The Codex installation record and
 generated plugin cache remain machine-local; start a new Codex task after a
 reload so it picks up the new skill and MCP schema.
-
-For local development, link future MCP processes to the current checkout once:
-
-```sh
-scripts/codex-plugin.sh dev:link
-scripts/codex-plugin.sh dev:status
-```
-
-The dev override uses a stable bootstrap under `$CODEX_HOME/telegram-bridge-dev`
-and runs the MCP adapter from this checkout. The adapter proxies the production
-HTTP MCP and never opens the Telegram session. It permits the named, idempotent
-media actions and non-destructive media-aware history in addition to read-only
-tools. The normal workflow is:
-edit → `scripts/check.sh` → open a new Codex task. Tool names and schemas are
-fixed during MCP initialization, so an already-open task does not reload them.
-
-MCP adapter changes need no reinstall or process restart. Return new tasks to the versioned production plugin with:
-
-```sh
-scripts/codex-plugin.sh dev:unlink
-```
 
 ## Private message deletion alerts
 
