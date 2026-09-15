@@ -1,6 +1,9 @@
 package config
 
 import (
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -9,43 +12,50 @@ import (
 )
 
 type Config struct {
-	Media               MediaConfig
-	Addr                string
-	DBPath              string
+	Media         MediaConfig
+	Addr          string
+	DBPath        string
+	PublicBaseURL string
+	// SessionKey encrypts every stored Telegram user session (32 bytes).
+	SessionKey []byte
+	// OAuthMode "on" enables OAuth for MCP clients; it is off by default.
+	OAuthMode              string
+	OAuthExtraRedirectURIs []string
+	// TelegramLoginSecret is the client secret from the Login Widget settings
+	// of the bot in BotFather. OAuth needs it to bind requests to a user.
+	TelegramLoginSecret string
+
+	BotToken string
+
+	TelegramAPIID   int
+	TelegramAPIHash string
+
+	// Single-account deployments are imported once into the per-user model:
+	// the session file becomes that account's encrypted session, and the
+	// static tokens and group allowlist become that account's own.
 	SessionPath         string
-	PublicBaseURL       string
 	MCPToken            string
-	WorkerToken         string
-	NotificationChatIDs []int64
 	NotificationToken   string
-
-	BotToken        string
-	BotAdminChatIDs []int64
-
-	TelegramAPIID    int
-	TelegramAPIHash  string
-	TelegramPhone    string
-	TelegramPassword string
+	NotificationChatIDs []int64
 }
 
 func Load() (Config, error) {
 	loadDotenvFiles(".env.local", ".env")
 
 	cfg := Config{
-		Addr:              envFirst("TELEGRAM_BRIDGE_ADDR", "ADDR"),
-		DBPath:            envFirstDefault("TELEGRAM_BRIDGE_DB", "/data/telegram-bridge.db", "DB_PATH", "data/telegram-bridge.db"),
-		SessionPath:       envFirstDefault("TELEGRAM_BRIDGE_SESSION", "/data/telegram.session", "TG_SESSION_PATH", "data/telegram.session"),
-		PublicBaseURL:     strings.TrimRight(envFirst("TELEGRAM_BRIDGE_PUBLIC_URL", "PUBLIC_BASE_URL"), "/"),
-		MCPToken:          envFirst("TELEGRAM_BRIDGE_MCP_TOKEN", "MCP_TOKEN"),
-		WorkerToken:       envFirst("TELEGRAM_BRIDGE_WORKER_TOKEN", "WORKER_TOKEN"),
-		NotificationToken: envFirst("TELEGRAM_BRIDGE_NOTIFICATION_TOKEN"),
-		BotToken:          envFirst("TELEGRAM_BOT_TOKEN", "BOT_TOKEN"),
+		Addr:                envFirst("TELEGRAM_BRIDGE_ADDR", "ADDR"),
+		DBPath:              envFirstDefault("TELEGRAM_BRIDGE_DB", "/data/telegram-bridge.db", "DB_PATH", "data/telegram-bridge.db"),
+		SessionPath:         envFirstDefault("TELEGRAM_BRIDGE_SESSION", "/data/telegram.session", "TG_SESSION_PATH", "data/telegram.session"),
+		PublicBaseURL:       strings.TrimRight(envFirst("TELEGRAM_BRIDGE_PUBLIC_URL", "PUBLIC_BASE_URL"), "/"),
+		MCPToken:            envFirst("TELEGRAM_BRIDGE_MCP_TOKEN", "MCP_TOKEN"),
+		NotificationToken:   envFirst("TELEGRAM_BRIDGE_NOTIFICATION_TOKEN"),
+		OAuthMode:           strings.ToLower(strings.TrimSpace(envFirst("TELEGRAM_BRIDGE_OAUTH"))),
+		TelegramLoginSecret: strings.TrimSpace(envFirst("TELEGRAM_LOGIN_CLIENT_SECRET")),
+		BotToken:            envFirst("TELEGRAM_BOT_TOKEN", "BOT_TOKEN"),
 		TelegramAPIHash: envFirst(
 			"TELEGRAM_API_HASH",
 			"TG_API_HASH",
 		),
-		TelegramPhone:    envFirst("TELEGRAM_PHONE", "TG_PHONE"),
-		TelegramPassword: envFirst("TELEGRAM_PASSWORD", "TG_PASSWORD"),
 	}
 
 	if cfg.Addr == "" {
@@ -62,11 +72,10 @@ func Load() (Config, error) {
 	}
 	cfg.TelegramAPIID = apiID
 
-	adminChatIDs, err := parseInt64List(envFirst("TELEGRAM_BRIDGE_ADMIN_CHAT_IDS", "ADMIN_CHAT_IDS"))
+	cfg.SessionKey, err = parseSessionKey(envFirst("TELEGRAM_BRIDGE_SESSION_KEY"))
 	if err != nil {
 		return Config{}, err
 	}
-	cfg.BotAdminChatIDs = adminChatIDs
 	notificationChatIDs, err := parseInt64List(envFirst("TELEGRAM_BRIDGE_NOTIFICATION_CHAT_IDS"))
 	if err != nil {
 		return Config{}, fmt.Errorf("invalid TELEGRAM_BRIDGE_NOTIFICATION_CHAT_IDS")
@@ -77,6 +86,14 @@ func Load() (Config, error) {
 		}
 	}
 	cfg.NotificationChatIDs = notificationChatIDs
+	switch cfg.OAuthMode {
+	case "", "on", "off":
+	default:
+		return Config{}, fmt.Errorf("TELEGRAM_BRIDGE_OAUTH must be on or off")
+	}
+	cfg.OAuthExtraRedirectURIs = strings.FieldsFunc(envFirst("TELEGRAM_BRIDGE_OAUTH_REDIRECT_URIS"), func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\n'
+	})
 	if err := cfg.ValidateNotifications(); err != nil {
 		return Config{}, err
 	}
@@ -130,57 +147,61 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.DBPath, "db", c.DBPath, "SQLite database path")
 	fs.StringVar(&c.SessionPath, "session", c.SessionPath, "gotd Telegram session file path")
 	fs.StringVar(&c.PublicBaseURL, "public-url", c.PublicBaseURL, "public HTTPS base URL for Telegram Mini App")
-	fs.StringVar(&c.MCPToken, "mcp-token", c.MCPToken, "bearer token protecting the MCP endpoint")
-	fs.StringVar(&c.WorkerToken, "worker-token", c.WorkerToken, "bearer token protecting the Codex worker API")
 	fs.StringVar(&c.BotToken, "bot-token", c.BotToken, "Telegram bot token")
-	fs.Func("admin-chat-ids", "comma-separated Telegram chat ids allowed to run bot admin commands", func(value string) error {
-		ids, err := parseInt64List(value)
-		if err != nil {
-			return err
-		}
-		c.BotAdminChatIDs = ids
-		return nil
-	})
-	fs.IntVar(&c.TelegramAPIID, "tg-api-id", c.TelegramAPIID, "Telegram API ID for gotd user session")
-	fs.StringVar(&c.TelegramAPIHash, "tg-api-hash", c.TelegramAPIHash, "Telegram API hash for gotd user session")
-	fs.StringVar(&c.TelegramPhone, "tg-phone", c.TelegramPhone, "Telegram phone number for login")
-	fs.StringVar(&c.TelegramPassword, "tg-password", c.TelegramPassword, "Telegram 2FA password for login")
+	fs.IntVar(&c.TelegramAPIID, "tg-api-id", c.TelegramAPIID, "Telegram API ID for gotd user sessions")
+	fs.StringVar(&c.TelegramAPIHash, "tg-api-hash", c.TelegramAPIHash, "Telegram API hash for gotd user sessions")
 }
 
 func (c Config) HasBot() bool {
 	return strings.TrimSpace(c.BotToken) != ""
 }
 
-func (c Config) IsConfiguredBotAdmin(chatID int64) bool {
-	for _, id := range c.BotAdminChatIDs {
-		if id == chatID {
-			return true
-		}
-	}
-	return false
-}
-
 func (c Config) HasTelegramUserAPI() bool {
 	return c.TelegramAPIID != 0 && strings.TrimSpace(c.TelegramAPIHash) != ""
 }
 
-func (c Config) HasMCP() bool {
-	return strings.TrimSpace(c.MCPToken) != ""
+// TelegramLoginClientID is the bot ID, the client ID of Telegram Login.
+func (c Config) TelegramLoginClientID() string {
+	id, _, _ := strings.Cut(strings.TrimSpace(c.BotToken), ":")
+	if parsed, err := strconv.ParseInt(id, 10, 64); err != nil || parsed <= 0 {
+		return ""
+	}
+	return id
 }
 
-func (c Config) HasWorkerAPI() bool {
-	return strings.TrimSpace(c.WorkerToken) != ""
+// HasOAuth reports whether MCP clients may authorize through the bot. OAuth
+// is opt-in and needs the bot for approvals, a public URL for redirects, and
+// Telegram Login to bind each request to the user who opened it.
+func (c Config) HasOAuth() bool {
+	return c.OAuthMode == "on" && c.HasBot() && c.PublicBaseURL != "" &&
+		c.TelegramLoginClientID() != "" && c.TelegramLoginSecret != ""
 }
 
-func (c Config) ValidateLogin() error {
-	if c.TelegramAPIID == 0 {
-		return fmt.Errorf("telegram API ID is required: set TELEGRAM_API_ID or pass -tg-api-id")
+// parseSessionKey accepts 32 bytes encoded as base64 or hex, for example
+// the output of `openssl rand -base64 32`.
+func parseSessionKey(value string) ([]byte, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
 	}
-	if strings.TrimSpace(c.TelegramAPIHash) == "" {
-		return fmt.Errorf("telegram API hash is required: set TELEGRAM_API_HASH or pass -tg-api-hash")
+	for _, decode := range []func(string) ([]byte, error){
+		base64.StdEncoding.DecodeString,
+		base64.RawStdEncoding.DecodeString,
+		base64.URLEncoding.DecodeString,
+		base64.RawURLEncoding.DecodeString,
+		hex.DecodeString,
+	} {
+		if key, err := decode(value); err == nil && len(key) == 32 {
+			return key, nil
+		}
 	}
-	if strings.TrimSpace(c.TelegramPhone) == "" {
-		return fmt.Errorf("telegram phone is required: set TELEGRAM_PHONE or pass -tg-phone")
+	return nil, errors.New("TELEGRAM_BRIDGE_SESSION_KEY must be 32 random bytes in base64 or hex (openssl rand -base64 32)")
+}
+
+// ValidateSessionKey reports whether Telegram user sessions can be stored.
+func (c Config) ValidateSessionKey() error {
+	if len(c.SessionKey) != 32 {
+		return errors.New("TELEGRAM_BRIDGE_SESSION_KEY is required to store Telegram sessions: generate one with openssl rand -base64 32")
 	}
 	return nil
 }
@@ -241,7 +262,7 @@ func parseInt64List(value string) ([]int64, error) {
 		}
 		parsed, err := strconv.ParseInt(part, 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("TELEGRAM_BRIDGE_ADMIN_CHAT_IDS contains invalid chat id %q: %w", part, err)
+			return nil, fmt.Errorf("invalid chat id %q: %w", part, err)
 		}
 		out = append(out, parsed)
 	}
@@ -255,12 +276,8 @@ func (c Config) ValidateNotifications() error {
 	if len(c.NotificationToken) < 32 || strings.TrimSpace(c.NotificationToken) != c.NotificationToken {
 		return fmt.Errorf("TELEGRAM_BRIDGE_NOTIFICATION_TOKEN must be a dedicated random token of at least 32 characters without surrounding whitespace")
 	}
-	if c.NotificationToken == c.MCPToken || c.NotificationToken == c.WorkerToken {
-		return fmt.Errorf("notification token must differ from MCP and worker tokens")
+	if c.NotificationToken == c.MCPToken {
+		return fmt.Errorf("notification token must differ from the MCP token")
 	}
 	return nil
-}
-
-func (c Config) HasNotificationAPI() bool {
-	return c.NotificationToken != "" && len(c.NotificationChatIDs) > 0 && c.ValidateNotifications() == nil
 }

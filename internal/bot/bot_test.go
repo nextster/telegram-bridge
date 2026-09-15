@@ -1,15 +1,11 @@
 package bot
 
 import (
-	"context"
 	"strings"
 	"testing"
 	"time"
 	"unicode/utf16"
 
-	"github.com/mymmrac/telego"
-
-	"github.com/nextster/telegram-bridge/internal/config"
 	"github.com/nextster/telegram-bridge/internal/db"
 )
 
@@ -121,104 +117,6 @@ func TestFormatDeletedMessageIsJustChatAndContent(t *testing.T) {
 	}
 }
 
-func TestPrivateAlertChatIDUsesOnlyLoggedInOwner(t *testing.T) {
-	ctx := context.Background()
-	store, err := db.Open(ctx, t.TempDir()+"/bot-admin.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	for _, chatID := range []int64{111, 222} {
-		if err := store.UpsertSubscriber(ctx, db.Subscriber{ChatID: chatID}); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	service := &Service{store: store, cfg: config.Config{BotAdminChatIDs: []int64{999}}}
-	if got, ok, err := service.privateAlertChatID(ctx, 222); err != nil || !ok || got != 222 {
-		t.Fatalf("subscribed owner: id=%d ok=%v err=%v", got, ok, err)
-	}
-	if got, ok, err := service.privateAlertChatID(ctx, 999); err != nil || ok || got != 0 {
-		t.Fatalf("unsubscribed configured admin: id=%d ok=%v err=%v", got, ok, err)
-	}
-}
-
-func TestAdminCommandAndSubscriptionBoundaries(t *testing.T) {
-	for _, command := range []string{"add", "watch", "del", "delete", "keywords", "recent", "login", "loginstatus", "cancel"} {
-		if !adminOnlyCommand(command) {
-			t.Fatalf("%q should require an admin chat", command)
-		}
-	}
-	for _, command := range []string{"start", "stop", "help", "unknown"} {
-		if adminOnlyCommand(command) {
-			t.Fatalf("%q unexpectedly requires the admin-command gate", command)
-		}
-	}
-
-	ctx := context.Background()
-	store, err := db.Open(ctx, t.TempDir()+"/subscriptions.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-
-	service := &Service{store: store}
-	if allowed, err := service.canSubscribe(ctx, 111); err != nil || !allowed {
-		t.Fatalf("first subscriber allowed=%v err=%v", allowed, err)
-	}
-	if err := store.UpsertSubscriber(ctx, db.Subscriber{ChatID: 111}); err != nil {
-		t.Fatal(err)
-	}
-	if allowed, err := service.canSubscribe(ctx, 222); err != nil || allowed {
-		t.Fatalf("second subscriber allowed=%v err=%v", allowed, err)
-	}
-	if allowed, err := service.canSubscribe(ctx, 111); err != nil || !allowed {
-		t.Fatalf("existing admin subscriber allowed=%v err=%v", allowed, err)
-	}
-
-	configured := &Service{store: store, cfg: config.Config{BotAdminChatIDs: []int64{222}}}
-	if allowed, err := configured.canSubscribe(ctx, 111); err != nil || allowed {
-		t.Fatalf("unconfigured chat allowed=%v err=%v", allowed, err)
-	}
-	if allowed, err := configured.canSubscribe(ctx, 222); err != nil || !allowed {
-		t.Fatalf("configured admin allowed=%v err=%v", allowed, err)
-	}
-}
-
-func TestOnlyAdminReceivesDashboardAndDestructiveButtons(t *testing.T) {
-	ctx := context.Background()
-	store, err := db.Open(ctx, t.TempDir()+"/admin-markup.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	if err := store.UpsertSubscriber(ctx, db.Subscriber{ChatID: 111}); err != nil {
-		t.Fatal(err)
-	}
-	service := &Service{store: store, cfg: config.Config{PublicBaseURL: "https://telegram-bridge.example"}}
-
-	if service.webAppMarkup(ctx, 111) == nil {
-		t.Fatal("admin dashboard button is missing")
-	}
-	if service.webAppMarkup(ctx, 222) != nil {
-		t.Fatal("non-admin received a dashboard button")
-	}
-
-	event := db.Event{ID: 9, RuleID: 4, Keyword: "private rule", SourcePeerType: "channel", SourcePeerID: 123, MessageID: 77}
-	adminMarkup, ok := service.eventMarkup(ctx, event, 111).(*telego.InlineKeyboardMarkup)
-	if !ok || len(adminMarkup.InlineKeyboard) != 2 {
-		t.Fatalf("admin event markup = %#v, want link and stop rows", adminMarkup)
-	}
-	actions := adminMarkup.InlineKeyboard[1]
-	if len(actions) != 2 || actions[0].Text != "Правило" || actions[0].WebApp == nil || actions[0].WebApp.URL != "https://telegram-bridge.example/#rule-4" {
-		t.Fatalf("admin event actions = %#v, want rule deep-link and stop button", actions)
-	}
-	nonAdminMarkup, ok := service.eventMarkup(ctx, event, 222).(*telego.InlineKeyboardMarkup)
-	if !ok || len(nonAdminMarkup.InlineKeyboard) != 1 {
-		t.Fatalf("non-admin event markup = %#v, want link row only", nonAdminMarkup)
-	}
-}
-
 func TestFormatEventIsConcise(t *testing.T) {
 	got := formatEvent(db.Event{
 		Keyword:     "exact cassette",
@@ -229,71 +127,5 @@ func TestFormatEventIsConcise(t *testing.T) {
 	})
 	if got != "🔎 Найдено:\n\nSRAM XG-1250 cassette for sale" {
 		t.Fatalf("formatEvent() = %q", got)
-	}
-}
-
-func TestFormatCodexSnapshotPreservesUsefulMarkdown(t *testing.T) {
-	got := formatCodexSnapshot(db.CodexThreadSnapshot{
-		CWD: "/path/to/telegram-bridge", Status: "active",
-		MessageRole: "assistant",
-		Message:     "**Done** with [details](https://example.com).\n\n- one\n- `two`\n\n```go\nfmt.Println(\"ok\")\n```",
-	})
-	for _, want := range []string{
-		"<b>Done</b>",
-		"<a href=\"https://example.com\">details</a>",
-		"• one",
-		"<code>two</code>",
-		"<pre><code class=\"language-go\">fmt.Println(&#34;ok&#34;)",
-	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("formatted snapshot does not contain %q: %s", want, got)
-		}
-	}
-}
-
-func TestFormatCodexSnapshotHighlightsWaitingForUser(t *testing.T) {
-	got := formatCodexSnapshot(db.CodexThreadSnapshot{
-		CWD: "/tmp/project", Status: "active", ActiveFlags: []string{"waitingOnUserInput"},
-		MessageRole: "user", Message: "Which one?",
-	})
-	if got != "Which one?" {
-		t.Fatalf("formatCodexSnapshot() = %q", got)
-	}
-}
-
-func TestFormatCodexSnapshotUsesQuietEmptyState(t *testing.T) {
-	got := formatCodexSnapshot(db.CodexThreadSnapshot{Status: "active"})
-	if got != "В работе…" {
-		t.Fatalf("formatCodexSnapshot() = %q", got)
-	}
-}
-
-func TestResolveGeneralCodexProject(t *testing.T) {
-	ctx := context.Background()
-	store, err := db.Open(ctx, t.TempDir()+"/general-codex.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	for _, project := range []db.CodexProject{
-		{Slug: "_active", Title: "Active", TelegramChannelID: 100, TelegramChatID: -1000000000100},
-		{Slug: "telegram-bridge", Title: "telegram-bridge", TelegramChannelID: 200, TelegramChatID: -1000000000200},
-	} {
-		if err := store.UpsertCodexProject(ctx, project); err != nil {
-			t.Fatal(err)
-		}
-	}
-	service := &Service{store: store}
-	active, _, err := store.GetCodexProject(ctx, "_active")
-	if err != nil {
-		t.Fatal(err)
-	}
-	project, prompt, err := service.resolveGeneralCodexProject(ctx, active, "make it nicer")
-	if err != nil || project != "telegram-bridge" || prompt != "make it nicer" {
-		t.Fatalf("single project resolution = %q, %q, %v", project, prompt, err)
-	}
-	project, prompt, err = service.resolveGeneralCodexProject(ctx, active, "telegram-bridge :: inspect this")
-	if err != nil || project != "telegram-bridge" || prompt != "inspect this" {
-		t.Fatalf("explicit project resolution = %q, %q, %v", project, prompt, err)
 	}
 }

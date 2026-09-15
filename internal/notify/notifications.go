@@ -25,30 +25,34 @@ type NotificationInput struct {
 	Text    string `json:"text"`
 }
 
-type Notifications struct {
-	store   *db.Store
-	sender  NotificationSender
-	allowed map[int64]bool
+// Senders returns the Telegram account that sends on behalf of a user.
+type Senders interface {
+	NotificationSender(ctx context.Context, accountID int64) (NotificationSender, error)
 }
 
-func NewNotifications(store *db.Store, sender NotificationSender, chatIDs []int64) *Notifications {
-	allowed := make(map[int64]bool, len(chatIDs))
-	for _, id := range chatIDs {
-		if id < 0 {
-			allowed[id] = true
-		}
-	}
-	return &Notifications{store: store, sender: sender, allowed: allowed}
+// Notifications sends messages from a user's own account to groups that the
+// same user allowed. Receipts are kept per account.
+type Notifications struct {
+	store   *db.Store
+	senders Senders
+}
+
+func NewNotifications(store *db.Store, senders Senders) *Notifications {
+	return &Notifications{store: store, senders: senders}
 }
 
 var eventIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
-func (n *Notifications) Send(ctx context.Context, input NotificationInput) (db.NotificationReceipt, error) {
-	if n == nil || n.store == nil || n.sender == nil {
+func (n *Notifications) Send(ctx context.Context, accountID int64, input NotificationInput) (db.NotificationReceipt, error) {
+	if n == nil || n.store == nil || n.senders == nil || accountID <= 0 {
 		return db.NotificationReceipt{}, errors.New("notifications are disabled")
 	}
 	chatID, err := notificationChatID(input.Chat)
-	if err != nil || !n.allowed[chatID] {
+	if err != nil {
+		return db.NotificationReceipt{}, errors.New("notification group is not allowed")
+	}
+	allowed, err := n.store.IsNotificationChatAllowed(ctx, accountID, chatID)
+	if err != nil || !allowed {
 		return db.NotificationReceipt{}, errors.New("notification group is not allowed")
 	}
 	if !eventIDPattern.MatchString(input.EventID) {
@@ -59,11 +63,15 @@ func (n *Notifications) Send(ctx context.Context, input NotificationInput) (db.N
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	if err := n.sender.CheckNotificationChat(ctx, chatID); err != nil {
+	sender, err := n.senders.NotificationSender(ctx, accountID)
+	if err != nil {
+		return db.NotificationReceipt{}, errors.New("the Telegram account is not connected")
+	}
+	if err := sender.CheckNotificationChat(ctx, chatID); err != nil {
 		return db.NotificationReceipt{}, errors.New("notification group is unavailable to the authorized account")
 	}
 	digest := fmt.Sprintf("%x", sha256.Sum256([]byte(input.Text)))
-	receipt, reserved, err := n.store.ReserveNotification(ctx, chatID, input.EventID, digest)
+	receipt, reserved, err := n.store.ReserveNotification(ctx, accountID, chatID, input.EventID, digest)
 	if err != nil {
 		return db.NotificationReceipt{}, err
 	}
@@ -73,17 +81,22 @@ func (n *Notifications) Send(ctx context.Context, input NotificationInput) (db.N
 		}
 		return db.NotificationReceipt{}, errors.New("notification delivery is pending or uncertain; inspect the group before recovery")
 	}
-	messageID, err := n.sender.SendNotification(ctx, chatID, input.Text, input.EventID)
+	messageID, err := sender.SendNotification(ctx, chatID, input.Text, input.EventID)
 	if err != nil || messageID <= 0 {
 		return db.NotificationReceipt{}, errors.New("notification delivery is uncertain; no automatic retry; inspect the group")
 	}
 	// Persist an acknowledged send even if the HTTP caller disconnected.
 	receiptCtx, receiptCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer receiptCancel()
-	if err := n.store.CompleteNotification(receiptCtx, chatID, input.EventID, messageID); err != nil {
+	if err := n.store.CompleteNotification(receiptCtx, accountID, chatID, input.EventID, messageID); err != nil {
 		return db.NotificationReceipt{}, errors.New("notification was sent but receipt storage failed; inspect the group")
 	}
 	return db.NotificationReceipt{Status: "sent", MessageID: messageID}, nil
+}
+
+// ChatID converts a group key such as channel:123 to a Bot API chat ID.
+func ChatID(key string) (int64, error) {
+	return notificationChatID(key)
 }
 
 func notificationChatID(key string) (int64, error) {

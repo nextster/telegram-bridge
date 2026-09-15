@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/nextster/telegram-bridge/internal/db"
 )
@@ -31,6 +32,23 @@ func (f *fakeSender) SendNotification(context.Context, int64, string, string) (i
 	return 42, nil
 }
 
+const (
+	testAccount  = int64(111)
+	otherAccount = int64(222)
+	testGroup    = int64(-1001234567890)
+)
+
+// fakeSenders maps each account to its own sender.
+type fakeSenders map[int64]*fakeSender
+
+func (f fakeSenders) NotificationSender(_ context.Context, accountID int64) (NotificationSender, error) {
+	sender, ok := f[accountID]
+	if !ok {
+		return nil, errors.New("not connected")
+	}
+	return sender, nil
+}
+
 func setupNotifications(t *testing.T) (*Notifications, *fakeSender, string) {
 	t.Helper()
 	path := t.TempDir() + "/notifications.db"
@@ -39,8 +57,11 @@ func setupNotifications(t *testing.T) (*Notifications, *fakeSender, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { store.Close() })
+	if err := store.AddNotificationChat(context.Background(), testAccount, testGroup, "Releases", time.Now()); err != nil {
+		t.Fatal(err)
+	}
 	sender := &fakeSender{}
-	return NewNotifications(store, sender, []int64{-1001234567890}), sender, path
+	return NewNotifications(store, fakeSenders{testAccount: sender}), sender, path
 }
 func releaseInput() NotificationInput {
 	return NotificationInput{Chat: "channel:1234567890", EventID: "example:ios:0.1.0:16", Text: "Example 0.1.0 (16)"}
@@ -49,7 +70,7 @@ func releaseInput() NotificationInput {
 func TestNotificationIdempotencySurvivesReopen(t *testing.T) {
 	n, sender, path := setupNotifications(t)
 	ctx := context.Background()
-	first, err := n.Send(ctx, releaseInput())
+	first, err := n.Send(ctx, testAccount, releaseInput())
 	if err != nil || first.Status != "sent" || first.MessageID != 42 {
 		t.Fatalf("first=%+v err=%v", first, err)
 	}
@@ -59,18 +80,18 @@ func TestNotificationIdempotencySurvivesReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	n = NewNotifications(store, sender, []int64{-1001234567890})
-	again, err := n.Send(ctx, releaseInput())
+	n = NewNotifications(store, fakeSenders{testAccount: sender})
+	again, err := n.Send(ctx, testAccount, releaseInput())
 	if err != nil || again != first || sender.calls.Load() != 1 {
 		t.Fatalf("again=%+v err=%v calls=%d", again, err, sender.calls.Load())
 	}
 	input := releaseInput()
 	input.Text = "changed"
-	if _, err := n.Send(ctx, input); err == nil {
+	if _, err := n.Send(ctx, testAccount, input); err == nil {
 		t.Fatal("accepted conflicting text")
 	}
 	input.EventID += ":new"
-	if _, err := n.Send(ctx, input); err != nil {
+	if _, err := n.Send(ctx, testAccount, input); err != nil {
 		t.Fatal(err)
 	}
 	if sender.calls.Load() != 2 {
@@ -82,7 +103,7 @@ func TestNotificationFailureIsRedactedAndNotRetried(t *testing.T) {
 	n, sender, _ := setupNotifications(t)
 	sender.fail = true
 	for range 2 {
-		_, err := n.Send(context.Background(), releaseInput())
+		_, err := n.Send(context.Background(), testAccount, releaseInput())
 		if err == nil || strings.Contains(err.Error(), "private token") {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -95,11 +116,11 @@ func TestNotificationFailureIsRedactedAndNotRetried(t *testing.T) {
 func TestNotificationPreflightFailureRemainsRetryable(t *testing.T) {
 	n, sender, _ := setupNotifications(t)
 	sender.unavailable = true
-	if _, err := n.Send(context.Background(), releaseInput()); err == nil || strings.Contains(err.Error(), "private token") {
+	if _, err := n.Send(context.Background(), testAccount, releaseInput()); err == nil || strings.Contains(err.Error(), "private token") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	sender.unavailable = false
-	if _, err := n.Send(context.Background(), releaseInput()); err != nil {
+	if _, err := n.Send(context.Background(), testAccount, releaseInput()); err != nil {
 		t.Fatal(err)
 	}
 	if sender.calls.Load() != 1 {
@@ -126,7 +147,7 @@ func TestNotificationRejectsInvalidOrUnauthorizedInput(t *testing.T) {
 		inputs = append(inputs, input)
 	}
 	for _, input := range inputs {
-		if _, err := n.Send(context.Background(), input); err == nil {
+		if _, err := n.Send(context.Background(), testAccount, input); err == nil {
 			t.Errorf("accepted invalid input %+v", input)
 		}
 	}
@@ -135,7 +156,7 @@ func TestNotificationRejectsInvalidOrUnauthorizedInput(t *testing.T) {
 	}
 	input := releaseInput()
 	input.Text = strings.Repeat("🙂", 2048)
-	if _, err := n.Send(context.Background(), input); err != nil {
+	if _, err := n.Send(context.Background(), testAccount, input); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -144,7 +165,7 @@ func TestNotificationConcurrentRequestsSendOnce(t *testing.T) {
 	n, sender, _ := setupNotifications(t)
 	var wg sync.WaitGroup
 	for range 12 {
-		wg.Go(func() { _, _ = n.Send(context.Background(), releaseInput()) })
+		wg.Go(func() { _, _ = n.Send(context.Background(), testAccount, releaseInput()) })
 	}
 	wg.Wait()
 	if sender.calls.Load() != 1 {
@@ -154,11 +175,42 @@ func TestNotificationConcurrentRequestsSendOnce(t *testing.T) {
 
 func TestNotificationEmptyAllowlistIsDisabled(t *testing.T) {
 	n, sender, _ := setupNotifications(t)
-	n.allowed = map[int64]bool{}
-	if _, err := n.Send(context.Background(), releaseInput()); err == nil {
+	if err := n.store.RemoveNotificationChat(context.Background(), testAccount, testGroup); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.Send(context.Background(), testAccount, releaseInput()); err == nil {
 		t.Fatal("empty allowlist accepted notification")
 	}
 	if sender.calls.Load() != 0 {
 		t.Fatal("disabled service sent")
+	}
+}
+
+func TestNotificationsUseOnlyTheCallersAccountAndAllowlist(t *testing.T) {
+	n, sender, _ := setupNotifications(t)
+	other := &fakeSender{}
+	n.senders = fakeSenders{testAccount: sender, otherAccount: other}
+	ctx := context.Background()
+
+	if _, err := n.Send(ctx, otherAccount, releaseInput()); err == nil {
+		t.Fatal("another account sent to a group allowed only by the test account")
+	}
+	if sender.calls.Load() != 0 || other.calls.Load() != 0 {
+		t.Fatal("rejected cross-account request sent a message")
+	}
+	if err := n.store.AddNotificationChat(ctx, otherAccount, testGroup, "Releases", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.Send(ctx, testAccount, releaseInput()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.Send(ctx, otherAccount, releaseInput()); err != nil {
+		t.Fatalf("same event id for another account must be independent: %v", err)
+	}
+	if sender.calls.Load() != 1 || other.calls.Load() != 1 {
+		t.Fatalf("each account must send with its own session: test=%d other=%d", sender.calls.Load(), other.calls.Load())
+	}
+	if _, err := n.Send(ctx, 0, releaseInput()); err == nil {
+		t.Fatal("request without account was accepted")
 	}
 }

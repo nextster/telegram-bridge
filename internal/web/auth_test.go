@@ -14,37 +14,102 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nextster/telegram-bridge/internal/apitoken"
 	"github.com/nextster/telegram-bridge/internal/config"
 	"github.com/nextster/telegram-bridge/internal/db"
+	"github.com/nextster/telegram-bridge/internal/monitor"
+	"github.com/nextster/telegram-bridge/internal/notify"
 )
 
-func TestDashboardRequiresTelegramAdminSession(t *testing.T) {
-	ctx := context.Background()
-	store, err := db.Open(ctx, t.TempDir()+"/web-auth.db")
+const (
+	aliceID = int64(42)
+	bobID   = int64(99)
+)
+
+type fakeAccounts struct {
+	checked []int64
+}
+
+func (*fakeAccounts) Account(int64) (*monitor.Service, error) { return nil, monitor.ErrNotConnected }
+
+func (*fakeAccounts) Status(int64) monitor.Status { return monitor.Status{Configured: true} }
+
+func (*fakeAccounts) Login(context.Context, int64, monitor.LoginOptions) (monitor.LoginResult, error) {
+	return monitor.LoginResult{}, monitor.ErrNotConnected
+}
+
+func (f *fakeAccounts) NotificationSender(_ context.Context, accountID int64) (notify.NotificationSender, error) {
+	return fakeSender{accounts: f, accountID: accountID}, nil
+}
+
+type fakeSender struct {
+	accounts  *fakeAccounts
+	accountID int64
+}
+
+func (s fakeSender) CheckNotificationChat(context.Context, int64) error {
+	s.accounts.checked = append(s.accounts.checked, s.accountID)
+	return nil
+}
+
+func (fakeSender) SendNotification(context.Context, int64, string, string) (int, error) {
+	return 1, nil
+}
+
+func testWebServer(t *testing.T) (*db.Store, *fakeAccounts, config.Config, http.Handler) {
+	t.Helper()
+	store, err := db.Open(context.Background(), t.TempDir()+"/web.db")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
-	if err := store.UpsertSubscriber(ctx, db.Subscriber{ChatID: 42}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.AddKeyword(ctx, "private dashboard phrase"); err != nil {
-		t.Fatal(err)
-	}
-
+	t.Cleanup(func() { store.Close() })
 	cfg := config.Config{BotToken: "123456:test-token", PublicBaseURL: "http://example.test"}
-	server, err := New(cfg, store, nil, nil, nil)
+	accounts := &fakeAccounts{}
+	server, err := New(cfg, store, accounts, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := server.routes()
+	return store, accounts, cfg, server.routes()
+}
 
-	unauthenticated := httptest.NewRecorder()
-	handler.ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodGet, "/", nil))
+func webSession(t *testing.T, handler http.Handler, cfg config.Config, userID int64) *http.Cookie {
+	t.Helper()
+	response := authenticateWebAppRequest(t, handler, cfg.BotToken, userID, time.Now().UTC())
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("auth for %d status = %d: %s", userID, response.Code, response.Body.String())
+	}
+	cookies := response.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("auth cookies = %d, want 1", len(cookies))
+	}
+	return cookies[0]
+}
+
+func do(handler http.Handler, method, path, form string, cookie *http.Cookie) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(method, path, strings.NewReader(form))
+	if form != "" {
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+	if cookie != nil {
+		request.AddCookie(cookie)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
+}
+
+func TestDashboardRequiresTelegramSession(t *testing.T) {
+	store, _, cfg, handler := testWebServer(t)
+	ctx := context.Background()
+	if _, err := store.AddKeyword(ctx, aliceID, "private dashboard phrase"); err != nil {
+		t.Fatal(err)
+	}
+
+	unauthenticated := do(handler, http.MethodGet, "/", "", nil)
 	if unauthenticated.Code != http.StatusOK {
 		t.Fatalf("GET / status = %d, want %d", unauthenticated.Code, http.StatusOK)
 	}
-	if body := unauthenticated.Body.String(); !strings.Contains(body, "Open the dashboard from the telegram-bridge bot admin chat") || strings.Contains(body, "private dashboard phrase") {
+	if body := unauthenticated.Body.String(); !strings.Contains(body, "Open the dashboard from the telegram-bridge bot") || strings.Contains(body, "private dashboard phrase") {
 		t.Fatalf("unauthenticated dashboard body leaked data or missed bootstrap: %q", body)
 	}
 	if !strings.Contains(unauthenticated.Body.String(), "window.location.reload()") {
@@ -53,31 +118,18 @@ func TestDashboardRequiresTelegramAdminSession(t *testing.T) {
 
 	for _, path := range []string{
 		"/keywords/add", "/rules/add", "/keywords/delete", "/sources/sync", "/sources/toggle", "/history/backfill",
+		"/tokens/create", "/tokens/delete", "/notification-chats/add", "/notification-chats/delete",
 	} {
-		mutation := httptest.NewRecorder()
-		handler.ServeHTTP(mutation, httptest.NewRequest(http.MethodPost, path, strings.NewReader("id=1")))
-		if mutation.Code != http.StatusUnauthorized {
+		if mutation := do(handler, http.MethodPost, path, "id=1", nil); mutation.Code != http.StatusUnauthorized {
 			t.Fatalf("unauthenticated POST %s status = %d, want %d", path, mutation.Code, http.StatusUnauthorized)
 		}
 	}
 
-	now := time.Now().UTC()
-	authResponse := authenticateWebAppRequest(t, handler, cfg.BotToken, 42, now)
-	if authResponse.Code != http.StatusNoContent {
-		t.Fatalf("admin auth status = %d, want %d: %s", authResponse.Code, http.StatusNoContent, authResponse.Body.String())
+	alice := webSession(t, handler, cfg, aliceID)
+	if !alice.HttpOnly || alice.SameSite != http.SameSiteStrictMode {
+		t.Fatalf("auth cookie flags = %#v", alice)
 	}
-	cookies := authResponse.Result().Cookies()
-	if len(cookies) != 1 {
-		t.Fatalf("auth cookies = %d, want 1", len(cookies))
-	}
-	if !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteStrictMode {
-		t.Fatalf("auth cookie flags = %#v", cookies[0])
-	}
-
-	authenticatedRequest := httptest.NewRequest(http.MethodGet, "/", nil)
-	authenticatedRequest.AddCookie(cookies[0])
-	authenticated := httptest.NewRecorder()
-	handler.ServeHTTP(authenticated, authenticatedRequest)
+	authenticated := do(handler, http.MethodGet, "/", "", alice)
 	if authenticated.Code != http.StatusOK || !strings.Contains(authenticated.Body.String(), "private dashboard phrase") {
 		t.Fatalf("authenticated dashboard status=%d body=%q", authenticated.Code, authenticated.Body.String())
 	}
@@ -85,25 +137,158 @@ func TestDashboardRequiresTelegramAdminSession(t *testing.T) {
 		t.Fatalf("authenticated dashboard has no rule anchor: %q", authenticated.Body.String())
 	}
 
-	nonAdmin := authenticateWebAppRequest(t, handler, cfg.BotToken, 99, now)
-	if nonAdmin.Code != http.StatusForbidden {
-		t.Fatalf("non-admin auth status = %d, want %d", nonAdmin.Code, http.StatusForbidden)
-	}
-	stale := authenticateWebAppRequest(t, handler, cfg.BotToken, 42, now.Add(-webInitDataMaxAge-time.Second))
+	stale := authenticateWebAppRequest(t, handler, cfg.BotToken, aliceID, time.Now().Add(-webInitDataMaxAge-time.Second))
 	if stale.Code != http.StatusUnauthorized {
 		t.Fatalf("stale auth status = %d, want %d", stale.Code, http.StatusUnauthorized)
 	}
-
 	tamperedBody := url.Values{"init_data": {signedTelegramInitData(cfg.BotToken, map[string]string{
-		"auth_date": strconv.FormatInt(now.Unix(), 10),
+		"auth_date": strconv.FormatInt(time.Now().Unix(), 10),
 		"user":      `{"id":42}`,
 	}) + "x"}}.Encode()
-	tamperedRequest := httptest.NewRequest(http.MethodPost, "/webapp/auth", strings.NewReader(tamperedBody))
-	tamperedRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	tampered := httptest.NewRecorder()
-	handler.ServeHTTP(tampered, tamperedRequest)
-	if tampered.Code != http.StatusUnauthorized {
+	if tampered := do(handler, http.MethodPost, "/webapp/auth", tamperedBody, nil); tampered.Code != http.StatusUnauthorized {
 		t.Fatalf("tampered auth status = %d, want %d", tampered.Code, http.StatusUnauthorized)
+	}
+	forged := &http.Cookie{Name: webAuthCookieName, Value: encodeWebSession("42:"+strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10), "other-bot-token")}
+	if body := do(handler, http.MethodGet, "/", "", forged).Body.String(); strings.Contains(body, "private dashboard phrase") {
+		t.Fatal("a session signed with another key opened the dashboard")
+	}
+}
+
+func TestWebAppAuthRejectsCrossSiteRequests(t *testing.T) {
+	_, _, cfg, handler := testWebServer(t)
+	initData := signedTelegramInitData(cfg.BotToken, map[string]string{
+		"auth_date": strconv.FormatInt(time.Now().Unix(), 10),
+		"user":      `{"id":42}`,
+	})
+	for _, headers := range []map[string]string{
+		{"Sec-Fetch-Site": "cross-site"},
+		{"Sec-Fetch-Site": "same-site"},
+		{"Origin": "https://attacker.example"},
+	} {
+		request := httptest.NewRequest(http.MethodPost, "/webapp/auth", strings.NewReader(url.Values{"init_data": {initData}}.Encode()))
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		for key, value := range headers {
+			request.Header.Set(key, value)
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusForbidden || len(response.Result().Cookies()) != 0 {
+			t.Fatalf("headers %v: status=%d cookies=%d", headers, response.Code, len(response.Result().Cookies()))
+		}
+	}
+	request := httptest.NewRequest(http.MethodPost, "/webapp/auth", strings.NewReader(url.Values{"init_data": {initData}}.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Sec-Fetch-Site", "same-origin")
+	request.Header.Set("Origin", "http://"+request.Host)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("same-origin auth status = %d", response.Code)
+	}
+}
+
+func TestDashboardIsolatesUsers(t *testing.T) {
+	store, accounts, cfg, handler := testWebServer(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	aliceRule, err := store.AddKeyword(ctx, aliceID, "alice secret rule")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertMonitorPeer(ctx, db.MonitorPeer{OwnerUserID: aliceID, PeerType: "channel", PeerID: 500, Title: "Alice Private Channel", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMonitorPeerEnabled(ctx, aliceID, "channel", 500, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.RecordEvent(ctx, db.Event{OwnerUserID: aliceID, SourcePeerType: "channel", SourcePeerID: 500, MessageID: 1, Keyword: "alice secret rule", Text: "alice secret message"}); err != nil {
+		t.Fatal(err)
+	}
+	_, hash, err := apitoken.New(db.APITokenScopeMCP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliceToken, err := store.CreateAPIToken(ctx, aliceID, db.APITokenScopeMCP, "alice laptop", hash, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddNotificationChat(ctx, aliceID, -1001234567890, "Alice Group", now); err != nil {
+		t.Fatal(err)
+	}
+
+	bob := webSession(t, handler, cfg, bobID)
+	body := do(handler, http.MethodGet, "/", "", bob).Body.String()
+	for _, secret := range []string{"alice secret rule", "Alice Private Channel", "alice secret message", "alice laptop", "Alice Group", "-1001234567890"} {
+		if strings.Contains(body, secret) {
+			t.Fatalf("bob's dashboard shows alice's %q", secret)
+		}
+	}
+
+	do(handler, http.MethodPost, "/keywords/delete", "id="+strconv.FormatInt(aliceRule.ID, 10), bob)
+	do(handler, http.MethodPost, "/keywords/delete", "id=alice+secret+rule", bob)
+	if rules, _ := store.ListKeywords(ctx, aliceID); len(rules) != 1 {
+		t.Fatalf("bob deleted alice's rule: %v", rules)
+	}
+	do(handler, http.MethodPost, "/sources/toggle", "peer_type=channel&peer_id=500&enabled=0", bob)
+	if enabled, _ := store.IsMonitorPeerEnabled(ctx, aliceID, "channel", 500); !enabled {
+		t.Fatal("bob paused alice's source")
+	}
+	do(handler, http.MethodPost, "/tokens/delete", "id="+strconv.FormatInt(aliceToken.ID, 10), bob)
+	if tokens, _ := store.ListAPITokens(ctx, aliceID); len(tokens) != 1 {
+		t.Fatal("bob deleted alice's token")
+	}
+	do(handler, http.MethodPost, "/notification-chats/delete", "chat_id=-1001234567890", bob)
+	if allowed, _ := store.IsNotificationChatAllowed(ctx, aliceID, -1001234567890); !allowed {
+		t.Fatal("bob removed alice's notification group")
+	}
+
+	// A rule scoped to alice's source is saved for bob without that source.
+	do(handler, http.MethodPost, "/rules/add", "name=bob+rule&any=bike&sources=channel:500", bob)
+	bobRules, err := store.ListKeywords(ctx, bobID)
+	if err != nil || len(bobRules) != 1 || len(bobRules[0].Sources) != 0 {
+		t.Fatalf("bob rules = %#v err=%v", bobRules, err)
+	}
+
+	// Adding a group is checked with bob's own account and stored for bob only.
+	do(handler, http.MethodPost, "/notification-chats/add", "chat=channel:777", bob)
+	if len(accounts.checked) != 1 || accounts.checked[0] != bobID {
+		t.Fatalf("group checked with accounts %v", accounts.checked)
+	}
+	if chats, _ := store.ListNotificationChats(ctx, bobID); len(chats) != 1 {
+		t.Fatalf("bob chats = %v", chats)
+	}
+	if chats, _ := store.ListNotificationChats(ctx, aliceID); len(chats) != 1 {
+		t.Fatalf("alice chats changed: %v", chats)
+	}
+
+	created := do(handler, http.MethodPost, "/tokens/create", "scope=notify&name=bob+script", bob)
+	if created.Code != http.StatusOK || !strings.Contains(created.Body.String(), "tbn_") {
+		t.Fatalf("token create status=%d", created.Code)
+	}
+	if tokens, _ := store.ListAPITokens(ctx, bobID); len(tokens) != 1 || tokens[0].Scope != db.APITokenScopeNotify {
+		t.Fatalf("bob tokens = %v", tokens)
+	}
+	if again := do(handler, http.MethodGet, "/", "", bob).Body.String(); strings.Contains(again, "tbn_") {
+		t.Fatal("a created token is shown more than once")
+	}
+}
+
+func TestParseNotificationChat(t *testing.T) {
+	for input, want := range map[string]int64{
+		"channel:123":    -1000000000123,
+		"-1000000000123": -1000000000123,
+		"chat:55":        -55,
+		"-55":            -55,
+	} {
+		if got, err := parseNotificationChat(input); err != nil || got != want {
+			t.Fatalf("parseNotificationChat(%q) = %d, %v; want %d", input, got, err, want)
+		}
+	}
+	for _, input := range []string{"", "user:5", "5", "abc", "channel:-1"} {
+		if _, err := parseNotificationChat(input); err == nil {
+			t.Fatalf("parseNotificationChat(%q) accepted", input)
+		}
 	}
 }
 
@@ -129,12 +314,7 @@ func authenticateWebAppRequest(t *testing.T, handler http.Handler, botToken stri
 		"query_id":  "test-query",
 		"user":      `{"id":` + strconv.FormatInt(userID, 10) + `,"first_name":"Test"}`,
 	})
-	body := url.Values{"init_data": {initData}}.Encode()
-	request := httptest.NewRequest(http.MethodPost, "/webapp/auth", strings.NewReader(body))
-	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, request)
-	return response
+	return do(handler, http.MethodPost, "/webapp/auth", url.Values{"init_data": {initData}}.Encode(), nil)
 }
 
 func signedTelegramInitData(botToken string, fields map[string]string) string {

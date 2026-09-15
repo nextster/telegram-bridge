@@ -298,7 +298,9 @@ deduplication. Reaching the record limit fails closed and requires a deliberate
 retention/export decision. Deleting database state can remove deduplication and
 must not be treated as routine cache cleanup.
 
-All MCP calls and every original-file GET/HEAD require `TELEGRAM_BRIDGE_MCP_TOKEN`.
+All MCP calls and every original-file GET/HEAD require the caller's OAuth access
+token or personal MCP token. Jobs, batches and cached originals belong to one
+account and are never returned to another.
 Files have private filesystem permissions and `Cache-Control: private, no-store`.
 No arbitrary URL/path input, public directory listing, token-in-URL link, or user
 filename is accepted. Service errors expose stable codes; request bodies, media,
@@ -311,7 +313,7 @@ Fly memory setting becomes 512 MB. Use the regular Dockerfile/deploy path.
 
 1. Record the current deployed image and Fly configuration for rollback. Verify
    exactly one `serve` Machine owns the existing Telegram session volume. Do not
-   start a local `serve` or CLI login using a copy of that session.
+   start a local `serve` using a copy of that database.
 2. Check available volume space and preserve an application-consistent backup
    of the SQLite database/session using the existing single-writer maintenance
    procedure. Do not copy only the main SQLite file while ignoring a live WAL.
@@ -357,7 +359,7 @@ Fly memory setting becomes 512 MB. Use the regular Dockerfile/deploy path.
    processed only within an explicitly requested image scope, not automatically
    as a side effect of this voice batch.
 
-Once queued, jobs run on Fly with the Mac off. Agent-driven discovery/export can
+Once queued, jobs run on Fly without any local process. Agent-driven discovery/export can
 be resumed separately using the durable job IDs. The single-voice smoke test and
 the `<prefix>` batch are separate live checks, not covered by local tests.
 

@@ -15,7 +15,7 @@ func budgetJob(t *testing.T, s *Store, id string, now time.Time) {
 	if _, err := s.EnqueueMedia(context.Background(), MediaJob{ID: id, AccountID: 1, Chat: "chat:1", MessageID: 1, CreatedAt: now.Unix(), Payload: "{}"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.ClaimMedia(context.Background(), 1, now); err != nil {
+	if _, err := s.ClaimMedia(context.Background(), []int64{1}, now); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -101,7 +101,7 @@ func TestMediaSettlementReleasesOnlyKnownCostAndWakesBudgetWait(t *testing.T) {
 	if wait.Status != "retry_wait" || wait.Attempts != 0 || wait.ProviderAttempts != 0 || wait.RetryAt != now.Add(time.Minute).Unix() {
 		t.Fatalf("bad wait: %+v", wait)
 	}
-	if _, err := s.ClaimMedia(ctx, 1, now); err == nil {
+	if _, err := s.ClaimMedia(ctx, []int64{1}, now); err == nil {
 		t.Fatal("claimed before budget window")
 	}
 	if err := s.RecoverMedia(ctx, now); err != nil {
@@ -114,7 +114,7 @@ func TestMediaSettlementReleasesOnlyKnownCostAndWakesBudgetWait(t *testing.T) {
 	if wait.RetryAt != 0 {
 		t.Fatal("settlement did not wake waiter")
 	}
-	if _, err := s.ClaimMedia(ctx, 1, now); err != nil {
+	if _, err := s.ClaimMedia(ctx, []int64{1}, now); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.ReserveMedia(ctx, "b", "{}", 80, 100, 200, now); err != nil {
@@ -169,7 +169,7 @@ func TestMediaBudgetDayAndTotalScopes(t *testing.T) {
 				if wait.RetryAt != want.Unix() {
 					t.Fatal("window not UTC")
 				}
-				if _, err := s.ClaimMedia(ctx, 1, want); err != nil {
+				if _, err := s.ClaimMedia(ctx, []int64{1}, want); err != nil {
 					t.Fatal(err)
 				}
 				if err := s.ReserveMedia(ctx, "b", "{}", amount, daily, total, want); err != nil {
@@ -247,7 +247,7 @@ func TestMediaSettlementBetweenRefusalAndDeferralNotLost(t *testing.T) {
 	if err := s.DeferMediaBudget(ctx, "b", b, now); err != nil {
 		t.Fatal(err)
 	}
-	if j, err := s.ClaimMedia(ctx, 1, now); err != nil || j.ID != "b" {
+	if j, err := s.ClaimMedia(ctx, []int64{1}, now); err != nil || j.ID != "b" {
 		t.Fatal("lost settlement wakeup", err)
 	}
 }

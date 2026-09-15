@@ -14,10 +14,6 @@ type DeletionNotifier interface {
 	NotifyDeletedMessages(ctx context.Context, deletion db.PrivateMessageDeletion) error
 }
 
-type SystemNotifier interface {
-	NotifySystem(ctx context.Context, text string) error
-}
-
 type Nop struct{}
 
 func (Nop) NotifyEvent(context.Context, db.Event) error {
@@ -25,9 +21,5 @@ func (Nop) NotifyEvent(context.Context, db.Event) error {
 }
 
 func (Nop) NotifyDeletedMessages(context.Context, db.PrivateMessageDeletion) error {
-	return nil
-}
-
-func (Nop) NotifySystem(context.Context, string) error {
 	return nil
 }

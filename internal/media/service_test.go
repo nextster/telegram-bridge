@@ -16,6 +16,8 @@ import (
 	"github.com/nextster/telegram-bridge/internal/db"
 )
 
+const testAccount = int64(1)
+
 type fakeSource struct {
 	attachment Attachment
 	downloads  int
@@ -24,11 +26,19 @@ type fakeSource struct {
 	account    int64
 }
 
-func (f *fakeSource) AccountID() int64 { return f.account }
-func (f *fakeSource) Attachment(context.Context, string, int) (Attachment, error) {
+func (f *fakeSource) LiveAccounts() []int64 { return []int64{f.account} }
+
+// Attachment serves only the source's own account, like a real session.
+func (f *fakeSource) Attachment(_ context.Context, accountID int64, _ string, _ int) (Attachment, error) {
+	if accountID != f.account {
+		return Attachment{}, Fail("telegram_account_unavailable")
+	}
 	return f.attachment, f.err
 }
-func (f *fakeSource) Download(_ context.Context, _ Attachment, w io.Writer) error {
+func (f *fakeSource) Download(_ context.Context, accountID int64, _ Attachment, w io.Writer) error {
+	if accountID != f.account {
+		return Fail("telegram_account_unavailable")
+	}
 	f.downloads++
 	if f.err != nil {
 		return f.err
@@ -79,7 +89,7 @@ func testService(t *testing.T) (*Service, *fakeSource, *fakeProvider) {
 }
 func startTestJob(t *testing.T, s *Service, operation string, options Options) Job {
 	t.Helper()
-	j, err := s.Start(context.Background(), "channel:42", 7, operation, options, true)
+	j, err := s.Start(context.Background(), testAccount, "channel:42", 7, operation, options, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +104,7 @@ func runTestJob(t *testing.T, s *Service) {
 }
 func getTestJob(t *testing.T, s *Service, id string) Job {
 	t.Helper()
-	j, err := s.Get(context.Background(), "channel:42", 7, id)
+	j, err := s.Get(context.Background(), testAccount, "channel:42", 7, id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,31 +113,37 @@ func getTestJob(t *testing.T, s *Service, id string) Job {
 
 func TestExplicitPaidActionAndReadOnlyDownload(t *testing.T) {
 	s, source, p := testService(t)
-	if _, err := s.Start(context.Background(), "channel:42", 7, "transcription", Options{}, false); err == nil {
+	if _, err := s.Start(context.Background(), testAccount, "channel:42", 7, "transcription", Options{}, false); err == nil {
 		t.Fatal("accepted implicit paid processing")
 	}
-	if _, err := s.Metadata(context.Background(), "channel:42", 7); err != nil {
+	if _, err := s.Metadata(context.Background(), testAccount, "channel:42", 7); err != nil {
 		t.Fatal(err)
 	}
-	a, err := s.Download(context.Background(), "channel:42", 7)
+	a, err := s.Download(context.Background(), testAccount, "channel:42", 7)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := s.Download(context.Background(), "channel:42", 7)
+	b, err := s.Download(context.Background(), testAccount, "channel:42", 7)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if a.FileID != b.FileID || source.downloads != 1 || p.calls != 0 {
 		t.Fatal("download cache or paid boundary broken")
 	}
-	f, _, err := s.OpenDownload(context.Background(), a.FileID)
+	f, _, err := s.OpenDownload(context.Background(), testAccount, a.FileID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	f.Close()
+	if _, _, err := s.OpenDownload(context.Background(), testAccount+1, a.FileID); err == nil {
+		t.Fatal("another account opened a cached original")
+	}
+	if _, err := s.Get(context.Background(), testAccount+1, "channel:42", 7, strings.Repeat("a", 64)); err == nil {
+		t.Fatal("another account read a job")
+	}
 	source.account = 2
-	if _, _, err := s.OpenDownload(context.Background(), a.FileID); err == nil {
-		t.Fatal("cross-account download allowed")
+	if _, _, err := s.OpenDownload(context.Background(), testAccount, a.FileID); err == nil {
+		t.Fatal("download allowed after the account lost access")
 	}
 }
 
@@ -160,7 +176,7 @@ func TestJobDedupAndCacheInvalidation(t *testing.T) {
 	if startTestJob(t, s, "transcription", Options{}).ID == j.ID {
 		t.Fatal("revision change ignored")
 	}
-	if _, err := s.Start(context.Background(), "channel:42", 7, "transcription", Options{Model: "unapproved/model"}, true); err == nil {
+	if _, err := s.Start(context.Background(), testAccount, "channel:42", 7, "transcription", Options{Model: "unapproved/model"}, true); err == nil {
 		t.Fatal("unapproved model allowed")
 	}
 }
@@ -172,7 +188,7 @@ func TestConcurrentDuplicateRequestsCreateOneJob(t *testing.T) {
 	errs := make(chan error, 10)
 	for range 10 {
 		wg.Go(func() {
-			j, err := s.Start(context.Background(), "channel:42", 7, "transcription", Options{}, true)
+			j, err := s.Start(context.Background(), testAccount, "channel:42", 7, "transcription", Options{}, true)
 			ids <- j.ID
 			errs <- err
 		})
@@ -230,7 +246,7 @@ func TestImageDescriptionAndOCRStoredSeparately(t *testing.T) {
 func TestRecoveryAcrossDatabaseReopen(t *testing.T) {
 	s, source, p := testService(t)
 	j := startTestJob(t, s, "transcription", Options{})
-	if _, err := s.store.ClaimMedia(context.Background(), 1, s.now()); err != nil {
+	if _, err := s.store.ClaimMedia(context.Background(), []int64{1}, s.now()); err != nil {
 		t.Fatal(err)
 	}
 	path := filepath.Join(filepath.Dir(s.cfg.Directory), "test.db")
@@ -264,7 +280,7 @@ func TestRecoveryAcrossDatabaseReopen(t *testing.T) {
 func TestSubmittingRecoveryNeverResubmits(t *testing.T) {
 	s, _, p := testService(t)
 	j := startTestJob(t, s, "transcription", Options{})
-	row, err := s.store.ClaimMedia(context.Background(), 1, s.now())
+	row, err := s.store.ClaimMedia(context.Background(), []int64{1}, s.now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,7 +360,7 @@ func TestLimitsAndSourceChangesBeforePaidRequest(t *testing.T) {
 func TestReferenceAndHintValidation(t *testing.T) {
 	s, f, _ := testService(t)
 	for _, chat := range []string{"https://example.com/audio", "/etc/passwd", "channel:1/../../etc", "channel:0", "channel:+42", "file:42"} {
-		if _, err := s.Metadata(context.Background(), chat, 7); err == nil {
+		if _, err := s.Metadata(context.Background(), testAccount, chat, 7); err == nil {
 			t.Fatalf("accepted %q", chat)
 		}
 	}
@@ -354,31 +370,31 @@ func TestReferenceAndHintValidation(t *testing.T) {
 		}
 	}
 	f.attachment.Supported = false
-	if _, err := s.Start(context.Background(), "channel:42", 7, "transcription", Options{}, true); err == nil {
+	if _, err := s.Start(context.Background(), testAccount, "channel:42", 7, "transcription", Options{}, true); err == nil {
 		t.Fatal("accepted unsupported media")
 	}
 	f.attachment.Supported = true
 	f.attachment.Duration = 601
-	if _, err := s.Start(context.Background(), "channel:42", 7, "transcription", Options{}, true); err == nil {
+	if _, err := s.Start(context.Background(), testAccount, "channel:42", 7, "transcription", Options{}, true); err == nil {
 		t.Fatal("accepted excessive duration")
 	}
 	f.attachment.Duration = 10
 	f.attachment.Size = s.cfg.MaxBytes + 1
-	if _, err := s.Download(context.Background(), "channel:42", 7); err == nil {
+	if _, err := s.Download(context.Background(), testAccount, "channel:42", 7); err == nil {
 		t.Fatal("accepted excessive size")
 	}
 }
 
 func TestCleanupExpiryOrphansAndIntegrity(t *testing.T) {
 	s, _, _ := testService(t)
-	d, err := s.Download(context.Background(), "channel:42", 7)
+	d, err := s.Download(context.Background(), testAccount, "channel:42", 7)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(s.cfg.Directory, d.FileID+".bin"), []byte("other"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Download(context.Background(), "channel:42", 7); err == nil {
+	if _, err := s.Download(context.Background(), testAccount, "channel:42", 7); err == nil {
 		t.Fatal("corrupted cache accepted")
 	}
 	if err := os.WriteFile(filepath.Join(s.cfg.Directory, "tmp-orphan"), []byte("partial"), 0600); err != nil {
@@ -390,7 +406,7 @@ func TestCleanupExpiryOrphansAndIntegrity(t *testing.T) {
 	}
 	later := s.now().Add(25 * time.Hour)
 	s.now = func() time.Time { return later }
-	if _, _, err := s.OpenDownload(context.Background(), d.FileID); err == nil {
+	if _, _, err := s.OpenDownload(context.Background(), testAccount, d.FileID); err == nil {
 		t.Fatal("expired file accepted")
 	}
 	if err := s.cleanup(context.Background(), true); err != nil {

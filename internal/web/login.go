@@ -13,7 +13,6 @@ import (
 
 	"github.com/nextster/telegram-bridge/internal/db"
 	"github.com/nextster/telegram-bridge/internal/monitor"
-	"github.com/nextster/telegram-bridge/internal/notify"
 )
 
 const webLoginTimeout = 10 * time.Minute
@@ -29,8 +28,8 @@ const (
 
 type webLoginManager struct {
 	store    *db.Store
-	monitor  *monitor.Service
-	notifier notify.SystemNotifier
+	accounts Accounts
+	notifier UserNotifier
 
 	mu    sync.Mutex
 	flows map[string]*webLoginFlow
@@ -74,21 +73,30 @@ type webLoginView struct {
 	Notice        string
 }
 
-func newWebLoginManager(store *db.Store, monitorService *monitor.Service, notifier notify.SystemNotifier) *webLoginManager {
+func newWebLoginManager(store *db.Store, accounts Accounts, notifier UserNotifier) *webLoginManager {
 	if notifier == nil {
-		notifier = notify.Nop{}
+		notifier = nopUserNotifier{}
 	}
 	return &webLoginManager{
 		store:    store,
-		monitor:  monitorService,
+		accounts: accounts,
 		notifier: notifier,
 		flows:    make(map[string]*webLoginFlow),
 	}
 }
 
+// get returns a login flow that is still within its lifetime. Older flows are
+// dropped so an old link no longer shows the phone number or user ID.
 func (m *webLoginManager) get(token string) *webLoginFlow {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	now := time.Now().UTC()
+	for key, flow := range m.flows {
+		if now.Sub(flow.startedAt) > webLoginTimeout {
+			flow.cancel()
+			delete(m.flows, key)
+		}
+	}
 	return m.flows[strings.TrimSpace(token)]
 }
 
@@ -101,7 +109,7 @@ func (m *webLoginManager) restart(record db.LoginToken) (*webLoginFlow, error) {
 }
 
 func (m *webLoginManager) startRecord(record db.LoginToken, replace bool) (*webLoginFlow, error) {
-	if m.monitor == nil {
+	if m.accounts == nil {
 		return nil, errors.New("telegram user API is not configured")
 	}
 	m.mu.Lock()
@@ -134,7 +142,9 @@ func (m *webLoginManager) startRecord(record db.LoginToken, replace bool) (*webL
 }
 
 func (m *webLoginManager) run(ctx context.Context, flow *webLoginFlow) {
-	result, err := m.monitor.LoginWithPrompts(ctx, monitor.LoginOptions{
+	// The session is saved only if the Telegram account that logs in is the
+	// same user who requested the link in the bot.
+	result, err := m.accounts.Login(ctx, flow.chatID, monitor.LoginOptions{
 		Phone: flow.phone,
 		Prompt: func(ctx context.Context, req monitor.LoginPromptRequest) (string, error) {
 			return flow.prompt(ctx, req)
@@ -147,7 +157,7 @@ func (m *webLoginManager) run(ctx context.Context, flow *webLoginFlow) {
 	}
 	flow.finish(result, err)
 	if err == nil {
-		m.notifyLogin(result)
+		m.notifyLogin(flow.chatID)
 	}
 }
 
@@ -373,6 +383,12 @@ func webLoginErrorMessage(err error) string {
 	if errors.Is(err, context.Canceled) {
 		return "Cancelled."
 	}
+	if errors.Is(err, monitor.ErrAccountMismatch) {
+		return "This is a different Telegram account. Log in with the account you use to talk to the bot."
+	}
+	if errors.Is(err, monitor.ErrLoginInProgress) || errors.Is(err, monitor.ErrLoginBusy) {
+		return err.Error()
+	}
 	detail := err.Error()
 	switch {
 	case strings.Contains(detail, "PHONE_CODE_EXPIRED"):
@@ -390,14 +406,10 @@ func webLoginErrorMessage(err error) string {
 	}
 }
 
-func (m *webLoginManager) notifyLogin(result monitor.LoginResult) {
-	text := "Telegram login connected."
-	if result.UserID != 0 {
-		text = fmt.Sprintf("Telegram login connected: user_id=%d.", result.UserID)
-	}
+func (m *webLoginManager) notifyLogin(chatID int64) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := m.notifier.NotifySystem(ctx, text); err != nil {
+	if err := m.notifier.NotifyUser(ctx, chatID, "Telegram подключён. Теперь можно подключить MCP и настроить радар."); err != nil {
 		log.Printf("send login notification failed: %v", err)
 	}
 }

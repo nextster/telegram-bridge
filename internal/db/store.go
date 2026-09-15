@@ -33,6 +33,7 @@ type Subscriber struct {
 
 type Keyword struct {
 	ID                  int64
+	OwnerUserID         int64
 	Phrase              string
 	Enabled             bool
 	AnyTerms            []string
@@ -53,6 +54,7 @@ type RuleSource struct {
 
 type Event struct {
 	ID             int64
+	OwnerUserID    int64
 	SourcePeerType string
 	SourcePeerID   int64
 	MessageID      int
@@ -67,6 +69,7 @@ type Event struct {
 }
 
 type MonitorPeer struct {
+	OwnerUserID    int64
 	PeerType       string
 	PeerID         int64
 	AccessHash     int64
@@ -80,7 +83,6 @@ type MonitorPeer struct {
 }
 
 type Stats struct {
-	Subscribers  int
 	Keywords     int
 	Events       int
 	Peers        int
@@ -141,9 +143,17 @@ func (s *Store) pingAndMigrate(ctx context.Context) error {
 		}
 	}
 
-	for _, stmt := range schema {
-		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("sqlite migrate: %w", err)
+	if err := s.migrateLegacyTenancy(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateOAuthRequests(ctx); err != nil {
+		return err
+	}
+	for _, statements := range [][]string{schema, oauthSchema, tenancySchema} {
+		for _, stmt := range statements {
+			if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+				return fmt.Errorf("sqlite migrate: %w", err)
+			}
 		}
 	}
 	return nil
@@ -171,13 +181,14 @@ var schema = []string{
 		fingerprint TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL, mime TEXT NOT NULL, expires_at INTEGER NOT NULL
 	)`,
 	`CREATE TABLE IF NOT EXISTS notification_receipts (
+		account_id INTEGER NOT NULL,
 		chat_id INTEGER NOT NULL,
 		event_id TEXT NOT NULL,
 		digest TEXT NOT NULL,
 		status TEXT NOT NULL CHECK(status IN ('pending', 'sent')),
 		message_id INTEGER NOT NULL DEFAULT 0,
 		created_at TEXT NOT NULL,
-		PRIMARY KEY(chat_id, event_id)
+		PRIMARY KEY(account_id, chat_id, event_id)
 	)`,
 	`CREATE TABLE IF NOT EXISTS subscribers (
 		chat_id INTEGER PRIMARY KEY,
@@ -189,9 +200,11 @@ var schema = []string{
 	)`,
 	`CREATE TABLE IF NOT EXISTS keywords (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		phrase TEXT NOT NULL COLLATE NOCASE UNIQUE,
+		owner_user_id INTEGER NOT NULL,
+		phrase TEXT NOT NULL COLLATE NOCASE,
 		enabled INTEGER NOT NULL DEFAULT 1,
-		created_at TEXT NOT NULL
+		created_at TEXT NOT NULL,
+		UNIQUE(owner_user_id, phrase)
 	)`,
 	`CREATE TABLE IF NOT EXISTS keyword_terms (
 		keyword_id INTEGER NOT NULL,
@@ -240,6 +253,7 @@ var schema = []string{
 	)`,
 	`CREATE TABLE IF NOT EXISTS events (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		owner_user_id INTEGER NOT NULL,
 		source_peer_type TEXT NOT NULL,
 		source_peer_id INTEGER NOT NULL,
 		message_id INTEGER NOT NULL,
@@ -247,9 +261,10 @@ var schema = []string{
 		text TEXT NOT NULL,
 		keyword TEXT NOT NULL,
 		created_at TEXT NOT NULL,
-		UNIQUE(source_peer_type, source_peer_id, message_id, keyword)
+		UNIQUE(owner_user_id, source_peer_type, source_peer_id, message_id, keyword)
 	)`,
-	`CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at DESC)`,
+	`DROP INDEX IF EXISTS idx_events_created_at`,
+	`CREATE INDEX IF NOT EXISTS idx_events_owner_created_at ON events(owner_user_id, created_at DESC)`,
 	`CREATE TABLE IF NOT EXISTS event_match_details (
 		event_id INTEGER PRIMARY KEY,
 		keyword_id INTEGER NOT NULL DEFAULT 0,
@@ -258,6 +273,7 @@ var schema = []string{
 		FOREIGN KEY(event_id) REFERENCES events(id) ON DELETE CASCADE
 	)`,
 	`CREATE TABLE IF NOT EXISTS monitor_peers (
+		owner_user_id INTEGER NOT NULL,
 		peer_type TEXT NOT NULL,
 		peer_id INTEGER NOT NULL,
 		access_hash INTEGER NOT NULL DEFAULT 0,
@@ -268,9 +284,10 @@ var schema = []string{
 		discovered_at TEXT NOT NULL,
 		updated_at TEXT NOT NULL,
 		last_backfill_at TEXT NOT NULL DEFAULT '',
-		PRIMARY KEY(peer_type, peer_id)
+		PRIMARY KEY(owner_user_id, peer_type, peer_id)
 	)`,
-	`CREATE INDEX IF NOT EXISTS idx_monitor_peers_enabled ON monitor_peers(enabled, title COLLATE NOCASE)`,
+	`DROP INDEX IF EXISTS idx_monitor_peers_enabled`,
+	`CREATE INDEX IF NOT EXISTS idx_monitor_peers_owner_enabled ON monitor_peers(owner_user_id, enabled, title COLLATE NOCASE)`,
 	`CREATE TABLE IF NOT EXISTS update_state (
 		user_id INTEGER PRIMARY KEY,
 		pts INTEGER NOT NULL,
@@ -361,100 +378,6 @@ var schema = []string{
 		)`,
 	`CREATE INDEX IF NOT EXISTS idx_private_message_deletions_pending
 		ON private_message_deletions(owner_user_id, notified_at, observed_at)`,
-	`CREATE TABLE IF NOT EXISTS codex_projects (
-		slug TEXT PRIMARY KEY COLLATE NOCASE,
-		title TEXT NOT NULL,
-		telegram_channel_id INTEGER NOT NULL,
-		telegram_access_hash INTEGER NOT NULL,
-		telegram_chat_id INTEGER NOT NULL UNIQUE,
-		created_at TEXT NOT NULL,
-		updated_at TEXT NOT NULL
-	)`,
-	`CREATE TABLE IF NOT EXISTS codex_threads (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		project_slug TEXT NOT NULL COLLATE NOCASE,
-		telegram_chat_id INTEGER NOT NULL,
-		telegram_topic_id INTEGER NOT NULL,
-		title TEXT NOT NULL,
-		codex_thread_id TEXT NOT NULL DEFAULT '',
-		created_at TEXT NOT NULL,
-		updated_at TEXT NOT NULL,
-		UNIQUE(telegram_chat_id, telegram_topic_id),
-		FOREIGN KEY(project_slug) REFERENCES codex_projects(slug) ON DELETE CASCADE
-	)`,
-	`CREATE INDEX IF NOT EXISTS idx_codex_threads_codex_id ON codex_threads(codex_thread_id)`,
-	`CREATE TABLE IF NOT EXISTS codex_thread_aliases (
-		thread_id INTEGER NOT NULL,
-		codex_thread_id TEXT NOT NULL UNIQUE,
-		observed_at TEXT NOT NULL,
-		FOREIGN KEY(thread_id) REFERENCES codex_threads(id) ON DELETE CASCADE
-	)`,
-	`CREATE INDEX IF NOT EXISTS idx_codex_thread_aliases_thread ON codex_thread_aliases(thread_id)`,
-	`INSERT OR IGNORE INTO codex_thread_aliases(thread_id, codex_thread_id, observed_at)
-		SELECT id, codex_thread_id, updated_at FROM codex_threads WHERE codex_thread_id != ''`,
-	`CREATE TABLE IF NOT EXISTS codex_deleted_topics (
-		thread_id INTEGER PRIMARY KEY,
-		deleted_at TEXT NOT NULL,
-		FOREIGN KEY(thread_id) REFERENCES codex_threads(id) ON DELETE CASCADE
-	)`,
-	`CREATE TABLE IF NOT EXISTS codex_thread_mirrors (
-		thread_id INTEGER PRIMARY KEY,
-		cwd TEXT NOT NULL DEFAULT '',
-		telegram_message_id INTEGER NOT NULL DEFAULT 0,
-		content_hash TEXT NOT NULL DEFAULT '',
-		updated_at TEXT NOT NULL,
-		FOREIGN KEY(thread_id) REFERENCES codex_threads(id) ON DELETE CASCADE
-	)`,
-	`CREATE TABLE IF NOT EXISTS codex_read_receipts (
-		thread_id INTEGER PRIMARY KEY,
-		requested_at TEXT NOT NULL,
-		delivered_at TEXT NOT NULL DEFAULT '',
-		FOREIGN KEY(thread_id) REFERENCES codex_threads(id) ON DELETE CASCADE
-	)`,
-	`CREATE TABLE IF NOT EXISTS codex_topic_read_states (
-		thread_id INTEGER PRIMARY KEY,
-		is_unread INTEGER NOT NULL,
-		read_max_id INTEGER NOT NULL DEFAULT 0,
-		updated_at TEXT NOT NULL,
-		FOREIGN KEY(thread_id) REFERENCES codex_threads(id) ON DELETE CASCADE
-	)`,
-	`CREATE TABLE IF NOT EXISTS telegram_bridge_migrations (
-		name TEXT PRIMARY KEY,
-		applied_at TEXT NOT NULL
-	)`,
-	`INSERT INTO codex_read_receipts(thread_id, requested_at, delivered_at)
-		SELECT thread_id, updated_at, '' FROM codex_topic_read_states
-		WHERE is_unread = 0 AND NOT EXISTS (
-			SELECT 1 FROM telegram_bridge_migrations WHERE name = 'requeue-read-receipts-for-desktop-atom-v2'
-		)
-		ON CONFLICT(thread_id) DO UPDATE SET requested_at = excluded.requested_at, delivered_at = ''`,
-	`INSERT OR IGNORE INTO telegram_bridge_migrations(name, applied_at)
-		VALUES('requeue-read-receipts-for-desktop-atom-v2', CURRENT_TIMESTAMP)`,
-	`CREATE TABLE IF NOT EXISTS codex_outbound_messages (
-		telegram_chat_id INTEGER NOT NULL,
-		telegram_topic_id INTEGER NOT NULL,
-		telegram_message_id INTEGER NOT NULL DEFAULT 0,
-		text TEXT NOT NULL,
-		created_at TEXT NOT NULL,
-		PRIMARY KEY(telegram_chat_id, telegram_topic_id, telegram_message_id)
-	)`,
-	`CREATE TABLE IF NOT EXISTS codex_jobs (
-		id TEXT PRIMARY KEY,
-		thread_id INTEGER NOT NULL,
-		prompt TEXT NOT NULL,
-		status TEXT NOT NULL CHECK(status IN ('queued', 'claimed', 'running', 'succeeded', 'failed')),
-		worker_id TEXT NOT NULL DEFAULT '',
-		lease_token TEXT NOT NULL DEFAULT '',
-		lease_expires_at TEXT NOT NULL DEFAULT '',
-		result TEXT NOT NULL DEFAULT '',
-		error TEXT NOT NULL DEFAULT '',
-		created_at TEXT NOT NULL,
-		updated_at TEXT NOT NULL,
-		started_at TEXT NOT NULL DEFAULT '',
-		finished_at TEXT NOT NULL DEFAULT '',
-		FOREIGN KEY(thread_id) REFERENCES codex_threads(id) ON DELETE CASCADE
-	)`,
-	`CREATE INDEX IF NOT EXISTS idx_codex_jobs_claim ON codex_jobs(status, created_at)`,
 }
 
 func (s *Store) UpsertSubscriber(ctx context.Context, sub Subscriber) error {
@@ -591,70 +514,26 @@ func (s *Store) MarkLoginTokenUsed(ctx context.Context, token string) error {
 	return nil
 }
 
-func (s *Store) ListSubscribers(ctx context.Context) ([]Subscriber, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT chat_id, username, first_name, last_name, created_at, last_seen_at
-		FROM subscribers
-		ORDER BY created_at DESC
-	`)
-	if err != nil {
-		return nil, fmt.Errorf("list subscribers: %w", err)
-	}
-	defer rows.Close()
-
-	var out []Subscriber
-	for rows.Next() {
-		var sub Subscriber
-		var createdAt, lastSeenAt string
-		if err := rows.Scan(&sub.ChatID, &sub.Username, &sub.FirstName, &sub.LastName, &createdAt, &lastSeenAt); err != nil {
-			return nil, fmt.Errorf("scan subscriber: %w", err)
-		}
-		sub.CreatedAt = parseDBTime(createdAt)
-		sub.LastSeenAt = parseDBTime(lastSeenAt)
-		out = append(out, sub)
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) FirstSubscriber(ctx context.Context) (Subscriber, bool, error) {
-	row := s.db.QueryRowContext(ctx, `
-		SELECT chat_id, username, first_name, last_name, created_at, last_seen_at
-		FROM subscribers
-		ORDER BY created_at ASC
-		LIMIT 1
-	`)
-
-	var sub Subscriber
-	var createdAt, lastSeenAt string
-	err := row.Scan(&sub.ChatID, &sub.Username, &sub.FirstName, &sub.LastName, &createdAt, &lastSeenAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Subscriber{}, false, nil
-	}
-	if err != nil {
-		return Subscriber{}, false, fmt.Errorf("first subscriber: %w", err)
-	}
-	sub.CreatedAt = parseDBTime(createdAt)
-	sub.LastSeenAt = parseDBTime(lastSeenAt)
-	return sub, true, nil
-}
-
-func (s *Store) AddKeyword(ctx context.Context, phrase string) (Keyword, error) {
+func (s *Store) AddKeyword(ctx context.Context, ownerUserID int64, phrase string) (Keyword, error) {
 	phrase = strings.TrimSpace(phrase)
 	if phrase == "" {
 		return Keyword{}, errors.New("keyword is empty")
 	}
+	if ownerUserID <= 0 {
+		return Keyword{}, errors.New("keyword owner is required")
+	}
 
 	createdAt := nowText()
 	res, err := s.db.ExecContext(ctx, `
-		INSERT INTO keywords(phrase, enabled, created_at)
-		VALUES(?, 1, ?)
-		ON CONFLICT(phrase) DO UPDATE SET enabled = 1
-	`, phrase, createdAt)
+		INSERT INTO keywords(owner_user_id, phrase, enabled, created_at)
+		VALUES(?, ?, 1, ?)
+		ON CONFLICT(owner_user_id, phrase) DO UPDATE SET enabled = 1
+	`, ownerUserID, phrase, createdAt)
 	if err != nil {
 		return Keyword{}, fmt.Errorf("add keyword: %w", err)
 	}
 	if affected, _ := res.RowsAffected(); affected > 0 {
-		keyword, getErr := s.GetKeywordByPhrase(ctx, phrase)
+		keyword, getErr := s.GetKeywordByPhrase(ctx, ownerUserID, phrase)
 		if getErr != nil {
 			return Keyword{}, getErr
 		}
@@ -668,10 +547,11 @@ func (s *Store) AddKeyword(ctx context.Context, phrase string) (Keyword, error) 
 		}
 	}
 
-	return s.GetKeywordByPhrase(ctx, phrase)
+	return s.GetKeywordByPhrase(ctx, ownerUserID, phrase)
 }
 
-func (s *Store) UpsertWatchRule(ctx context.Context, rule Keyword) (Keyword, error) {
+func (s *Store) UpsertWatchRule(ctx context.Context, ownerUserID int64, rule Keyword) (Keyword, error) {
+	rule.OwnerUserID = ownerUserID
 	rule, err := prepareWatchRule(rule)
 	if err != nil {
 		return Keyword{}, err
@@ -688,15 +568,19 @@ func (s *Store) UpsertWatchRule(ctx context.Context, rule Keyword) (Keyword, err
 	if err := tx.Commit(); err != nil {
 		return Keyword{}, fmt.Errorf("commit watch rule update: %w", err)
 	}
-	return s.GetKeywordByPhrase(ctx, rule.Phrase)
+	return s.GetKeywordByPhrase(ctx, ownerUserID, rule.Phrase)
 }
 
 // ApplyWatchRules applies a declarative rule update in one transaction. New
 // rules are written before the explicitly named old rules are deleted.
-func (s *Store) ApplyWatchRules(ctx context.Context, rules []Keyword, deleteValues []string) (int64, error) {
+func (s *Store) ApplyWatchRules(ctx context.Context, ownerUserID int64, rules []Keyword, deleteValues []string) (int64, error) {
+	if ownerUserID <= 0 {
+		return 0, errors.New("watch rule owner is required")
+	}
 	prepared := make([]Keyword, 0, len(rules))
 	names := make(map[string]bool, len(rules))
 	for _, rule := range rules {
+		rule.OwnerUserID = ownerUserID
 		item, err := prepareWatchRule(rule)
 		if err != nil {
 			return 0, err
@@ -734,9 +618,9 @@ func (s *Store) ApplyWatchRules(ctx context.Context, rules []Keyword, deleteValu
 	for _, value := range deletes {
 		var res sql.Result
 		if id, parseErr := strconv.ParseInt(value, 10, 64); parseErr == nil {
-			res, err = tx.ExecContext(ctx, `DELETE FROM keywords WHERE id = ?`, id)
+			res, err = tx.ExecContext(ctx, `DELETE FROM keywords WHERE id = ? AND owner_user_id = ?`, id, ownerUserID)
 		} else {
-			res, err = tx.ExecContext(ctx, `DELETE FROM keywords WHERE phrase = ? COLLATE NOCASE`, value)
+			res, err = tx.ExecContext(ctx, `DELETE FROM keywords WHERE phrase = ? COLLATE NOCASE AND owner_user_id = ?`, value, ownerUserID)
 		}
 		if err != nil {
 			return 0, fmt.Errorf("delete old watch rule %q: %w", value, err)
@@ -758,6 +642,9 @@ func prepareWatchRule(rule Keyword) (Keyword, error) {
 	if rule.Phrase == "" {
 		return Keyword{}, errors.New("rule name is empty")
 	}
+	if rule.OwnerUserID <= 0 {
+		return Keyword{}, errors.New("rule owner is required")
+	}
 	rule.AnyTerms = cleanTerms(rule.AnyTerms)
 	rule.AllTerms = cleanTerms(rule.AllTerms)
 	rule.RequiredAnyGroups = cleanTermGroups(rule.RequiredAnyGroups)
@@ -776,13 +663,13 @@ func prepareWatchRule(rule Keyword) (Keyword, error) {
 
 func upsertWatchRuleTx(ctx context.Context, tx *sql.Tx, rule *Keyword) error {
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO keywords(phrase, enabled, created_at)
-		VALUES(?, 1, ?)
-		ON CONFLICT(phrase) DO UPDATE SET enabled = 1
-	`, rule.Phrase, nowText()); err != nil {
+		INSERT INTO keywords(owner_user_id, phrase, enabled, created_at)
+		VALUES(?, ?, 1, ?)
+		ON CONFLICT(owner_user_id, phrase) DO UPDATE SET enabled = 1
+	`, rule.OwnerUserID, rule.Phrase, nowText()); err != nil {
 		return fmt.Errorf("upsert watch rule: %w", err)
 	}
-	if err := tx.QueryRowContext(ctx, `SELECT id FROM keywords WHERE phrase = ? COLLATE NOCASE`, rule.Phrase).Scan(&rule.ID); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM keywords WHERE owner_user_id = ? AND phrase = ? COLLATE NOCASE`, rule.OwnerUserID, rule.Phrase).Scan(&rule.ID); err != nil {
 		return fmt.Errorf("resolve watch rule id: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM keyword_terms WHERE keyword_id = ?`, rule.ID); err != nil {
@@ -853,15 +740,15 @@ func upsertWatchRuleTx(ctx context.Context, tx *sql.Tx, rule *Keyword) error {
 	return nil
 }
 
-func (s *Store) GetKeywordByPhrase(ctx context.Context, phrase string) (Keyword, error) {
+func (s *Store) GetKeywordByPhrase(ctx context.Context, ownerUserID int64, phrase string) (Keyword, error) {
 	var keyword Keyword
 	var enabled int
 	var createdAt string
 	err := s.db.QueryRowContext(ctx, `
-		SELECT id, phrase, enabled, created_at
+		SELECT id, owner_user_id, phrase, enabled, created_at
 		FROM keywords
-		WHERE phrase = ?
-	`, phrase).Scan(&keyword.ID, &keyword.Phrase, &enabled, &createdAt)
+		WHERE owner_user_id = ? AND phrase = ?
+	`, ownerUserID, phrase).Scan(&keyword.ID, &keyword.OwnerUserID, &keyword.Phrase, &enabled, &createdAt)
 	if err != nil {
 		return Keyword{}, fmt.Errorf("get keyword: %w", err)
 	}
@@ -873,7 +760,7 @@ func (s *Store) GetKeywordByPhrase(ctx context.Context, phrase string) (Keyword,
 	return keyword, nil
 }
 
-func (s *Store) DeleteKeyword(ctx context.Context, value string) (int64, error) {
+func (s *Store) DeleteKeyword(ctx context.Context, ownerUserID int64, value string) (int64, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return 0, errors.New("keyword is empty")
@@ -884,9 +771,9 @@ func (s *Store) DeleteKeyword(ctx context.Context, value string) (int64, error) 
 		err error
 	)
 	if id, parseErr := strconv.ParseInt(value, 10, 64); parseErr == nil {
-		res, err = s.db.ExecContext(ctx, `DELETE FROM keywords WHERE id = ?`, id)
+		res, err = s.db.ExecContext(ctx, `DELETE FROM keywords WHERE id = ? AND owner_user_id = ?`, id, ownerUserID)
 	} else {
-		res, err = s.db.ExecContext(ctx, `DELETE FROM keywords WHERE phrase = ? COLLATE NOCASE`, value)
+		res, err = s.db.ExecContext(ctx, `DELETE FROM keywords WHERE phrase = ? COLLATE NOCASE AND owner_user_id = ?`, value, ownerUserID)
 	}
 	if err != nil {
 		return 0, fmt.Errorf("delete keyword: %w", err)
@@ -898,13 +785,13 @@ func (s *Store) DeleteKeyword(ctx context.Context, value string) (int64, error) 
 	return rows, nil
 }
 
-func (s *Store) ListKeywords(ctx context.Context) ([]Keyword, error) {
+func (s *Store) ListKeywords(ctx context.Context, ownerUserID int64) ([]Keyword, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, phrase, enabled, created_at
+		SELECT id, owner_user_id, phrase, enabled, created_at
 		FROM keywords
-		WHERE enabled = 1
+		WHERE owner_user_id = ? AND enabled = 1
 		ORDER BY phrase COLLATE NOCASE
-	`)
+	`, ownerUserID)
 	if err != nil {
 		return nil, fmt.Errorf("list keywords: %w", err)
 	}
@@ -915,7 +802,7 @@ func (s *Store) ListKeywords(ctx context.Context) ([]Keyword, error) {
 		var item Keyword
 		var enabled int
 		var createdAt string
-		if err := rows.Scan(&item.ID, &item.Phrase, &enabled, &createdAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.OwnerUserID, &item.Phrase, &enabled, &createdAt); err != nil {
 			return nil, fmt.Errorf("scan keyword: %w", err)
 		}
 		item.Enabled = enabled == 1
@@ -1089,6 +976,9 @@ func cleanRuleSources(values []RuleSource) []RuleSource {
 }
 
 func (s *Store) RecordEvent(ctx context.Context, event Event) (Event, bool, error) {
+	if event.OwnerUserID <= 0 {
+		return Event{}, false, errors.New("event owner is required")
+	}
 	if event.MessageDate.IsZero() {
 		event.MessageDate = time.Now().UTC()
 	}
@@ -1101,9 +991,9 @@ func (s *Store) RecordEvent(ctx context.Context, event Event) (Event, bool, erro
 	}
 	defer tx.Rollback()
 	res, err := tx.ExecContext(ctx, `
-		INSERT OR IGNORE INTO events(source_peer_type, source_peer_id, message_id, message_date, text, keyword, created_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?)
-	`, event.SourcePeerType, event.SourcePeerID, event.MessageID, formatTime(event.MessageDate), event.Text, event.Keyword, formatTime(event.CreatedAt))
+		INSERT OR IGNORE INTO events(owner_user_id, source_peer_type, source_peer_id, message_id, message_date, text, keyword, created_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+	`, event.OwnerUserID, event.SourcePeerType, event.SourcePeerID, event.MessageID, formatTime(event.MessageDate), event.Text, event.Keyword, formatTime(event.CreatedAt))
 	if err != nil {
 		return Event{}, false, fmt.Errorf("record event: %w", err)
 	}
@@ -1133,16 +1023,16 @@ func (s *Store) RecordEvent(ctx context.Context, event Event) (Event, bool, erro
 	return event, true, nil
 }
 
-func (s *Store) GetEvent(ctx context.Context, id int64) (Event, bool, error) {
+func (s *Store) GetEvent(ctx context.Context, ownerUserID, id int64) (Event, bool, error) {
 	var item Event
 	var messageDate, createdAt string
 	err := s.db.QueryRowContext(ctx, `
-		SELECT e.id, e.source_peer_type, e.source_peer_id, e.message_id, e.message_date, e.text, e.keyword,
+		SELECT e.id, e.owner_user_id, e.source_peer_type, e.source_peer_id, e.message_id, e.message_date, e.text, e.keyword,
 		       COALESCE(d.keyword_id, 0), COALESCE(d.reason, ''), COALESCE(d.score, 0), e.created_at
 		FROM events e
 		LEFT JOIN event_match_details d ON d.event_id = e.id
-		WHERE e.id = ?
-	`, id).Scan(&item.ID, &item.SourcePeerType, &item.SourcePeerID, &item.MessageID, &messageDate, &item.Text, &item.Keyword,
+		WHERE e.id = ? AND e.owner_user_id = ?
+	`, id, ownerUserID).Scan(&item.ID, &item.OwnerUserID, &item.SourcePeerType, &item.SourcePeerID, &item.MessageID, &messageDate, &item.Text, &item.Keyword,
 		&item.RuleID, &item.MatchReason, &item.MatchScore, &createdAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Event{}, false, nil
@@ -1155,18 +1045,19 @@ func (s *Store) GetEvent(ctx context.Context, id int64) (Event, bool, error) {
 	return item, true, nil
 }
 
-func (s *Store) ListEvents(ctx context.Context, limit int) ([]Event, error) {
+func (s *Store) ListEvents(ctx context.Context, ownerUserID int64, limit int) ([]Event, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 50
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT e.id, e.source_peer_type, e.source_peer_id, e.message_id, e.message_date, e.text, e.keyword,
+		SELECT e.id, e.owner_user_id, e.source_peer_type, e.source_peer_id, e.message_id, e.message_date, e.text, e.keyword,
 		       COALESCE(d.keyword_id, 0), COALESCE(d.reason, ''), COALESCE(d.score, 0), e.created_at
 		FROM events e
 		LEFT JOIN event_match_details d ON d.event_id = e.id
+		WHERE e.owner_user_id = ?
 		ORDER BY e.created_at DESC
 		LIMIT ?
-	`, limit)
+	`, ownerUserID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list events: %w", err)
 	}
@@ -1176,7 +1067,7 @@ func (s *Store) ListEvents(ctx context.Context, limit int) ([]Event, error) {
 	for rows.Next() {
 		var item Event
 		var messageDate, createdAt string
-		if err := rows.Scan(&item.ID, &item.SourcePeerType, &item.SourcePeerID, &item.MessageID, &messageDate, &item.Text, &item.Keyword,
+		if err := rows.Scan(&item.ID, &item.OwnerUserID, &item.SourcePeerType, &item.SourcePeerID, &item.MessageID, &messageDate, &item.Text, &item.Keyword,
 			&item.RuleID, &item.MatchReason, &item.MatchScore, &createdAt); err != nil {
 			return nil, fmt.Errorf("scan event: %w", err)
 		}
@@ -1188,6 +1079,9 @@ func (s *Store) ListEvents(ctx context.Context, limit int) ([]Event, error) {
 }
 
 func (s *Store) UpsertMonitorPeer(ctx context.Context, peer MonitorPeer) error {
+	if peer.OwnerUserID <= 0 {
+		return errors.New("peer owner is required")
+	}
 	if peer.PeerType == "" {
 		return errors.New("peer type is empty")
 	}
@@ -1199,32 +1093,33 @@ func (s *Store) UpsertMonitorPeer(ctx context.Context, peer MonitorPeer) error {
 		peer.DiscoveredAt = now
 	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO monitor_peers(peer_type, peer_id, access_hash, title, username, kind, enabled, discovered_at, updated_at, last_backfill_at)
-		VALUES(?, ?, ?, ?, ?, ?, 0, ?, ?, '')
-		ON CONFLICT(peer_type, peer_id) DO UPDATE SET
+		INSERT INTO monitor_peers(owner_user_id, peer_type, peer_id, access_hash, title, username, kind, enabled, discovered_at, updated_at, last_backfill_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, 0, ?, ?, '')
+		ON CONFLICT(owner_user_id, peer_type, peer_id) DO UPDATE SET
 			access_hash = excluded.access_hash,
 			title = excluded.title,
 			username = excluded.username,
 			kind = excluded.kind,
 			updated_at = excluded.updated_at
-	`, peer.PeerType, peer.PeerID, peer.AccessHash, peer.Title, peer.Username, peer.Kind, formatTime(peer.DiscoveredAt), formatTime(now))
+	`, peer.OwnerUserID, peer.PeerType, peer.PeerID, peer.AccessHash, peer.Title, peer.Username, peer.Kind, formatTime(peer.DiscoveredAt), formatTime(now))
 	if err != nil {
 		return fmt.Errorf("upsert monitor peer: %w", err)
 	}
 	return nil
 }
 
-func (s *Store) ListMonitorPeers(ctx context.Context, enabledOnly bool) ([]MonitorPeer, error) {
+func (s *Store) ListMonitorPeers(ctx context.Context, ownerUserID int64, enabledOnly bool) ([]MonitorPeer, error) {
 	query := `
-		SELECT peer_type, peer_id, access_hash, title, username, kind, enabled, discovered_at, updated_at, last_backfill_at
+		SELECT owner_user_id, peer_type, peer_id, access_hash, title, username, kind, enabled, discovered_at, updated_at, last_backfill_at
 		FROM monitor_peers
+		WHERE owner_user_id = ?
 	`
 	if enabledOnly {
-		query += ` WHERE enabled = 1`
+		query += ` AND enabled = 1`
 	}
 	query += ` ORDER BY enabled DESC, title COLLATE NOCASE, peer_id`
 
-	rows, err := s.db.QueryContext(ctx, query)
+	rows, err := s.db.QueryContext(ctx, query, ownerUserID)
 	if err != nil {
 		return nil, fmt.Errorf("list monitor peers: %w", err)
 	}
@@ -1241,12 +1136,12 @@ func (s *Store) ListMonitorPeers(ctx context.Context, enabledOnly bool) ([]Monit
 	return out, rows.Err()
 }
 
-func (s *Store) GetMonitorPeer(ctx context.Context, peerType string, peerID int64) (MonitorPeer, bool, error) {
+func (s *Store) GetMonitorPeer(ctx context.Context, ownerUserID int64, peerType string, peerID int64) (MonitorPeer, bool, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT peer_type, peer_id, access_hash, title, username, kind, enabled, discovered_at, updated_at, last_backfill_at
+		SELECT owner_user_id, peer_type, peer_id, access_hash, title, username, kind, enabled, discovered_at, updated_at, last_backfill_at
 		FROM monitor_peers
-		WHERE peer_type = ? AND peer_id = ?
-	`, peerType, peerID)
+		WHERE owner_user_id = ? AND peer_type = ? AND peer_id = ?
+	`, ownerUserID, peerType, peerID)
 	peer, err := scanMonitorPeer(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return MonitorPeer{}, false, nil
@@ -1257,7 +1152,7 @@ func (s *Store) GetMonitorPeer(ctx context.Context, peerType string, peerID int6
 	return peer, true, nil
 }
 
-func (s *Store) SetMonitorPeerEnabled(ctx context.Context, peerType string, peerID int64, enabled bool) error {
+func (s *Store) SetMonitorPeerEnabled(ctx context.Context, ownerUserID int64, peerType string, peerID int64, enabled bool) error {
 	value := 0
 	if enabled {
 		value = 1
@@ -1265,8 +1160,8 @@ func (s *Store) SetMonitorPeerEnabled(ctx context.Context, peerType string, peer
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE monitor_peers
 		SET enabled = ?, updated_at = ?
-		WHERE peer_type = ? AND peer_id = ?
-	`, value, nowText(), peerType, peerID)
+		WHERE owner_user_id = ? AND peer_type = ? AND peer_id = ?
+	`, value, nowText(), ownerUserID, peerType, peerID)
 	if err != nil {
 		return fmt.Errorf("set monitor peer enabled: %w", err)
 	}
@@ -1280,13 +1175,13 @@ func (s *Store) SetMonitorPeerEnabled(ctx context.Context, peerType string, peer
 	return nil
 }
 
-func (s *Store) IsMonitorPeerEnabled(ctx context.Context, peerType string, peerID int64) (bool, error) {
+func (s *Store) IsMonitorPeerEnabled(ctx context.Context, ownerUserID int64, peerType string, peerID int64) (bool, error) {
 	var enabled int
 	err := s.db.QueryRowContext(ctx, `
 		SELECT enabled
 		FROM monitor_peers
-		WHERE peer_type = ? AND peer_id = ?
-	`, peerType, peerID).Scan(&enabled)
+		WHERE owner_user_id = ? AND peer_type = ? AND peer_id = ?
+	`, ownerUserID, peerType, peerID).Scan(&enabled)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -1296,36 +1191,33 @@ func (s *Store) IsMonitorPeerEnabled(ctx context.Context, peerType string, peerI
 	return enabled == 1, nil
 }
 
-func (s *Store) SetMonitorPeerBackfilled(ctx context.Context, peerType string, peerID int64, at time.Time) error {
+func (s *Store) SetMonitorPeerBackfilled(ctx context.Context, ownerUserID int64, peerType string, peerID int64, at time.Time) error {
 	if at.IsZero() {
 		at = time.Now().UTC()
 	}
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE monitor_peers
 		SET last_backfill_at = ?, updated_at = ?
-		WHERE peer_type = ? AND peer_id = ?
-	`, formatTime(at), nowText(), peerType, peerID)
+		WHERE owner_user_id = ? AND peer_type = ? AND peer_id = ?
+	`, formatTime(at), nowText(), ownerUserID, peerType, peerID)
 	if err != nil {
 		return fmt.Errorf("set monitor peer backfilled: %w", err)
 	}
 	return nil
 }
 
-func (s *Store) Stats(ctx context.Context) (Stats, error) {
+func (s *Store) Stats(ctx context.Context, ownerUserID int64) (Stats, error) {
 	var stats Stats
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM subscribers`).Scan(&stats.Subscribers); err != nil {
-		return Stats{}, fmt.Errorf("count subscribers: %w", err)
-	}
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM keywords WHERE enabled = 1`).Scan(&stats.Keywords); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM keywords WHERE owner_user_id = ? AND enabled = 1`, ownerUserID).Scan(&stats.Keywords); err != nil {
 		return Stats{}, fmt.Errorf("count keywords: %w", err)
 	}
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events`).Scan(&stats.Events); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE owner_user_id = ?`, ownerUserID).Scan(&stats.Events); err != nil {
 		return Stats{}, fmt.Errorf("count events: %w", err)
 	}
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM monitor_peers`).Scan(&stats.Peers); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM monitor_peers WHERE owner_user_id = ?`, ownerUserID).Scan(&stats.Peers); err != nil {
 		return Stats{}, fmt.Errorf("count monitor peers: %w", err)
 	}
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM monitor_peers WHERE enabled = 1`).Scan(&stats.EnabledPeers); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM monitor_peers WHERE owner_user_id = ? AND enabled = 1`, ownerUserID).Scan(&stats.EnabledPeers); err != nil {
 		return Stats{}, fmt.Errorf("count enabled monitor peers: %w", err)
 	}
 	return stats, nil
@@ -1569,6 +1461,7 @@ func scanMonitorPeer(scanner monitorPeerScanner) (MonitorPeer, error) {
 	var enabled int
 	var discoveredAt, updatedAt, lastBackfillAt string
 	if err := scanner.Scan(
+		&peer.OwnerUserID,
 		&peer.PeerType,
 		&peer.PeerID,
 		&peer.AccessHash,

@@ -40,24 +40,32 @@ func TestHandlerRecordsAndNotifiesKeywordMatchOnce(t *testing.T) {
 	}
 	defer store.Close()
 
-	if _, err := store.AddKeyword(ctx, "radar"); err != nil {
+	const owner, otherOwner = int64(100), int64(200)
+	if _, err := store.AddKeyword(ctx, owner, "radar"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpsertMonitorPeer(ctx, db.MonitorPeer{
-		PeerType:   "channel",
-		PeerID:     1001,
-		AccessHash: 123,
-		Title:      "Radar Channel",
-		Kind:       "channel",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.SetMonitorPeerEnabled(ctx, "channel", 1001, true); err != nil {
-		t.Fatal(err)
+	for _, peerOwner := range []int64{owner, otherOwner} {
+		if err := store.UpsertMonitorPeer(ctx, db.MonitorPeer{
+			OwnerUserID: peerOwner,
+			PeerType:    "channel",
+			PeerID:      1001,
+			AccessHash:  123,
+			Title:       "Radar Channel",
+			Kind:        "channel",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.SetMonitorPeerEnabled(ctx, peerOwner, "channel", 1001, true); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	notifier := &captureNotifier{}
 	handler := NewHandler(store, notifier)
+	handler.SetSelfUserID(owner)
+	otherNotifier := &captureNotifier{}
+	otherHandler := NewHandler(store, otherNotifier)
+	otherHandler.SetSelfUserID(otherOwner)
 	update := &tg.Updates{
 		Updates: []tg.UpdateClass{
 			&tg.UpdateNewChannelMessage{
@@ -77,15 +85,21 @@ func TestHandlerRecordsAndNotifiesKeywordMatchOnce(t *testing.T) {
 	if err := handler.Handle(ctx, update); err != nil {
 		t.Fatal(err)
 	}
+	if err := otherHandler.Handle(ctx, update); err != nil {
+		t.Fatal(err)
+	}
+	if events, err := store.ListEvents(ctx, otherOwner, 10); err != nil || len(events) != 0 || len(otherNotifier.events) != 0 {
+		t.Fatalf("another account's rule matched for a user without rules: events=%#v notified=%d err=%v", events, len(otherNotifier.events), err)
+	}
 
-	events, err := store.ListEvents(ctx, 10)
+	events, err := store.ListEvents(ctx, owner, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := len(events); got != 1 {
 		t.Fatalf("events len = %d, want 1", got)
 	}
-	if events[0].Keyword != "radar" {
+	if events[0].Keyword != "radar" || events[0].OwnerUserID != owner {
 		t.Fatalf("keyword = %q, want radar", events[0].Keyword)
 	}
 	if events[0].SourcePeerType != "channel" || events[0].SourcePeerID != 1001 {

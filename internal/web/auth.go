@@ -1,7 +1,6 @@
 package web
 
 import (
-	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -18,7 +17,7 @@ import (
 )
 
 const (
-	webAuthCookieName = "telegram_bridge_admin"
+	webAuthCookieName = "telegram_bridge_session"
 	webAuthMaxAge     = 24 * time.Hour
 	webInitDataMaxAge = 10 * time.Minute
 )
@@ -28,26 +27,34 @@ type telegramWebAppUser struct {
 }
 
 func (s *Server) dashboardEntry(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.authenticatedWebAdmin(r); ok {
-		s.dashboard(w, r)
+	if userID, ok := s.authenticatedWebUser(r); ok {
+		s.dashboard(w, r, userID)
 		return
 	}
 	renderWebAppBootstrap(w)
 }
 
-func (s *Server) requireWebAdmin(next http.HandlerFunc) http.HandlerFunc {
+// requireWebUser passes the signed-in Telegram user to next. Handlers must
+// scope every read and write to that user.
+func (s *Server) requireWebUser(next func(http.ResponseWriter, *http.Request, int64)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
-		if _, ok := s.authenticatedWebAdmin(r); !ok {
+		userID, ok := s.authenticatedWebUser(r)
+		if !ok {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		next(w, r)
+		next(w, r, userID)
 	}
 }
 
 func (s *Server) authenticateWebApp(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
+	// A cross-site form could otherwise sign a browser in as another user.
+	if !sameOriginRequest(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "invalid authentication payload", http.StatusBadRequest)
@@ -56,15 +63,6 @@ func (s *Server) authenticateWebApp(w http.ResponseWriter, r *http.Request) {
 	userID, err := validateTelegramWebAppInitData(r.FormValue("init_data"), s.cfg.BotToken, time.Now())
 	if err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-	admin, err := s.isWebAdmin(r.Context(), userID)
-	if err != nil {
-		http.Error(w, "could not verify administrator", http.StatusInternalServerError)
-		return
-	}
-	if !admin {
-		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -83,34 +81,16 @@ func (s *Server) authenticateWebApp(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (s *Server) authenticatedWebAdmin(r *http.Request) (int64, bool) {
+func (s *Server) authenticatedWebUser(r *http.Request) (int64, bool) {
 	cookie, err := r.Cookie(webAuthCookieName)
 	if err != nil {
 		return 0, false
 	}
 	userID, err := decodeWebSession(cookie.Value, s.cfg.BotToken, time.Now())
-	if err != nil {
+	if err != nil || userID <= 0 {
 		return 0, false
 	}
-	admin, err := s.isWebAdmin(r.Context(), userID)
-	return userID, err == nil && admin
-}
-
-func (s *Server) isWebAdmin(ctx context.Context, userID int64) (bool, error) {
-	if userID <= 0 {
-		return false, nil
-	}
-	if len(s.cfg.BotAdminChatIDs) > 0 {
-		return s.cfg.IsConfiguredBotAdmin(userID), nil
-	}
-	if s.store == nil {
-		return false, nil
-	}
-	first, ok, err := s.store.FirstSubscriber(ctx)
-	if err != nil || !ok {
-		return false, err
-	}
-	return first.ChatID == userID, nil
+	return userID, true
 }
 
 func validateTelegramWebAppInitData(raw, botToken string, now time.Time) (int64, error) {
@@ -209,6 +189,23 @@ func webSessionMAC(encoded, botToken string) []byte {
 	return mac.Sum(nil)
 }
 
+// sameOriginRequest rejects requests that a browser marks as cross-site or
+// that carry a foreign Origin. Clients that send neither header are not
+// browsers acting on another site's behalf.
+func sameOriginRequest(r *http.Request) bool {
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "", "same-origin", "none":
+	default:
+		return false
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	return err == nil && parsed.Host == r.Host
+}
+
 func requestUsesHTTPS(r *http.Request, publicBaseURL string) bool {
 	return r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") ||
 		strings.HasPrefix(strings.ToLower(strings.TrimSpace(publicBaseURL)), "https://")
@@ -241,7 +238,7 @@ const webAppBootstrapPage = `<!doctype html>
       const app = window.Telegram && window.Telegram.WebApp;
       const initData = app && app.initData;
       if (!initData) {
-        status.textContent = 'Open the dashboard from the telegram-bridge bot admin chat.';
+        status.textContent = 'Open the dashboard from the telegram-bridge bot.';
         return;
       }
       app.ready();
@@ -256,7 +253,7 @@ const webAppBootstrapPage = `<!doctype html>
         if (!response.ok) throw new Error('authentication rejected');
 		window.location.reload();
       } catch (_) {
-        status.textContent = 'Dashboard access was rejected. Open it from the configured admin chat.';
+        status.textContent = 'Dashboard access was rejected. Open it again from the bot.';
       }
     })();
   </script>

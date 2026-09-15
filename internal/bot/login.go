@@ -3,7 +3,6 @@ package bot
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log"
 	"net/url"
 	"strings"
@@ -45,40 +44,29 @@ func newLoginManager(service *Service) *loginManager {
 	}
 }
 
-func (m *loginManager) Start(ctx context.Context, message *telego.Message, payload string) error {
-	if message.Chat.Type != "private" {
-		return m.service.reply(ctx, message.Chat.ID, "Use /login in a private chat with this bot.", nil)
+// Start begins a login for the sender's own account. The phone number must
+// come from Telegram's contact button, which proves it belongs to the sender,
+// so the bot cannot be used to send login codes to other people's phones.
+func (m *loginManager) Start(ctx context.Context, message *telego.Message) error {
+	userID, private := privateSender(message)
+	if !private {
+		return m.service.reply(ctx, message.Chat.ID, "Используйте /login в личном чате с ботом.", nil)
 	}
-	if m.service.monitorService == nil {
-		return m.service.reply(ctx, message.Chat.ID, "Telegram user API is not configured.", nil)
+	if m.service.accounts == nil {
+		return m.service.reply(ctx, userID, "Telegram API не настроен на сервере.", nil)
 	}
-
-	admin, err := m.service.isAdminChat(ctx, message.Chat.ID)
+	connected, err := m.service.accounts.Connected(ctx, userID)
 	if err != nil {
 		return err
 	}
-	if !admin {
-		return m.service.reply(ctx, message.Chat.ID, "This chat is not allowed to run /login. Send /start from the admin chat first or set TELEGRAM_BRIDGE_ADMIN_CHAT_IDS.", nil)
+	if connected {
+		return m.service.reply(ctx, userID, "Ваш Telegram уже подключён. Чтобы подключить заново, сначала отправьте /logout.", nil)
 	}
 
-	if status := m.service.monitorService.Status(); status.Authorized {
-		if status.UserID != 0 {
-			return m.service.reply(ctx, message.Chat.ID, fmt.Sprintf("Authorized: user_id=%d.", status.UserID), nil)
-		}
-		return m.service.reply(ctx, message.Chat.ID, "Authorized.", nil)
-	}
-
-	if phone := normalizePhone(payload); phone != "" {
-		if err := m.service.store.SaveLoginPhone(ctx, message.Chat.ID, phone); err != nil {
-			return err
-		}
-		return m.sendLoginLink(ctx, message.Chat.ID, phone)
-	}
-
-	if phone, ok, err := m.service.store.LoginPhone(ctx, message.Chat.ID); err != nil {
+	if phone, ok, err := m.service.store.LoginPhone(ctx, userID); err != nil {
 		return err
 	} else if ok {
-		return m.sendLoginLink(ctx, message.Chat.ID, phone)
+		return m.sendLoginLink(ctx, userID, phone)
 	}
 
 	loginCtx, cancel := context.WithTimeout(context.Background(), loginTimeout)
@@ -92,13 +80,13 @@ func (m *loginManager) Start(ctx context.Context, message *telego.Message, paylo
 	if _, exists := m.sessions[message.Chat.ID]; exists {
 		m.mu.Unlock()
 		cancel()
-		return m.service.reply(ctx, message.Chat.ID, "Login already running. /cancel", nil)
+		return m.service.reply(ctx, message.Chat.ID, "Вход уже начат. /cancel — отменить.", nil)
 	}
 	m.sessions[message.Chat.ID] = session
 	m.mu.Unlock()
 
 	go m.expirePhonePrompt(loginCtx, session)
-	return m.sendPrompt(ctx, session, "Share phone", phoneKeyboard())
+	return m.sendPrompt(ctx, session, "Нажмите «Поделиться номером» — так Telegram подтвердит, что номер ваш.", phoneKeyboard())
 }
 
 func (m *loginManager) HandleMessage(ctx context.Context, message *telego.Message) (bool, error) {
@@ -115,38 +103,33 @@ func (m *loginManager) HandleMessage(ctx context.Context, message *telego.Messag
 	if strings.EqualFold(firstField(text), "/cancel") {
 		return true, m.Cancel(ctx, message.Chat.ID)
 	}
-	if strings.HasPrefix(text, "/") {
-		return true, m.service.reply(ctx, message.Chat.ID, "Send value or /cancel.", nil)
+	if text != "" && !strings.HasPrefix(text, "/") {
+		m.deleteIncoming(ctx, message)
 	}
-	if text == "" {
-		return true, m.service.reply(ctx, message.Chat.ID, "Send value or /cancel.", nil)
-	}
-
-	m.deleteIncoming(ctx, message)
-	return true, m.finishPhone(ctx, session, text)
+	return true, m.service.reply(ctx, message.Chat.ID, "Номер нужно отправить кнопкой «Поделиться номером». /cancel — отменить.", phoneKeyboard())
 }
 
 func (m *loginManager) Cancel(ctx context.Context, chatID int64) error {
 	session := m.takeSession(chatID)
 	if session == nil {
-		return m.service.reply(ctx, chatID, "No login is in progress.", nil)
+		return m.service.reply(ctx, chatID, "Вход не начат.", nil)
 	}
 	session.cancel()
 	m.deletePrompt(ctx, session)
-	return m.service.reply(ctx, chatID, "Cancelled.", removeKeyboard())
+	return m.service.reply(ctx, chatID, "Вход отменён.", removeKeyboard())
 }
 
 func (m *loginManager) handleContact(ctx context.Context, session *loginSession, message *telego.Message) error {
 	if session.promptKind() != monitor.LoginPromptPhone {
-		return m.service.reply(ctx, message.Chat.ID, "Send value or /cancel.", removeKeyboard())
+		return m.service.reply(ctx, message.Chat.ID, "/cancel — отменить вход.", removeKeyboard())
 	}
-	if message.Contact.UserID != 0 && message.From != nil && message.Contact.UserID != message.From.ID {
-		return m.service.reply(ctx, message.Chat.ID, "Share your own phone.", phoneKeyboard())
+	if message.From == nil || message.Contact.UserID == 0 || message.Contact.UserID != message.From.ID {
+		return m.service.reply(ctx, message.Chat.ID, "Нужен ваш собственный номер — нажмите «Поделиться номером».", phoneKeyboard())
 	}
 
 	phone := strings.TrimSpace(message.Contact.PhoneNumber)
 	if phone == "" {
-		return m.service.reply(ctx, message.Chat.ID, "Empty phone. Type it manually.", phoneKeyboard())
+		return m.service.reply(ctx, message.Chat.ID, "Telegram не передал номер. Попробуйте ещё раз.", phoneKeyboard())
 	}
 
 	m.deleteIncoming(ctx, message)
@@ -194,7 +177,7 @@ func (s *loginSession) takePromptMessageID() int {
 func (m *loginManager) finishPhone(ctx context.Context, session *loginSession, phone string) error {
 	phone = normalizePhone(phone)
 	if phone == "" {
-		return m.service.reply(ctx, session.chatID, "Empty phone. Share phone or type it manually.", phoneKeyboard())
+		return m.service.reply(ctx, session.chatID, "Telegram не передал номер. Попробуйте ещё раз.", phoneKeyboard())
 	}
 	session.setPhone(phone)
 	if err := m.service.store.SaveLoginPhone(ctx, session.chatID, phone); err != nil {
@@ -208,14 +191,14 @@ func (m *loginManager) finishPhone(ctx context.Context, session *loginSession, p
 
 func (m *loginManager) sendLoginLink(ctx context.Context, chatID int64, phone string) error {
 	if m.service.cfg.PublicBaseURL == "" {
-		return m.service.reply(ctx, chatID, "Set TELEGRAM_BRIDGE_PUBLIC_URL to use site login.", removeKeyboard())
+		return m.service.reply(ctx, chatID, "На сервере не задан TELEGRAM_BRIDGE_PUBLIC_URL.", removeKeyboard())
 	}
 	token, err := m.service.store.CreateLoginToken(ctx, chatID, normalizePhone(phone), loginLinkTTL)
 	if err != nil {
 		return err
 	}
 	loginURL := m.service.cfg.PublicBaseURL + "/login?token=" + url.QueryEscape(token.Token)
-	return m.service.reply(ctx, chatID, "Open login. Enter code and 2FA on the site.", loginLinkMarkup(loginURL))
+	return m.service.reply(ctx, chatID, "Откройте страницу входа и введите там код из Telegram и пароль 2FA. Не отправляйте код в этот чат.", loginLinkMarkup(loginURL))
 }
 
 func (m *loginManager) expirePhonePrompt(ctx context.Context, session *loginSession) {
@@ -230,7 +213,7 @@ func (m *loginManager) expirePhonePrompt(ctx context.Context, session *loginSess
 	}
 	delete(m.sessions, session.chatID)
 	m.mu.Unlock()
-	m.finalReply(session, "Timed out. /login")
+	m.finalReply(session, "Время вышло. /login — начать заново.")
 }
 
 func (m *loginManager) session(chatID int64) *loginSession {
@@ -318,21 +301,6 @@ func (m *loginManager) deleteIncoming(ctx context.Context, message *telego.Messa
 	}
 }
 
-func (s *Service) isAdminChat(ctx context.Context, chatID int64) (bool, error) {
-	if len(s.cfg.BotAdminChatIDs) > 0 {
-		return s.cfg.IsConfiguredBotAdmin(chatID), nil
-	}
-
-	first, ok, err := s.store.FirstSubscriber(ctx)
-	if err != nil {
-		return false, err
-	}
-	if !ok {
-		return false, nil
-	}
-	return first.ChatID == chatID, nil
-}
-
 func firstField(value string) string {
 	fields := strings.Fields(strings.TrimSpace(value))
 	if len(fields) == 0 {
@@ -343,11 +311,11 @@ func firstField(value string) string {
 
 func phoneKeyboard() telego.ReplyMarkup {
 	return tu.Keyboard(
-		tu.KeyboardRow(tu.KeyboardButton("Share phone").WithRequestContact()),
+		tu.KeyboardRow(tu.KeyboardButton("Поделиться номером").WithRequestContact()),
 	).
 		WithResizeKeyboard().
 		WithOneTimeKeyboard().
-		WithInputFieldPlaceholder("Share phone or type +995...")
+		WithInputFieldPlaceholder("Нажмите «Поделиться номером»")
 }
 
 func removeKeyboard() telego.ReplyMarkup {
@@ -357,7 +325,7 @@ func removeKeyboard() telego.ReplyMarkup {
 func loginLinkMarkup(loginURL string) telego.ReplyMarkup {
 	return tu.InlineKeyboard(
 		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("Open login").WithURL(loginURL),
+			tu.InlineKeyboardButton("Открыть вход").WithURL(loginURL),
 		),
 	)
 }

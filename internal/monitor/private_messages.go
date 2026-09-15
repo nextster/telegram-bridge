@@ -239,7 +239,7 @@ func (s *Service) runPrivateArchive(ctx context.Context) {
 func (s *Service) runPrivateArchivePass(ctx context.Context) {
 	ownerUserID := s.handler.selfUserID.Load()
 	cutoff := time.Now().UTC().Add(-privateArchiveRetention)
-	if err := s.store.PrunePrivateArchive(ctx, cutoff, privateArchiveMaxMessages); err != nil {
+	if err := s.store.PrunePrivateArchive(ctx, ownerUserID, cutoff, privateArchiveMaxMessages); err != nil {
 		log.Printf("private archive prune failed: %v", err)
 	}
 	dialogs, messages, err := s.backfillPrivateMessages(ctx, cutoff)

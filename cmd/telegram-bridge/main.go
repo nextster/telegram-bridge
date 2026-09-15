@@ -16,13 +16,14 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/nextster/telegram-bridge/internal/apitoken"
 	"github.com/nextster/telegram-bridge/internal/bot"
-	"github.com/nextster/telegram-bridge/internal/codexworker"
 	"github.com/nextster/telegram-bridge/internal/config"
 	"github.com/nextster/telegram-bridge/internal/db"
 	"github.com/nextster/telegram-bridge/internal/media"
 	"github.com/nextster/telegram-bridge/internal/monitor"
 	"github.com/nextster/telegram-bridge/internal/notify"
+	"github.com/nextster/telegram-bridge/internal/oauth"
 	"github.com/nextster/telegram-bridge/internal/web"
 )
 
@@ -41,11 +42,9 @@ func run(args []string) error {
 	command, flagArgs := splitCommand(args)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if command == "worker" {
-		return runWorker(ctx, cfg, flagArgs)
-	}
 	fs := flag.NewFlagSet(command, flag.ExitOnError)
 	cfg.BindFlags(fs)
+	owner := fs.Int64("owner", 0, "Telegram user ID that owns imported rules (rules-import)")
 	if err := fs.Parse(flagArgs); err != nil {
 		return err
 	}
@@ -53,8 +52,6 @@ func run(args []string) error {
 	switch command {
 	case "serve":
 		return serve(ctx, cfg)
-	case "login":
-		return monitor.Login(ctx, cfg, os.Stdin, os.Stdout)
 	case "migrate":
 		store, err := db.Open(ctx, cfg.DBPath)
 		if err != nil {
@@ -64,54 +61,13 @@ func run(args []string) error {
 		fmt.Fprintf(os.Stdout, "SQLite schema is ready at %s\n", cfg.DBPath)
 		return nil
 	case "rules-import":
-		return importRules(ctx, cfg, os.Stdin, os.Stdout)
+		return importRules(ctx, cfg, *owner, os.Stdin, os.Stdout)
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
 	default:
 		return fmt.Errorf("unknown command %q", command)
 	}
-}
-
-type projectFlags []string
-
-func (p *projectFlags) String() string { return strings.Join(*p, ",") }
-func (p *projectFlags) Set(value string) error {
-	*p = append(*p, value)
-	return nil
-}
-
-func runWorker(ctx context.Context, cfg config.Config, args []string) error {
-	fs := flag.NewFlagSet("worker", flag.ContinueOnError)
-	var projects projectFlags
-	var workerID, codexBin string
-	var once bool
-	fs.Var(&projects, "project", "project mapping slug=/absolute/path (repeatable)")
-	fs.StringVar(&workerID, "worker-id", "", "stable worker name")
-	fs.StringVar(&codexBin, "codex-bin", "codex", "path to Codex CLI")
-	fs.BoolVar(&once, "once", false, "claim at most one job")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	parsed, err := codexworker.ParseProjects(projects)
-	if err != nil {
-		return err
-	}
-	worker, err := codexworker.New(codexworker.Config{
-		BaseURL: cfg.PublicBaseURL, Token: cfg.WorkerToken, WorkerID: workerID,
-		Projects: parsed, Poll: 3 * time.Second, CodexBin: codexBin,
-	})
-	if err != nil {
-		return err
-	}
-	if once {
-		claimed, err := worker.RunOnce(ctx)
-		if !claimed && err == nil {
-			fmt.Fprintln(os.Stdout, "No queued Codex jobs.")
-		}
-		return err
-	}
-	return worker.Run(ctx)
 }
 
 type ruleImport struct {
@@ -139,7 +95,10 @@ type ruleImportSource struct {
 	PeerID   int64  `json:"peer_id"`
 }
 
-func importRules(ctx context.Context, cfg config.Config, in io.Reader, out io.Writer) error {
+func importRules(ctx context.Context, cfg config.Config, owner int64, in io.Reader, out io.Writer) error {
+	if owner <= 0 {
+		return errors.New("rules-import needs -owner with the Telegram user ID that owns the rules")
+	}
 	var payload ruleImport
 	decoder := json.NewDecoder(in)
 	decoder.DisallowUnknownFields()
@@ -178,7 +137,7 @@ func importRules(ctx context.Context, cfg config.Config, in io.Reader, out io.Wr
 			Enabled:             true,
 		})
 	}
-	deleted, err := store.ApplyWatchRules(ctx, rules, payload.Delete)
+	deleted, err := store.ApplyWatchRules(ctx, owner, rules, payload.Delete)
 	if err != nil {
 		return err
 	}
@@ -193,44 +152,88 @@ func serve(ctx context.Context, cfg config.Config) error {
 	}
 	defer store.Close()
 
-	var notifier notify.Notifier = notify.Nop{}
-	var systemNotifier notify.SystemNotifier = notify.Nop{}
 	var botService *bot.Service
 	if cfg.HasBot() {
 		botService, err = bot.New(cfg, store)
 		if err != nil {
 			return err
 		}
-		notifier = botService
-		systemNotifier = botService
 	} else {
 		log.Print("telegram bot disabled: TELEGRAM_BOT_TOKEN/BOT_TOKEN is not configured")
 	}
 
-	var monitorService *monitor.Service
+	var manager *monitor.Manager
 	if cfg.HasTelegramUserAPI() {
-		monitorService = monitor.NewService(cfg, store, notifier)
+		if err := cfg.ValidateSessionKey(); err != nil {
+			return err
+		}
+		vault, err := monitor.NewSessionVault(store, cfg.SessionKey)
+		if err != nil {
+			return err
+		}
+		var notifier notify.Notifier = notify.Nop{}
 		if botService != nil {
-			botService.SetMonitorService(monitorService)
+			notifier = botService
+		}
+		manager = monitor.NewManager(cfg, store, notifier, vault)
+		if botService != nil {
+			botService.SetAccounts(manager)
 		}
 	} else {
-		log.Print("telegram user API monitoring disabled: TELEGRAM_API_ID/TELEGRAM_API_HASH are not configured")
+		log.Print("telegram user API disabled: TELEGRAM_API_ID/TELEGRAM_API_HASH are not configured")
 	}
 
-	webServer, err := web.New(cfg, store, monitorService, systemNotifier, botService)
+	// Interfaces are assigned only from non-nil values.
+	var accounts web.Accounts
+	if manager != nil {
+		accounts = manager
+	}
+	var userNotifier web.UserNotifier
+	if botService != nil {
+		userNotifier = botService
+	}
+	webServer, err := web.New(cfg, store, accounts, userNotifier)
 	if err != nil {
 		return err
 	}
+	if cfg.OAuthMode == "on" && !cfg.HasOAuth() {
+		log.Print("MCP OAuth disabled: it needs TELEGRAM_BOT_TOKEN, TELEGRAM_BRIDGE_PUBLIC_URL and TELEGRAM_LOGIN_CLIENT_SECRET")
+	}
+	if cfg.HasOAuth() && botService != nil && manager != nil {
+		oauthServer, err := oauth.New(cfg.PublicBaseURL, store, botService, oauth.Options{
+			ExtraRedirectURIs: cfg.OAuthExtraRedirectURIs,
+			TelegramLogin:     oauth.TelegramLogin{ClientID: cfg.TelegramLoginClientID(), ClientSecret: cfg.TelegramLoginSecret},
+		})
+		if err != nil {
+			log.Printf("MCP OAuth disabled: %v", err)
+		} else {
+			webServer.SetOAuth(oauthServer)
+		}
+	}
 
 	group, ctx := errgroup.WithContext(ctx)
-	if monitorService != nil && cfg.HasMCP() {
-		mediaService, err := media.New(cfg.Media, store, monitorService)
+	if manager != nil {
+		mediaService, err := media.New(cfg.Media, store, manager)
 		if err != nil {
 			return err
 		}
 		defer mediaService.Close()
 		webServer.SetMediaService(mediaService)
 		group.Go(func() error { return mediaService.Run(ctx) })
+		group.Go(func() error {
+			// Importing checks the old session with Telegram, so it runs here
+			// rather than delaying the web server and health checks.
+			importCtx, cancel := context.WithTimeout(ctx, time.Minute)
+			if err := importLegacyAccount(importCtx, cfg, store, manager); err != nil {
+				log.Printf("legacy account import failed: %v", err)
+			}
+			cancel()
+			err := manager.Run(ctx)
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
+			return err
+		})
 	}
 	group.Go(func() error {
 		return webServer.Run(ctx)
@@ -244,17 +247,37 @@ func serve(ctx context.Context, cfg config.Config) error {
 			return err
 		})
 	}
-	if monitorService != nil {
-		group.Go(func() error {
-			err := monitorService.Run(ctx)
-			if errors.Is(err, context.Canceled) {
-				return nil
-			}
-			return err
-		})
-	}
 
 	return group.Wait()
+}
+
+// importLegacyAccount moves a single-account deployment into the per-user
+// model. The static tokens and group allowlist are given only to the account
+// whose session file is imported in this same run, so they can never be
+// attached to anybody else later.
+func importLegacyAccount(ctx context.Context, cfg config.Config, store *db.Store, manager *monitor.Manager) error {
+	owner, err := manager.ImportLegacySession(ctx)
+	if owner <= 0 {
+		return err
+	}
+	now := time.Now()
+	for scope, token := range map[string]string{db.APITokenScopeMCP: cfg.MCPToken, db.APITokenScopeNotify: cfg.NotificationToken} {
+		if token == "" {
+			continue
+		}
+		if _, err := store.CreateAPIToken(ctx, owner, scope, "imported from environment", apitoken.Hash(token), now); err != nil {
+			log.Printf("import %s token for account %d failed: %v", scope, owner, err)
+		}
+	}
+	for _, chatID := range cfg.NotificationChatIDs {
+		if err := store.AddNotificationChat(ctx, owner, chatID, "", now); err != nil {
+			log.Printf("import notification group for account %d failed: %v", owner, err)
+		}
+	}
+	if cfg.MCPToken != "" || cfg.NotificationToken != "" || len(cfg.NotificationChatIDs) > 0 {
+		log.Printf("imported legacy tokens and groups for account %d; remove them from the environment", owner)
+	}
+	return err
 }
 
 func splitCommand(args []string) (string, []string) {
@@ -272,19 +295,16 @@ func printUsage() {
 	fmt.Fprintln(os.Stdout, `telegram-bridge
 
 Commands:
-  serve    Run web UI, bot polling, and gotd monitor
-  login    Authorize Telegram user session for gotd
-  migrate  Create or update SQLite schema
-  rules-import  Import flexible watch rules from JSON on stdin
-  worker   Run the local Codex app-server worker
+  serve         Run the web UI, bot, MCP server, and Telegram accounts
+  migrate       Create or update the SQLite schema
+  rules-import  Import watch rules from JSON on stdin: rules-import -owner <telegram user id>
+
+Users connect their own Telegram account with /login in the bot.
 
 Environment:
   TELEGRAM_BOT_TOKEN or BOT_TOKEN
   TELEGRAM_API_ID or TG_API_ID
   TELEGRAM_API_HASH or TG_API_HASH
-  TELEGRAM_PHONE or TG_PHONE
-  TELEGRAM_PASSWORD or TG_PASSWORD
-  TELEGRAM_BRIDGE_DB, TELEGRAM_BRIDGE_SESSION, TELEGRAM_BRIDGE_PUBLIC_URL,
-  TELEGRAM_BRIDGE_MCP_TOKEN, TELEGRAM_BRIDGE_WORKER_TOKEN,
-  TELEGRAM_BRIDGE_NOTIFICATION_TOKEN, TELEGRAM_BRIDGE_NOTIFICATION_CHAT_IDS, PORT`)
+  TELEGRAM_BRIDGE_SESSION_KEY (32 bytes, openssl rand -base64 32)
+  TELEGRAM_BRIDGE_DB, TELEGRAM_BRIDGE_PUBLIC_URL, TELEGRAM_BRIDGE_OAUTH, PORT`)
 }

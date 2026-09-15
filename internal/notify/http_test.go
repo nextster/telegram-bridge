@@ -1,27 +1,43 @@
 package notify
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/nextster/telegram-bridge/internal/apitoken"
 	"github.com/nextster/telegram-bridge/internal/db"
 )
 
+func notificationToken(t *testing.T, service *Notifications, account int64, scope string) string {
+	t.Helper()
+	token, hash, err := apitoken.New(scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.store.CreateAPIToken(context.Background(), account, scope, "test", hash, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	return token
+}
+
 func TestNotificationAPIAuthAndInputBoundaries(t *testing.T) {
 	service, sender, _ := setupNotifications(t)
-	token := strings.Repeat("n", 32)
-	handler := NewHTTPHandler(service, token)
+	token := notificationToken(t, service, testAccount, db.APITokenScopeNotify)
+	mcpToken := notificationToken(t, service, testAccount, db.APITokenScopeMCP)
+	handler := NewHTTPHandler(service, service.store)
 	valid := `{"chat":"channel:1234567890","event_id":"release:1","text":"Release test"}`
 	for _, tc := range []struct {
 		name, method, auth, contentType, body string
 		status                                int
 	}{
 		{"no auth", "POST", "", "application/json", valid, 401},
-		{"MCP credential", "POST", "Bearer read-only-mcp-token", "application/json", valid, 401},
-		{"worker credential", "POST", "Bearer worker-token", "application/json", valid, 401},
+		{"MCP credential", "POST", "Bearer " + mcpToken, "application/json", valid, 401},
+		{"unknown credential", "POST", "Bearer tbn_unknown", "application/json", valid, 401},
 		{"method", "GET", "Bearer " + token, "application/json", valid, 405},
 		{"content type", "POST", "Bearer " + token, "text/plain", valid, 415},
 		{"unknown field", "POST", "Bearer " + token, "application/json", `{"chat":"channel:1234567890","event_id":"release:1","text":"hello","parse_mode":"HTML"}`, 400},
@@ -52,10 +68,11 @@ func TestNotificationAPIAuthAndInputBoundaries(t *testing.T) {
 
 func TestNotificationAPIReturnsDurableReceipt(t *testing.T) {
 	service, sender, _ := setupNotifications(t)
-	handler := NewHTTPHandler(service, strings.Repeat("n", 32))
+	token := notificationToken(t, service, testAccount, db.APITokenScopeNotify)
+	handler := NewHTTPHandler(service, service.store)
 	for range 2 {
 		req := httptest.NewRequest(http.MethodPost, "/notifications/v1/messages", strings.NewReader(`{"chat":"channel:1234567890","event_id":"release:1","text":"Release test"}`))
-		req.Header.Set("Authorization", "Bearer "+strings.Repeat("n", 32))
+		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Content-Type", "application/json")
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
@@ -75,10 +92,11 @@ func TestNotificationAPIReturnsDurableReceipt(t *testing.T) {
 func TestNotificationAPIRedactsUncertainSend(t *testing.T) {
 	service, sender, _ := setupNotifications(t)
 	sender.fail = true
-	handler := NewHTTPHandler(service, strings.Repeat("n", 32))
+	token := notificationToken(t, service, testAccount, db.APITokenScopeNotify)
+	handler := NewHTTPHandler(service, service.store)
 	for range 2 {
 		req := httptest.NewRequest(http.MethodPost, "/notifications/v1/messages", strings.NewReader(`{"chat":"channel:1234567890","event_id":"release:1","text":"Release test"}`))
-		req.Header.Set("Authorization", "Bearer "+strings.Repeat("n", 32))
+		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Content-Type", "application/json")
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)

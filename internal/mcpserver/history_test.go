@@ -40,8 +40,8 @@ func (r *historyReader) GetHistoryPage(_ context.Context, opts monitor.HistoryOp
 
 type historySource struct{ mcpMediaSource }
 
-func (s historySource) Attachment(ctx context.Context, chat string, id int) (media.Attachment, error) {
-	a, err := s.mcpMediaSource.Attachment(ctx, chat, id)
+func (s historySource) Attachment(ctx context.Context, accountID int64, chat string, id int) (media.Attachment, error) {
+	a, err := s.mcpMediaSource.Attachment(ctx, accountID, chat, id)
 	if id == 11 {
 		a.Kind = "video_note"
 	}
@@ -70,17 +70,17 @@ func historyFixture(t *testing.T) (*Server, *db.Store, *historyReader) {
 	for i, kind := range []string{"voice", "video_note", "image", "document", "text"} {
 		r.page.Messages = append(r.page.Messages, monitor.TelegramMessage{ID: 10 + i, Chat: monitor.TelegramPeer{Key: "chat:1"}, MediaKind: kind, Date: time.Unix(1700000000, 0), ReplyToID: 9})
 	}
-	return New(r, "secret", Options{Media: service}), store, r
+	return New(Options{Accounts: accountsFor(map[int64]Monitor{testUser: r}), VerifyToken: testVerifier(map[string]int64{"secret": testUser}), Media: service}), store, r
 }
 
 func TestHistoryPaidBoundaryAndRangeValidation(t *testing.T) {
 	s, store, reader := historyFixture(t)
 	ctx := context.Background()
-	_, out, err := s.getHistory(ctx, nil, getHistoryInput{Chat: "chat:1", MinDate: "2023-01-01"})
+	_, out, err := s.getHistory(ctx, testRequest(testUser), getHistoryInput{Chat: "chat:1", MinDate: "2023-01-01"})
 	if err != nil || out.Media != nil || len(out.Messages) != 5 || !out.HasMore {
 		t.Fatal("free history changed")
 	}
-	if _, err := store.ClaimMedia(ctx, 1, time.Now()); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := store.ClaimMedia(ctx, []int64{1}, time.Now()); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatal("ordinary history queued paid work")
 	}
 	for _, in := range []getHistoryInput{
@@ -92,7 +92,7 @@ func TestHistoryPaidBoundaryAndRangeValidation(t *testing.T) {
 		{Chat: "chat:1", OffsetID: -1},
 		{Chat: "/etc/passwd"},
 	} {
-		if _, _, err := s.getHistory(ctx, nil, in); err == nil {
+		if _, _, err := s.getHistory(ctx, testRequest(testUser), in); err == nil {
 			t.Fatal("invalid history accepted")
 		}
 	}
@@ -101,7 +101,7 @@ func TestHistoryPaidBoundaryAndRangeValidation(t *testing.T) {
 	}
 	zero := 0
 	in := getHistoryInput{Chat: "chat:1", MinDate: "2023-01-01", ProcessMedia: true, ConfirmPaid: true, WaitSeconds: &zero}
-	_, out, err = s.getHistory(ctx, nil, in)
+	_, out, err = s.getHistory(ctx, testRequest(testUser), in)
 	if err != nil || out.Media == nil || len(out.Media.Items) != 3 || out.Media.Settled || out.MaxDate == "" {
 		t.Fatal("paid page did not queue exactly supported media")
 	}
@@ -118,7 +118,7 @@ func TestHistoryPaidBoundaryAndRangeValidation(t *testing.T) {
 		t.Fatal("date bounds not applied")
 	}
 	in.MaxDate = out.MaxDate
-	_, duplicate, err := s.getHistory(ctx, nil, in)
+	_, duplicate, err := s.getHistory(ctx, testRequest(testUser), in)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,7 @@ func completeHistoryJobs(ctx context.Context, store *db.Store, count int) error 
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		j, err := store.ClaimMedia(ctx, 1, time.Now())
+		j, err := store.ClaimMedia(ctx, []int64{1}, time.Now())
 		if errors.Is(err, sql.ErrNoRows) {
 			time.Sleep(5 * time.Millisecond)
 			continue
@@ -166,11 +166,11 @@ func TestConcurrentHistoryWaitsReuseBatchAndSingleResults(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	refs := []media.Reference{{Chat: "chat:1", MessageID: 10}, {Chat: "chat:1", MessageID: 12}}
-	batch, err := s.media.StartBatch(ctx, refs, media.BatchOptions{}, true)
+	batch, err := s.media.StartBatch(ctx, testUser, refs, media.BatchOptions{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	single, err := s.media.Start(ctx, "chat:1", 11, "transcription", media.Options{}, true)
+	single, err := s.media.Start(ctx, testUser, "chat:1", 11, "transcription", media.Options{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestConcurrentHistoryWaitsReuseBatchAndSingleResults(t *testing.T) {
 	wait := 2
 	for range 8 {
 		group.Go(func() {
-			_, out, err := s.getHistory(ctx, nil, getHistoryInput{Chat: "chat:1", MinDate: "2023-01-01", MaxDate: "2024-01-01", ProcessMedia: true, ConfirmPaid: true, WaitSeconds: &wait})
+			_, out, err := s.getHistory(ctx, testRequest(testUser), getHistoryInput{Chat: "chat:1", MinDate: "2023-01-01", MaxDate: "2024-01-01", ProcessMedia: true, ConfirmPaid: true, WaitSeconds: &wait})
 			if err != nil {
 				t.Error(err)
 				return
@@ -207,7 +207,7 @@ func TestConcurrentHistoryWaitsReuseBatchAndSingleResults(t *testing.T) {
 	if err := <-worker; err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.ClaimMedia(ctx, 1, time.Now()); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := store.ClaimMedia(ctx, []int64{1}, time.Now()); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatal("unprocessed duplicate left")
 	}
 }
@@ -215,7 +215,7 @@ func TestConcurrentHistoryWaitsReuseBatchAndSingleResults(t *testing.T) {
 func TestHistoryWaitTimeoutLeavesDurableJobs(t *testing.T) {
 	s, store, _ := historyFixture(t)
 	wait := 1
-	_, out, err := s.getHistory(context.Background(), nil, getHistoryInput{Chat: "chat:1", MinDate: "2023-01-01", ProcessMedia: true, ConfirmPaid: true, WaitSeconds: &wait})
+	_, out, err := s.getHistory(context.Background(), testRequest(testUser), getHistoryInput{Chat: "chat:1", MinDate: "2023-01-01", ProcessMedia: true, ConfirmPaid: true, WaitSeconds: &wait})
 	if err != nil || out.Media == nil || !out.Media.TimedOut || out.Media.Settled || out.Media.AllSucceeded {
 		t.Fatal("timeout falsely reported completion")
 	}
@@ -234,7 +234,7 @@ func TestHistoryReportsUnsupportedVideoButNotLinkPreview(t *testing.T) {
 		reader.page.Messages = append(reader.page.Messages, monitor.TelegramMessage{ID: i + 1, Chat: monitor.TelegramPeer{Key: "chat:1"}, MediaKind: kind})
 	}
 	zero := 0
-	_, out, err := s.getHistory(context.Background(), nil, getHistoryInput{Chat: "chat:1", MinDate: "2023-01-01", ProcessMedia: true, ConfirmPaid: true, WaitSeconds: &zero})
+	_, out, err := s.getHistory(context.Background(), testRequest(testUser), getHistoryInput{Chat: "chat:1", MinDate: "2023-01-01", ProcessMedia: true, ConfirmPaid: true, WaitSeconds: &zero})
 	if err != nil || out.Media == nil || len(out.Media.Items) != 0 || len(out.SkippedMedia) != 2 {
 		t.Fatal("unsupported scope hidden or queued", err)
 	}

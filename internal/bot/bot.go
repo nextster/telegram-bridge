@@ -2,7 +2,6 @@ package bot
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log"
@@ -21,25 +20,23 @@ import (
 	"github.com/nextster/telegram-bridge/internal/monitor"
 )
 
+// Accounts is the part of the account manager the bot needs. Every call is
+// scoped to one Telegram user.
+type Accounts interface {
+	Status(owner int64) monitor.Status
+	Connected(ctx context.Context, owner int64) (bool, error)
+	Logout(ctx context.Context, owner int64) error
+}
+
+// Service is the bot. Every command acts only for the Telegram user who sent
+// it, in that user's private chat with the bot.
 type Service struct {
-	bot            *telego.Bot
-	store          *db.Store
-	cfg            config.Config
-	monitorService *monitor.Service
-	login          *loginManager
-}
-
-type CodexTask struct {
-	Project db.CodexProject `json:"project"`
-	Thread  db.CodexThread  `json:"thread"`
-	Job     db.CodexJob     `json:"job"`
-	Link    string          `json:"link"`
-}
-
-type CodexSyncResult struct {
-	Created int `json:"created"`
-	Updated int `json:"updated"`
-	Skipped int `json:"skipped"`
+	bot      *telego.Bot
+	store    *db.Store
+	cfg      config.Config
+	accounts Accounts
+	login    *loginManager
+	identity botIdentity
 }
 
 func New(cfg config.Config, store *db.Store) (*Service, error) {
@@ -62,8 +59,8 @@ func New(cfg config.Config, store *db.Store) (*Service, error) {
 	return service, nil
 }
 
-func (s *Service) SetMonitorService(monitorService *monitor.Service) {
-	s.monitorService = monitorService
+func (s *Service) SetAccounts(accounts Accounts) {
+	s.accounts = accounts
 }
 
 func (s *Service) Run(ctx context.Context) error {
@@ -92,105 +89,81 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 }
 
+// NotifyEvent alerts the owner of the matched rule, in their private chat, if
+// they have alerts enabled.
 func (s *Service) NotifyEvent(ctx context.Context, event db.Event) error {
-	subscribers, err := s.store.ListSubscribers(ctx)
-	if err != nil {
+	subscribed, err := s.alertsEnabled(ctx, event.OwnerUserID)
+	if err != nil || !subscribed {
 		return err
 	}
-	if len(subscribers) == 0 {
-		return nil
-	}
-
-	body := formatEvent(event)
-	for _, sub := range subscribers {
-		_, sendErr := s.bot.SendMessage(ctx, &telego.SendMessageParams{
-			ChatID:      telego.ChatID{ID: sub.ChatID},
-			Text:        body,
-			ReplyMarkup: s.eventMarkup(ctx, event, sub.ChatID),
-		})
-		if sendErr != nil {
-			log.Printf("send alert to %d failed: %v", sub.ChatID, sendErr)
-		}
+	_, err = s.bot.SendMessage(ctx, &telego.SendMessageParams{
+		ChatID:      telego.ChatID{ID: event.OwnerUserID},
+		Text:        formatEvent(event),
+		ReplyMarkup: s.eventMarkup(ctx, event),
+	})
+	if err != nil {
+		return fmt.Errorf("send alert to %d: %w", event.OwnerUserID, err)
 	}
 	return nil
 }
 
+// NotifyDeletedMessages sends an archive alert only to the account owner.
 func (s *Service) NotifyDeletedMessages(ctx context.Context, deletion db.PrivateMessageDeletion) error {
-	chatID, ok, err := s.privateAlertChatID(ctx, deletion.Dialog.OwnerUserID)
-	if err != nil {
-		return err
-	}
+	owner := deletion.Dialog.OwnerUserID
 	if len(deletion.Messages) == 0 {
 		return nil
 	}
-	if !ok {
-		return fmt.Errorf("private deletion alert owner %d has not subscribed to the bot", deletion.Dialog.OwnerUserID)
-	}
-
-	_, err = s.bot.SendMessage(ctx, &telego.SendMessageParams{
-		ChatID: telego.ChatID{ID: chatID},
-		Text:   formatDeletedMessages(deletion),
-	})
-	if err != nil {
-		return fmt.Errorf("send deletion alert to owner chat %d: %w", chatID, err)
-	}
-	return nil
-}
-
-func (s *Service) privateAlertChatID(ctx context.Context, ownerUserID int64) (int64, bool, error) {
-	if ownerUserID <= 0 {
-		return 0, false, nil
-	}
-	subscribers, err := s.store.ListSubscribers(ctx)
-	if err != nil {
-		return 0, false, err
-	}
-	for _, subscriber := range subscribers {
-		// In a private Bot API chat, chat_id is the user's Telegram ID. Never
-		// route archived personal text to another subscriber or to a group.
-		if subscriber.ChatID == ownerUserID {
-			return ownerUserID, true, nil
-		}
-	}
-	return 0, false, nil
-}
-
-func (s *Service) NotifySystem(ctx context.Context, text string) error {
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return nil
-	}
-	subscribers, err := s.store.ListSubscribers(ctx)
+	subscribed, err := s.alertsEnabled(ctx, owner)
 	if err != nil {
 		return err
 	}
-	for _, sub := range subscribers {
-		_, sendErr := s.bot.SendMessage(ctx, &telego.SendMessageParams{
-			ChatID: telego.ChatID{ID: sub.ChatID},
-			Text:   text,
-		})
-		if sendErr != nil {
-			log.Printf("send system notification to %d failed: %v", sub.ChatID, sendErr)
-		}
+	if !subscribed {
+		return fmt.Errorf("private deletion alert owner %d has not subscribed to the bot", owner)
+	}
+	_, err = s.bot.SendMessage(ctx, &telego.SendMessageParams{
+		ChatID: telego.ChatID{ID: owner},
+		Text:   formatDeletedMessages(deletion),
+	})
+	if err != nil {
+		return fmt.Errorf("send deletion alert to owner chat %d: %w", owner, err)
 	}
 	return nil
+}
+
+// NotifyUser sends a system message to one user's private chat.
+func (s *Service) NotifyUser(ctx context.Context, userID int64, text string) error {
+	text = strings.TrimSpace(text)
+	if userID <= 0 || text == "" {
+		return nil
+	}
+	return s.reply(ctx, userID, text, nil)
+}
+
+// alertsEnabled reports whether a user started the bot and did not /stop. In
+// a private Bot API chat the chat ID equals the user ID.
+func (s *Service) alertsEnabled(ctx context.Context, userID int64) (bool, error) {
+	if userID <= 0 {
+		return false, nil
+	}
+	return s.store.IsSubscribed(ctx, userID)
 }
 
 func (s *Service) setCommands(ctx context.Context) error {
 	return s.bot.SetMyCommands(ctx, &telego.SetMyCommandsParams{
 		Commands: []telego.BotCommand{
-			{Command: "start", Description: "subscribe to alerts"},
-			{Command: "stop", Description: "unsubscribe from alerts"},
-			{Command: "add", Description: "add keyword"},
-			{Command: "watch", Description: "add flexible watch rule"},
-			{Command: "del", Description: "delete keyword by id or text"},
-			{Command: "keywords", Description: "list keywords"},
-			{Command: "recent", Description: "show recent matches"},
-			{Command: "codex", Description: "start a Codex task: project :: prompt"},
-			{Command: "login", Description: "authorize Telegram user session"},
-			{Command: "loginstatus", Description: "show Telegram user login status"},
-			{Command: "cancel", Description: "cancel current bot login"},
-			{Command: "help", Description: "show commands"},
+			{Command: "start", Description: "включить уведомления"},
+			{Command: "stop", Description: "выключить уведомления"},
+			{Command: "login", Description: "подключить свой Telegram"},
+			{Command: "loginstatus", Description: "статус подключения"},
+			{Command: "logout", Description: "отключить свой Telegram"},
+			{Command: "add", Description: "добавить ключевое слово"},
+			{Command: "watch", Description: "добавить гибкое правило"},
+			{Command: "del", Description: "удалить правило"},
+			{Command: "keywords", Description: "мои правила"},
+			{Command: "recent", Description: "последние совпадения"},
+			{Command: "connections", Description: "MCP-подключения"},
+			{Command: "cancel", Description: "отменить вход"},
+			{Command: "help", Description: "команды"},
 		},
 	})
 }
@@ -204,70 +177,80 @@ func (s *Service) handleUpdate(ctx context.Context, update telego.Update) error 
 	}
 	message := update.Message
 	text := strings.TrimSpace(message.Text)
+	userID, private := privateSender(message)
+	if !private {
+		if strings.HasPrefix(text, "/") {
+			return s.reply(ctx, message.Chat.ID, "Бот работает только в личном чате.", nil)
+		}
+		return nil
+	}
 	if s.login != nil {
 		consumed, err := s.login.HandleMessage(ctx, message)
 		if consumed || err != nil {
 			return err
 		}
 	}
-	if text != "" && !strings.HasPrefix(text, "/") {
-		if message.MessageThreadID > 0 {
-			mirrored, err := s.store.ConsumeCodexOutboundMessage(ctx, message.Chat.ID, message.MessageThreadID, message.MessageID, text)
-			if err != nil {
-				return err
-			}
-			if mirrored {
-				return nil
-			}
-			handled, err := s.handleCodexContinuation(ctx, message, text)
-			if handled || err != nil {
-				return err
-			}
-		}
-		return s.handleCodexGeneralPost(ctx, message, text)
-	}
 	if text == "" || !strings.HasPrefix(text, "/") {
 		return nil
 	}
 
 	command, _, payload := tu.ParseCommandPayload(text)
-	if adminOnlyCommand(command) {
-		admin, err := s.isAdminChat(ctx, message.Chat.ID)
-		if err != nil {
-			return err
-		}
-		if !admin {
-			return s.reply(ctx, message.Chat.ID, "This chat is not allowed to manage telegram-bridge.", nil)
-		}
-	}
 	switch command {
 	case "start":
-		return s.handleStart(ctx, message)
+		if requestID, ok := strings.CutPrefix(strings.TrimSpace(payload), oauthStartPrefix); ok {
+			return s.handleOAuthStart(ctx, message, requestID)
+		}
+		return s.handleStart(ctx, message, userID)
 	case "stop":
-		return s.handleStop(ctx, message)
+		return s.handleStop(ctx, userID)
 	case "add":
-		return s.handleAddKeyword(ctx, message, payload)
+		return s.handleAddKeyword(ctx, userID, payload)
 	case "watch":
-		return s.handleAddWatchRule(ctx, message, payload)
+		return s.handleAddWatchRule(ctx, userID, payload)
 	case "del", "delete":
-		return s.handleDeleteKeyword(ctx, message, payload)
+		return s.handleDeleteKeyword(ctx, userID, payload)
 	case "keywords":
-		return s.handleKeywords(ctx, message)
+		return s.handleKeywords(ctx, userID)
 	case "recent":
-		return s.handleRecent(ctx, message)
-	case "codex":
-		return s.handleCodex(ctx, message, payload)
+		return s.handleRecent(ctx, userID)
 	case "login":
-		return s.login.Start(ctx, message, payload)
+		return s.login.Start(ctx, message)
 	case "loginstatus":
-		return s.handleLoginStatus(ctx, message)
+		return s.handleLoginStatus(ctx, userID)
+	case "logout":
+		return s.handleLogout(ctx, userID)
 	case "cancel":
-		return s.login.Cancel(ctx, message.Chat.ID)
+		return s.login.Cancel(ctx, userID)
+	case "connections":
+		return s.handleConnections(ctx, message)
 	case "help":
-		return s.reply(ctx, message.Chat.ID, helpText(), nil)
+		return s.reply(ctx, userID, helpText(), nil)
 	default:
-		return s.reply(ctx, message.Chat.ID, "Unknown command. Send /help.", nil)
+		return s.reply(ctx, userID, "Неизвестная команда. Отправьте /help.", nil)
 	}
+}
+
+// privateSender returns the sender of a message in their private chat with the
+// bot. Group chats and anonymous senders are rejected.
+func privateSender(message *telego.Message) (int64, bool) {
+	if message == nil || message.From == nil || message.Chat.Type != "private" {
+		return 0, false
+	}
+	if message.From.ID <= 0 || message.Chat.ID != message.From.ID {
+		return 0, false
+	}
+	return message.From.ID, true
+}
+
+// callbackUser returns the user who pressed a button in their private chat.
+func callbackUser(query *telego.CallbackQuery) (int64, bool) {
+	if query == nil || query.From.ID <= 0 {
+		return 0, false
+	}
+	if callbackChatID(query) != query.From.ID {
+		return 0, false
+	}
+	return query.From.ID, true
 }
 
 func (s *Service) handleCallbackQuery(ctx context.Context, query *telego.CallbackQuery) error {
@@ -275,27 +258,29 @@ func (s *Service) handleCallbackQuery(ctx context.Context, query *telego.Callbac
 		return nil
 	}
 	data := strings.TrimSpace(query.Data)
-	if strings.HasPrefix(data, "kwdel:") {
-		chatID := callbackChatID(query)
-		admin, err := s.isAdminChat(ctx, chatID)
-		if err != nil {
-			return err
-		}
-		if !admin {
-			return s.answerCallback(ctx, query.ID, "This chat is not allowed to manage telegram-bridge.")
-		}
-		return s.handleStopKeywordCallback(ctx, query, strings.TrimPrefix(data, "kwdel:"))
+	userID, private := callbackUser(query)
+	if !private {
+		return s.answerCallback(ctx, query.ID, "Кнопки работают только в личном чате с ботом.")
 	}
-	return s.answerCallback(ctx, query.ID, "Unknown action.")
+	if payload, ok := strings.CutPrefix(data, oauthCallbackPrefix); ok {
+		return s.handleOAuthCallback(ctx, query, userID, payload)
+	}
+	if grantID, ok := strings.CutPrefix(data, oauthRevokeCallbackPrefix); ok {
+		return s.handleOAuthRevokeCallback(ctx, query, userID, grantID)
+	}
+	if rawEventID, ok := strings.CutPrefix(data, "kwdel:"); ok {
+		return s.handleStopKeywordCallback(ctx, query, userID, rawEventID)
+	}
+	return s.answerCallback(ctx, query.ID, "Неизвестное действие.")
 }
 
-func (s *Service) handleStopKeywordCallback(ctx context.Context, query *telego.CallbackQuery, rawEventID string) error {
+func (s *Service) handleStopKeywordCallback(ctx context.Context, query *telego.CallbackQuery, userID int64, rawEventID string) error {
 	eventID, err := strconv.ParseInt(strings.TrimSpace(rawEventID), 10, 64)
 	if err != nil || eventID <= 0 {
 		return s.answerCallback(ctx, query.ID, "This button is stale.")
 	}
 
-	event, ok, err := s.store.GetEvent(ctx, eventID)
+	event, ok, err := s.store.GetEvent(ctx, userID, eventID)
 	if err != nil {
 		_ = s.answerCallback(ctx, query.ID, "Could not stop keyword.")
 		return err
@@ -308,7 +293,7 @@ func (s *Service) handleStopKeywordCallback(ctx context.Context, query *telego.C
 	if event.RuleID > 0 {
 		deleteValue = strconv.FormatInt(event.RuleID, 10)
 	}
-	rows, err := s.store.DeleteKeyword(ctx, deleteValue)
+	rows, err := s.store.DeleteKeyword(ctx, userID, deleteValue)
 	if err != nil {
 		_ = s.answerCallback(ctx, query.ID, "Could not stop keyword.")
 		return err
@@ -357,69 +342,54 @@ func (s *Service) sendCallbackConfirmation(ctx context.Context, query *telego.Ca
 	return s.reply(ctx, chatID, text, nil)
 }
 
-func (s *Service) handleStart(ctx context.Context, message *telego.Message) error {
-	allowed, err := s.canSubscribe(ctx, message.Chat.ID)
-	if err != nil {
-		return err
-	}
-	if !allowed {
-		return s.reply(ctx, message.Chat.ID, "This chat is not allowed to subscribe to telegram-bridge.", nil)
-	}
-
-	var username, firstName, lastName string
-	if message.From != nil {
-		username = message.From.Username
-		firstName = message.From.FirstName
-		lastName = message.From.LastName
-	} else {
-		username = message.Chat.Username
-		firstName = message.Chat.FirstName
-		lastName = message.Chat.LastName
-	}
+func (s *Service) handleStart(ctx context.Context, message *telego.Message, userID int64) error {
 	if err := s.store.UpsertSubscriber(ctx, db.Subscriber{
-		ChatID:    message.Chat.ID,
-		Username:  username,
-		FirstName: firstName,
-		LastName:  lastName,
+		ChatID:    userID,
+		Username:  message.From.Username,
+		FirstName: message.From.FirstName,
+		LastName:  message.From.LastName,
 	}); err != nil {
 		return err
 	}
-
-	stats, err := s.store.Stats(ctx)
+	stats, err := s.store.Stats(ctx, userID)
 	if err != nil {
 		return err
 	}
-
-	text := fmt.Sprintf("Subscribed to telegram-bridge alerts.\n\nKeywords: %d\nMatches stored: %d\n\nUse /add keyword to add a radar phrase.", stats.Keywords, stats.Events)
-	if len(s.cfg.BotAdminChatIDs) == 0 {
-		if first, ok, err := s.store.FirstSubscriber(ctx); err == nil && ok && first.ChatID == message.Chat.ID {
-			text += "\n\nThis chat is the bot admin chat. Use /login to authorize Telegram monitoring."
-		}
+	text := fmt.Sprintf("Уведомления включены.\n\nПравил: %d\nСовпадений: %d", stats.Keywords, stats.Events)
+	if connected, err := s.connected(ctx, userID); err == nil && !connected {
+		text += "\n\nЧтобы бот видел ваши чаты и работал MCP, подключите свой Telegram: /login"
 	}
-	return s.reply(ctx, message.Chat.ID, text, s.webAppMarkup(ctx, message.Chat.ID))
+	return s.reply(ctx, userID, text, s.webAppMarkup())
 }
 
-func (s *Service) handleStop(ctx context.Context, message *telego.Message) error {
-	if err := s.store.DeleteSubscriber(ctx, message.Chat.ID); err != nil {
+func (s *Service) connected(ctx context.Context, userID int64) (bool, error) {
+	if s.accounts == nil {
+		return false, nil
+	}
+	return s.accounts.Connected(ctx, userID)
+}
+
+func (s *Service) handleStop(ctx context.Context, userID int64) error {
+	if err := s.store.DeleteSubscriber(ctx, userID); err != nil {
 		return err
 	}
-	return s.reply(ctx, message.Chat.ID, "Unsubscribed from telegram-bridge alerts.", nil)
+	return s.reply(ctx, userID, "Уведомления выключены. Подключение Telegram и правила сохранены.", nil)
 }
 
-func (s *Service) handleAddKeyword(ctx context.Context, message *telego.Message, payload string) error {
-	keyword, err := s.store.AddKeyword(ctx, payload)
+func (s *Service) handleAddKeyword(ctx context.Context, userID int64, payload string) error {
+	keyword, err := s.store.AddKeyword(ctx, userID, payload)
 	if err != nil {
-		return s.reply(ctx, message.Chat.ID, "Usage: /add keyword", nil)
+		return s.reply(ctx, userID, "Использование: /add слово", nil)
 	}
-	return s.reply(ctx, message.Chat.ID, fmt.Sprintf("Added keyword #%d: %s", keyword.ID, keyword.Phrase), nil)
+	return s.reply(ctx, userID, fmt.Sprintf("Добавлено правило #%d: %s", keyword.ID, keyword.Phrase), nil)
 }
 
-func (s *Service) handleAddWatchRule(ctx context.Context, message *telego.Message, payload string) error {
+func (s *Service) handleAddWatchRule(ctx context.Context, userID int64, payload string) error {
 	parts := strings.Split(payload, "::")
 	if len(parts) < 2 {
-		return s.reply(ctx, message.Chat.ID, "Usage: /watch name :: any term, synonym :: required terms :: excluded terms", nil)
+		return s.reply(ctx, userID, "Использование: /watch название :: любое, синоним :: обязательные :: исключения", nil)
 	}
-	rule, err := s.store.UpsertWatchRule(ctx, db.Keyword{
+	rule, err := s.store.UpsertWatchRule(ctx, userID, db.Keyword{
 		Phrase:       strings.TrimSpace(parts[0]),
 		AnyTerms:     splitRuleTerms(parts[1]),
 		AllTerms:     splitRulePart(parts, 2),
@@ -427,9 +397,9 @@ func (s *Service) handleAddWatchRule(ctx context.Context, message *telego.Messag
 		Enabled:      true,
 	})
 	if err != nil {
-		return s.reply(ctx, message.Chat.ID, "Could not add watch rule: "+err.Error(), nil)
+		return s.reply(ctx, userID, "Не удалось добавить правило: "+err.Error(), nil)
 	}
-	return s.reply(ctx, message.Chat.ID, fmt.Sprintf("Watching #%d %s\nany: %s", rule.ID, rule.Phrase, strings.Join(rule.AnyTerms, ", ")), nil)
+	return s.reply(ctx, userID, fmt.Sprintf("Слежу #%d %s\nлюбое: %s", rule.ID, rule.Phrase, strings.Join(rule.AnyTerms, ", ")), nil)
 }
 
 func splitRulePart(parts []string, index int) []string {
@@ -450,25 +420,25 @@ func splitRuleTerms(value string) []string {
 	return out
 }
 
-func (s *Service) handleDeleteKeyword(ctx context.Context, message *telego.Message, payload string) error {
-	rows, err := s.store.DeleteKeyword(ctx, payload)
+func (s *Service) handleDeleteKeyword(ctx context.Context, userID int64, payload string) error {
+	rows, err := s.store.DeleteKeyword(ctx, userID, payload)
 	if err != nil || rows == 0 {
-		return s.reply(ctx, message.Chat.ID, "Usage: /del keyword-or-id", nil)
+		return s.reply(ctx, userID, "Использование: /del слово-или-номер", nil)
 	}
-	return s.reply(ctx, message.Chat.ID, "Deleted keyword.", nil)
+	return s.reply(ctx, userID, "Правило удалено.", nil)
 }
 
-func (s *Service) handleKeywords(ctx context.Context, message *telego.Message) error {
-	keywords, err := s.store.ListKeywords(ctx)
+func (s *Service) handleKeywords(ctx context.Context, userID int64) error {
+	keywords, err := s.store.ListKeywords(ctx, userID)
 	if err != nil {
 		return err
 	}
 	if len(keywords) == 0 {
-		return s.reply(ctx, message.Chat.ID, "No keywords yet. Use /add keyword.", nil)
+		return s.reply(ctx, userID, "Правил пока нет. Добавьте: /add слово", nil)
 	}
 
 	var b strings.Builder
-	b.WriteString("Watch rules:\n")
+	b.WriteString("Ваши правила:\n")
 	for _, keyword := range keywords {
 		fmt.Fprintf(&b, "#%d %s", keyword.ID, keyword.Phrase)
 		if len(keyword.AnyTerms) > 0 {
@@ -489,7 +459,7 @@ func (s *Service) handleKeywords(ctx context.Context, message *telego.Message) e
 		}
 		b.WriteByte('\n')
 	}
-	return s.reply(ctx, message.Chat.ID, strings.TrimSpace(b.String()), s.webAppMarkup(ctx, message.Chat.ID))
+	return s.reply(ctx, userID, strings.TrimSpace(b.String()), s.webAppMarkup())
 }
 
 func formatRuleTerms(terms []string, limit int) string {
@@ -499,38 +469,59 @@ func formatRuleTerms(terms []string, limit int) string {
 	return fmt.Sprintf("%s (+%d)", strings.Join(terms[:limit], ", "), len(terms)-limit)
 }
 
-func (s *Service) handleRecent(ctx context.Context, message *telego.Message) error {
-	events, err := s.store.ListEvents(ctx, 5)
+func (s *Service) handleRecent(ctx context.Context, userID int64) error {
+	events, err := s.store.ListEvents(ctx, userID, 5)
 	if err != nil {
 		return err
 	}
 	if len(events) == 0 {
-		return s.reply(ctx, message.Chat.ID, "No matches yet.", nil)
+		return s.reply(ctx, userID, "Совпадений пока нет.", nil)
 	}
 
 	var b strings.Builder
-	b.WriteString("Recent matches:\n")
+	b.WriteString("Последние совпадения:\n")
 	for _, event := range events {
 		fmt.Fprintf(&b, "\n#%d [%s] %s:%d\n%s", event.ID, event.Keyword, event.SourcePeerType, event.SourcePeerID, truncate(event.Text, 180))
 	}
-	return s.reply(ctx, message.Chat.ID, strings.TrimSpace(b.String()), s.webAppMarkup(ctx, message.Chat.ID))
+	return s.reply(ctx, userID, strings.TrimSpace(b.String()), s.webAppMarkup())
 }
 
-func (s *Service) handleLoginStatus(ctx context.Context, message *telego.Message) error {
-	if s.monitorService == nil {
-		return s.reply(ctx, message.Chat.ID, "Telegram user API is not configured.", nil)
+func (s *Service) handleLoginStatus(ctx context.Context, userID int64) error {
+	if s.accounts == nil {
+		return s.reply(ctx, userID, "Telegram API не настроен на сервере.", nil)
 	}
-	status := s.monitorService.Status()
+	status := s.accounts.Status(userID)
+	connected, err := s.accounts.Connected(ctx, userID)
+	if err != nil {
+		return err
+	}
 	switch {
 	case !status.Configured:
-		return s.reply(ctx, message.Chat.ID, "Telegram user API is not configured.", nil)
+		return s.reply(ctx, userID, "Telegram API не настроен на сервере.", nil)
 	case status.Authorized:
-		return s.reply(ctx, message.Chat.ID, fmt.Sprintf("Telegram user session is authorized as user_id=%d.", status.UserID), nil)
-	case status.LastRunError != "":
-		return s.reply(ctx, message.Chat.ID, "Telegram user session is not authorized.\n\nLast monitor error: "+status.LastRunError, nil)
+		return s.reply(ctx, userID, "Ваш Telegram подключён и работает.", nil)
+	case connected:
+		return s.reply(ctx, userID, "Ваш Telegram подключён, сервер переподключается.", nil)
 	default:
-		return s.reply(ctx, message.Chat.ID, "Telegram user session is not authorized. Use /login to connect it.", nil)
+		return s.reply(ctx, userID, "Ваш Telegram не подключён. Отправьте /login.", nil)
 	}
+}
+
+func (s *Service) handleLogout(ctx context.Context, userID int64) error {
+	if s.accounts == nil {
+		return s.reply(ctx, userID, "Telegram API не настроен на сервере.", nil)
+	}
+	connected, err := s.accounts.Connected(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if !connected {
+		return s.reply(ctx, userID, "Ваш Telegram не подключён.", nil)
+	}
+	if err := s.accounts.Logout(ctx, userID); err != nil {
+		return err
+	}
+	return s.reply(ctx, userID, "Готово: сессия Telegram завершена, MCP-подключения и токены удалены. Правила сохранены.", nil)
 }
 
 func (s *Service) reply(ctx context.Context, chatID int64, text string, markup telego.ReplyMarkup) error {
@@ -542,469 +533,34 @@ func (s *Service) reply(ctx context.Context, chatID int64, text string, markup t
 	return err
 }
 
-func (s *Service) replyTopic(ctx context.Context, chatID int64, topicID int, text string) error {
-	_, err := s.bot.SendMessage(ctx, &telego.SendMessageParams{
-		ChatID:          telego.ChatID{ID: chatID},
-		MessageThreadID: topicID,
-		Text:            truncateUTF16(text, 3900),
-	})
-	return err
-}
-
-func (s *Service) SendCodexJobResult(ctx context.Context, job db.CodexJob) error {
-	text := strings.TrimSpace(job.Result)
-	if job.Status == "failed" {
-		text = "⚠️ Codex: " + strings.TrimSpace(job.Error)
-	}
-	if text == "" {
-		text = "Codex finished without a text response."
-	}
-	return s.replyTopic(ctx, job.Thread.TelegramChatID, job.Thread.TelegramTopicID, text)
-}
-
-func (s *Service) SyncCodexThreads(ctx context.Context, snapshots []db.CodexThreadSnapshot) (CodexSyncResult, error) {
-	var result CodexSyncResult
-	var dashboard db.CodexProject
-	var dashboardReady bool
-	var failures []error
-
-	for _, snapshot := range snapshots {
-		snapshot.CodexThreadID = strings.TrimSpace(snapshot.CodexThreadID)
-		snapshot.Title = strings.TrimSpace(snapshot.Title)
-		snapshot.CWD = strings.TrimSpace(snapshot.CWD)
-		if snapshot.CodexThreadID == "" || snapshot.CWD == "" {
-			result.Skipped++
-			continue
-		}
-		mirror, exists, err := s.store.GetCodexThreadMirrorByCodexID(ctx, snapshot.CodexThreadID)
-		if err != nil {
-			failures = append(failures, err)
-			continue
-		}
-		if exists && mirror.Thread.CodexThreadID != "" && mirror.Thread.CodexThreadID != snapshot.CodexThreadID {
-			// A fallback fork is the canonical continuation of this Telegram
-			// topic; do not let its still-listed ancestor overwrite it.
-			result.Skipped++
-			continue
-		}
-		if exists {
-			deleted, err := s.store.IsCodexTopicDeleted(ctx, mirror.Thread.ID)
-			if err != nil {
-				failures = append(failures, err)
-				continue
-			}
-			if deleted {
-				result.Skipped++
-				continue
-			}
-		} else {
-			if !dashboardReady {
-				if s.monitorService == nil {
-					failures = append(failures, errors.New("Telegram user API is unavailable"))
-					break
-				}
-				identity, err := s.bot.GetMe(ctx)
-				if err != nil {
-					failures = append(failures, fmt.Errorf("get bot identity: %w", err))
-					break
-				}
-				dashboard, err = s.monitorService.EnsureCodexProject(ctx, "_active", "Active", identity.Username)
-				if err != nil {
-					failures = append(failures, err)
-					break
-				}
-				dashboardReady = true
-			}
-			topicTitle := codexTopicTitle(snapshot.Title)
-			topic, err := s.bot.CreateForumTopic(ctx, &telego.CreateForumTopicParams{
-				ChatID: telego.ChatID{ID: dashboard.TelegramChatID}, Name: topicTitle, IconColor: 0x6FB9F0,
-			})
-			if err != nil {
-				failures = append(failures, fmt.Errorf("create Codex mirror topic: %w", err))
-				continue
-			}
-			thread, err := s.store.CreateCodexThread(ctx, db.CodexThread{
-				ProjectSlug: dashboard.Slug, TelegramChatID: dashboard.TelegramChatID,
-				TelegramTopicID: topic.MessageThreadID, Title: topicTitle,
-			})
-			if err != nil {
-				failures = append(failures, err)
-				continue
-			}
-			if err := s.store.SetCodexThreadID(ctx, thread.ID, snapshot.CodexThreadID); err != nil {
-				failures = append(failures, err)
-				continue
-			}
-			thread.CodexThreadID = snapshot.CodexThreadID
-			mirror = db.CodexThreadMirror{Thread: thread}
-			result.Created++
-		}
-
-		topicTitle := codexTopicTitle(snapshot.Title)
-		if topicTitle != mirror.Thread.Title {
-			if err := s.bot.EditForumTopic(ctx, &telego.EditForumTopicParams{
-				ChatID:          telego.ChatID{ID: mirror.Thread.TelegramChatID},
-				MessageThreadID: mirror.Thread.TelegramTopicID,
-				Name:            topicTitle,
-			}); err != nil {
-				failures = append(failures, fmt.Errorf("rename Codex mirror topic: %w", err))
-				continue
-			}
-			if err := s.store.SetCodexThreadTitle(ctx, mirror.Thread.ID, topicTitle); err != nil {
-				failures = append(failures, err)
-				continue
-			}
-		}
-
-		text := formatCodexSnapshot(snapshot)
-		hash := fmt.Sprintf("%x", sha256.Sum256([]byte(topicTitle+"\x00"+snapshot.MessageRole+"\x00"+text)))
-		if mirror.ContentHash == hash && mirror.TelegramMessageID > 0 {
-			if err := s.markCodexMirrorRead(ctx, mirror, snapshot, mirror.TelegramMessageID); err != nil {
-				failures = append(failures, err)
-				continue
-			}
-			result.Skipped++
-			continue
-		}
-		messageID, err := s.replaceCodexMirrorMessage(ctx, mirror, snapshot, text)
-		if err != nil {
-			failures = append(failures, err)
-			continue
-		}
-		if err := s.store.SaveCodexThreadMirror(ctx, mirror.Thread.ID, snapshot.CWD, messageID, hash); err != nil {
-			failures = append(failures, err)
-			continue
-		}
-		if err := s.markCodexMirrorRead(ctx, mirror, snapshot, messageID); err != nil {
-			failures = append(failures, err)
-		}
-		if exists {
-			result.Updated++
-		}
-	}
-	return result, errors.Join(failures...)
-}
-
-func (s *Service) markCodexMirrorRead(ctx context.Context, mirror db.CodexThreadMirror, snapshot db.CodexThreadSnapshot, messageID int) error {
-	if snapshot.Unread == nil || *snapshot.Unread || s.monitorService == nil || messageID <= 0 {
-		return nil
-	}
-	project, ok, err := s.store.GetCodexProjectByChatID(ctx, mirror.Thread.TelegramChatID)
-	if err != nil || !ok {
-		return err
-	}
-	return s.monitorService.MarkCodexTopicRead(ctx, project, mirror.Thread.TelegramTopicID, messageID)
-}
-
-func (s *Service) replaceCodexMirrorMessage(ctx context.Context, mirror db.CodexThreadMirror, snapshot db.CodexThreadSnapshot, text string) (int, error) {
-	if mirror.TelegramMessageID > 0 {
-		err := s.bot.DeleteMessage(ctx, &telego.DeleteMessageParams{
-			ChatID: telego.ChatID{ID: mirror.Thread.TelegramChatID}, MessageID: mirror.TelegramMessageID,
-		})
-		if err != nil {
-			_, editErr := s.bot.EditMessageText(ctx, &telego.EditMessageTextParams{
-				ChatID: telego.ChatID{ID: mirror.Thread.TelegramChatID}, MessageID: mirror.TelegramMessageID,
-				Text: text, ParseMode: "HTML",
-			})
-			if editErr == nil || strings.Contains(strings.ToLower(editErr.Error()), "message is not modified") {
-				return mirror.TelegramMessageID, nil
-			}
-			return 0, fmt.Errorf("replace Codex mirror message: delete: %v; edit: %w", err, editErr)
-		}
-	}
-	if snapshot.MessageRole == "user" && strings.TrimSpace(snapshot.Message) != "" {
-		if s.monitorService == nil {
-			return 0, errors.New("Telegram user API is unavailable")
-		}
-		project, ok, err := s.store.GetCodexProjectByChatID(ctx, mirror.Thread.TelegramChatID)
-		if err != nil {
-			return 0, err
-		}
-		if !ok {
-			return 0, fmt.Errorf("Codex Telegram project for chat %d not found", mirror.Thread.TelegramChatID)
-		}
-		return s.monitorService.SendCodexMessage(ctx, project, mirror.Thread.TelegramTopicID, truncateUTF16(snapshot.Message, 3600))
-	}
-	message, err := s.bot.SendMessage(ctx, &telego.SendMessageParams{
-		ChatID: telego.ChatID{ID: mirror.Thread.TelegramChatID}, MessageThreadID: mirror.Thread.TelegramTopicID,
-		Text: text, ParseMode: "HTML", DisableNotification: true,
-	})
-	if err != nil {
-		return 0, fmt.Errorf("send Codex mirror message: %w", err)
-	}
-	return message.MessageID, nil
-}
-
-func (s *Service) DeleteArchivedCodexTopics(ctx context.Context, archivedThreadIDs []string) (int, error) {
-	threads, err := s.store.PendingArchivedCodexThreads(ctx, archivedThreadIDs)
-	if err != nil {
-		return 0, err
-	}
-	deleted := 0
-	var failures []error
-	for _, thread := range threads {
-		err := s.bot.DeleteForumTopic(ctx, &telego.DeleteForumTopicParams{
-			ChatID:          telego.ChatID{ID: thread.TelegramChatID},
-			MessageThreadID: thread.TelegramTopicID,
-		})
-		if err != nil && !codexTopicAlreadyGone(err) {
-			failures = append(failures, fmt.Errorf("delete Telegram topic %d/%d: %w", thread.TelegramChatID, thread.TelegramTopicID, err))
-			continue
-		}
-		if err := s.store.MarkCodexTopicDeleted(ctx, thread.ID); err != nil {
-			failures = append(failures, err)
-			continue
-		}
-		deleted++
-	}
-	return deleted, errors.Join(failures...)
-}
-
-func codexTopicAlreadyGone(err error) bool {
-	if err == nil {
-		return false
-	}
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "message thread not found") ||
-		strings.Contains(message, "topic_deleted") ||
-		strings.Contains(message, "topic was deleted")
-}
-
-func (s *Service) handleCodex(ctx context.Context, message *telego.Message, payload string) error {
-	if !s.cfg.HasWorkerAPI() {
-		return s.reply(ctx, message.Chat.ID, "Codex worker API is not configured.", nil)
-	}
-	if s.monitorService == nil {
-		return s.reply(ctx, message.Chat.ID, "Telegram user API is not configured.", nil)
-	}
-	projectSlug, prompt, ok := parseCodexPayload(payload)
-	if !ok {
-		return s.reply(ctx, message.Chat.ID, "Usage: /codex project :: what Codex should do", nil)
-	}
-	task, err := s.CreateCodexTask(ctx, projectSlug, prompt)
-	if err != nil {
-		return err
-	}
-	return s.reply(ctx, message.Chat.ID, "Создал задачу в "+task.Project.Title+":\n"+task.Link, nil)
-}
-
-func (s *Service) CreateCodexTask(ctx context.Context, projectSlug, prompt string) (CodexTask, error) {
-	if !s.cfg.HasWorkerAPI() {
-		return CodexTask{}, errors.New("Codex worker API is not configured")
-	}
-	if s.monitorService == nil {
-		return CodexTask{}, errors.New("Telegram user API is not configured")
-	}
-	projectSlug, prompt = strings.ToLower(strings.TrimSpace(projectSlug)), strings.TrimSpace(prompt)
-	if projectSlug == "" || prompt == "" || strings.ContainsAny(projectSlug, " /\\") {
-		return CodexTask{}, errors.New("project and prompt are required")
-	}
-	project, exists, err := s.store.GetCodexProject(ctx, projectSlug)
-	if err != nil {
-		return CodexTask{}, err
-	}
-	if !exists {
-		identity, err := s.bot.GetMe(ctx)
-		if err != nil {
-			return CodexTask{}, fmt.Errorf("get bot identity: %w", err)
-		}
-		project, err = s.monitorService.EnsureCodexProject(ctx, projectSlug, projectSlug, identity.Username)
-		if err != nil {
-			return CodexTask{}, err
-		}
-	}
-	return s.createCodexTaskInForum(ctx, projectSlug, project, prompt)
-}
-
-func (s *Service) createCodexTaskInForum(ctx context.Context, projectSlug string, forum db.CodexProject, prompt string) (CodexTask, error) {
-	topicTitle := codexTopicTitle(prompt)
-	topic, err := s.bot.CreateForumTopic(ctx, &telego.CreateForumTopicParams{
-		ChatID:    telego.ChatID{ID: forum.TelegramChatID},
-		Name:      topicTitle,
-		IconColor: 0x6FB9F0,
-	})
-	if err != nil {
-		return CodexTask{}, fmt.Errorf("create Codex topic: %w", err)
-	}
-	thread, err := s.store.CreateCodexThread(ctx, db.CodexThread{
-		ProjectSlug:     projectSlug,
-		TelegramChatID:  forum.TelegramChatID,
-		TelegramTopicID: topic.MessageThreadID,
-		Title:           topicTitle,
-	})
-	if err != nil {
-		return CodexTask{}, err
-	}
-	job, err := s.store.EnqueueCodexJob(ctx, thread.ID, prompt)
-	if err != nil {
-		return CodexTask{}, err
-	}
-	if err := s.replyTopic(ctx, thread.TelegramChatID, thread.TelegramTopicID, "🧵 Codex task queued · "+job.ID); err != nil {
-		return CodexTask{}, err
-	}
-	link := fmt.Sprintf("https://t.me/c/%d/%d", forum.TelegramChannelID, thread.TelegramTopicID)
-	return CodexTask{Project: forum, Thread: thread, Job: job, Link: link}, nil
-}
-
-func (s *Service) handleCodexContinuation(ctx context.Context, message *telego.Message, prompt string) (bool, error) {
-	thread, ok, err := s.store.GetCodexThreadByTopic(ctx, message.Chat.ID, message.MessageThreadID)
-	if err != nil || !ok {
-		return false, err
-	}
-	if message.From == nil || message.From.IsBot {
-		return true, nil
-	}
-	allowed, err := s.isAdminSender(ctx, message.From.ID)
-	if err != nil {
-		return true, err
-	}
-	if !allowed {
-		return true, nil
-	}
-	job, err := s.store.EnqueueCodexJob(ctx, thread.ID, prompt)
-	if err != nil {
-		return true, err
-	}
-	return true, s.replyTopic(ctx, message.Chat.ID, message.MessageThreadID, "⏳ queued · "+job.ID)
-}
-
-func (s *Service) handleCodexGeneralPost(ctx context.Context, message *telego.Message, prompt string) error {
-	if message.MessageThreadID > 1 || message.From == nil || message.From.IsBot {
-		return nil
-	}
-	forum, ok, err := s.store.GetCodexProjectByChatID(ctx, message.Chat.ID)
-	if err != nil || !ok {
-		return err
-	}
-	allowed, err := s.isAdminSender(ctx, message.From.ID)
-	if err != nil || !allowed {
-		return err
-	}
-	projectSlug, prompt, err := s.resolveGeneralCodexProject(ctx, forum, prompt)
-	if err != nil {
-		return s.reply(ctx, message.Chat.ID, err.Error(), nil)
-	}
-	task, err := s.createCodexTaskInForum(ctx, projectSlug, forum, prompt)
-	if err != nil {
-		return err
-	}
-	if err := s.bot.DeleteMessage(ctx, &telego.DeleteMessageParams{
-		ChatID: telego.ChatID{ID: message.Chat.ID}, MessageID: message.MessageID,
-	}); err != nil {
-		log.Printf("delete promoted Codex General post %d/%d failed: %v; task: %s", message.Chat.ID, message.MessageID, err, task.Link)
-	}
-	return nil
-}
-
-func (s *Service) resolveGeneralCodexProject(ctx context.Context, forum db.CodexProject, input string) (string, string, error) {
-	if forum.Slug != "_active" {
-		return forum.Slug, strings.TrimSpace(input), nil
-	}
-	if project, prompt, ok := parseCodexPayload(input); ok && project != "_active" {
-		if _, exists, err := s.store.GetCodexProject(ctx, project); err != nil {
-			return "", "", err
-		} else if exists {
-			return project, prompt, nil
-		}
-		return "", "", fmt.Errorf("Unknown Codex project %q.", project)
-	}
-	projects, err := s.store.ListCodexProjects(ctx)
-	if err != nil {
-		return "", "", err
-	}
-	var candidates []db.CodexProject
-	for _, project := range projects {
-		if project.Slug != "_active" {
-			candidates = append(candidates, project)
-		}
-	}
-	if len(candidates) == 1 {
-		return candidates[0].Slug, strings.TrimSpace(input), nil
-	}
-	if len(candidates) == 0 {
-		return "", "", errors.New("No Codex project is configured yet.")
-	}
-	var slugs []string
-	for _, project := range candidates {
-		slugs = append(slugs, project.Slug)
-	}
-	return "", "", fmt.Errorf("Choose a project: %s :: task", strings.Join(slugs, " / "))
-}
-
-func (s *Service) isAdminSender(ctx context.Context, userID int64) (bool, error) {
-	if userID <= 0 {
-		return false, nil
-	}
-	if len(s.cfg.BotAdminChatIDs) > 0 {
-		return s.cfg.IsConfiguredBotAdmin(userID), nil
-	}
-	first, ok, err := s.store.FirstSubscriber(ctx)
-	return ok && first.ChatID == userID, err
-}
-
-func parseCodexPayload(payload string) (string, string, bool) {
-	project, prompt, ok := strings.Cut(strings.TrimSpace(payload), "::")
-	project = strings.TrimSpace(project)
-	prompt = strings.TrimSpace(prompt)
-	if !ok || project == "" || prompt == "" || strings.ContainsAny(project, " /\\") {
-		return "", "", false
-	}
-	return strings.ToLower(project), prompt, true
-}
-
-func codexTopicTitle(prompt string) string {
-	line := strings.TrimSpace(strings.Split(prompt, "\n")[0])
-	runes := []rune(line)
-	if len(runes) > 72 {
-		runes = runes[:72]
-	}
-	if len(runes) == 0 {
-		return "New Codex task"
-	}
-	return string(runes)
-}
-
-func (s *Service) webAppMarkup(ctx context.Context, chatID int64) telego.ReplyMarkup {
+func (s *Service) webAppMarkup() telego.ReplyMarkup {
 	if s.cfg.PublicBaseURL == "" {
-		return nil
-	}
-	admin, err := s.isAdminChat(ctx, chatID)
-	if err != nil {
-		log.Printf("check dashboard admin chat %d failed: %v", chatID, err)
-		return nil
-	}
-	if !admin {
 		return nil
 	}
 	return tu.InlineKeyboard(
 		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("Open dashboard").WithWebApp(&telego.WebAppInfo{URL: s.cfg.PublicBaseURL}),
+			tu.InlineKeyboardButton("Открыть панель").WithWebApp(&telego.WebAppInfo{URL: s.cfg.PublicBaseURL}),
 		),
 	)
 }
 
-func (s *Service) eventMarkup(ctx context.Context, event db.Event, chatID int64) telego.ReplyMarkup {
+// eventMarkup is only ever attached to an alert in the event owner's chat.
+func (s *Service) eventMarkup(ctx context.Context, event db.Event) telego.ReplyMarkup {
 	rows := make([][]telego.InlineKeyboardButton, 0, 2)
 	if url := s.messageURL(ctx, event); url != "" {
 		rows = append(rows, tu.InlineKeyboardRow(
 			tu.InlineKeyboardButton("Open message").WithURL(url),
 		))
 	}
-	admin, err := s.isAdminChat(ctx, chatID)
-	if err != nil {
-		log.Printf("check event action admin chat %d failed: %v", chatID, err)
+	actions := make([]telego.InlineKeyboardButton, 0, 2)
+	if ruleURL := s.ruleWebAppURL(event.RuleID); ruleURL != "" {
+		actions = append(actions, tu.InlineKeyboardButton("Правило").WithWebApp(&telego.WebAppInfo{URL: ruleURL}))
 	}
-	if err == nil && admin {
-		actions := make([]telego.InlineKeyboardButton, 0, 2)
-		if ruleURL := s.ruleWebAppURL(event.RuleID); ruleURL != "" {
-			actions = append(actions, tu.InlineKeyboardButton("Правило").WithWebApp(&telego.WebAppInfo{URL: ruleURL}))
-		}
-		if event.ID > 0 && strings.TrimSpace(event.Keyword) != "" {
-			actions = append(actions, tu.InlineKeyboardButton("Stop keyword").WithCallbackData(fmt.Sprintf("kwdel:%d", event.ID)))
-		}
-		if len(actions) > 0 {
-			rows = append(rows, tu.InlineKeyboardRow(actions...))
-		}
+	if event.ID > 0 && strings.TrimSpace(event.Keyword) != "" {
+		actions = append(actions, tu.InlineKeyboardButton("Stop keyword").WithCallbackData(fmt.Sprintf("kwdel:%d", event.ID)))
+	}
+	if len(actions) > 0 {
+		rows = append(rows, tu.InlineKeyboardRow(actions...))
 	}
 	if len(rows) == 0 {
 		return nil
@@ -1020,15 +576,6 @@ func (s *Service) ruleWebAppURL(ruleID int64) string {
 	return fmt.Sprintf("%s/#rule-%d", baseURL, ruleID)
 }
 
-func adminOnlyCommand(command string) bool {
-	switch command {
-	case "add", "watch", "del", "delete", "keywords", "recent", "codex", "login", "loginstatus", "cancel":
-		return true
-	default:
-		return false
-	}
-}
-
 func callbackChatID(query *telego.CallbackQuery) int64 {
 	if query == nil {
 		return 0
@@ -1041,19 +588,8 @@ func callbackChatID(query *telego.CallbackQuery) int64 {
 	return query.From.ID
 }
 
-func (s *Service) canSubscribe(ctx context.Context, chatID int64) (bool, error) {
-	if len(s.cfg.BotAdminChatIDs) > 0 {
-		return s.cfg.IsConfiguredBotAdmin(chatID), nil
-	}
-	first, ok, err := s.store.FirstSubscriber(ctx)
-	if err != nil || !ok {
-		return !ok, err
-	}
-	return first.ChatID == chatID, nil
-}
-
 func (s *Service) messageURL(ctx context.Context, event db.Event) string {
-	peer, ok, err := s.store.GetMonitorPeer(ctx, event.SourcePeerType, event.SourcePeerID)
+	peer, ok, err := s.store.GetMonitorPeer(ctx, event.OwnerUserID, event.SourcePeerType, event.SourcePeerID)
 	if err != nil {
 		log.Printf("get monitor peer for event link failed: %v", err)
 	}
@@ -1188,18 +724,21 @@ func deletedMediaLabel(mediaType string) string {
 
 func helpText() string {
 	return strings.Join([]string{
-		"telegram-bridge commands:",
-		"/start - subscribe this chat to alerts",
-		"/stop - unsubscribe this chat",
-		"/add keyword - add a radar phrase",
-		"/watch name :: any1, any2 :: required1 :: excluded1 - add a flexible rule",
-		"/del keyword-or-id - delete a phrase",
-		"/keywords - list phrases",
-		"/recent - show recent matches",
-		"/codex project :: prompt - create a Codex task and Telegram topic",
-		"/login - authorize Telegram user monitoring",
-		"/loginstatus - show Telegram user session status",
-		"/cancel - cancel current login",
+		"Команды telegram-bridge:",
+		"/login — подключить свой Telegram",
+		"/loginstatus — статус подключения",
+		"/logout — отключить свой Telegram, MCP-подключения и токены",
+		"/start — включить уведомления",
+		"/stop — выключить уведомления",
+		"/add слово — добавить правило",
+		"/watch название :: любое1, любое2 :: обязательное :: исключение — гибкое правило",
+		"/del слово-или-номер — удалить правило",
+		"/keywords — мои правила",
+		"/recent — последние совпадения",
+		"/connections — MCP-подключения",
+		"/cancel — отменить вход",
+		"",
+		"Всё в боте и на панели относится только к вашему аккаунту.",
 	}, "\n")
 }
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import os
 import pathlib
-import plistlib
 import subprocess
 import sys
 import tempfile
@@ -12,7 +11,6 @@ import tomllib
 
 PLUGIN_NAME = "telegram-bridge"
 PLUGIN_ID = "telegram-bridge@nextster"
-WORKER_LABEL = "dev.nextster.telegram-bridge.codex-worker"
 
 
 def repo_root() -> pathlib.Path:
@@ -186,45 +184,6 @@ def repo_version(root: pathlib.Path) -> str:
         return "missing"
 
 
-def worker_details() -> tuple[str, str, str]:
-    launchctl = os.environ.get("LAUNCHCTL_BIN", "launchctl")
-    result = run([launchctl, "print", f"gui/{os.getuid()}/{WORKER_LABEL}"], check=False)
-    state = "not loaded"
-    pid = "-"
-    if result.returncode == 0:
-        for raw in result.stdout.splitlines():
-            line = raw.strip()
-            if line.startswith("state =") and state == "not loaded":
-                state = line.split("=", 1)[1].strip()
-            if line.startswith("pid ="):
-                pid = line.split("=", 1)[1].strip()
-                break
-    plist = pathlib.Path.home() / "Library" / "LaunchAgents" / f"{WORKER_LABEL}.plist"
-    binary = "missing"
-    try:
-        with plist.open("rb") as handle:
-            arguments = plistlib.load(handle).get("ProgramArguments", [])
-        if arguments:
-            binary = arguments[0]
-    except (OSError, plistlib.InvalidFileException):
-        pass
-    build = "unknown"
-    if binary != "missing" and pathlib.Path(binary).is_file():
-        go = os.environ.get("GO_BIN", "go")
-        info = run([go, "version", "-m", binary], check=False)
-        revision = ""
-        modified = False
-        for raw in info.stdout.splitlines():
-            line = raw.strip()
-            if line.startswith("build\tvcs.revision="):
-                revision = line.split("=", 1)[1]
-            elif line == "build\tvcs.modified=true":
-                modified = True
-        if revision:
-            build = revision[:12] + ("+modified" if modified else "")
-    return f"{state} pid={pid}", binary, build
-
-
 def status() -> int:
     root = repo_root()
     source = ""
@@ -237,7 +196,6 @@ def status() -> int:
     version = repo_version(root)
     plugin = plugin_details()
     mcp = mcp_details()
-    worker, worker_binary, worker_build = worker_details()
     warnings: list[str] = []
     if linked:
         mode = "development"
@@ -267,9 +225,6 @@ def status() -> int:
     print(f"MCP transport: {transport_type}")
     print(f"MCP entrypoint: {entrypoint}")
     print(f"MCP cwd/source: {cwd}")
-    print(f"worker: {worker}")
-    print(f"worker binary: {worker_binary}")
-    print(f"worker build: {worker_build}")
     if warnings:
         for warning in warnings:
             print(f"warning: {warning}")

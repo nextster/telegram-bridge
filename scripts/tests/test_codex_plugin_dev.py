@@ -53,9 +53,6 @@ else:
 '''
 
 
-FAKE_LAUNCHCTL = "#!/bin/sh\nexit 1\n"
-
-
 class DevPluginTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -65,16 +62,12 @@ class DevPluginTest(unittest.TestCase):
         self.fake_codex = self.home / "codex"
         self.fake_codex.write_text(FAKE_CODEX)
         self.fake_codex.chmod(0o755)
-        self.fake_launchctl = self.home / "launchctl"
-        self.fake_launchctl.write_text(FAKE_LAUNCHCTL)
-        self.fake_launchctl.chmod(0o755)
         version = json.loads((ROOT / "plugins/telegram-bridge/.codex-plugin/plugin.json").read_text())["version"]
         self.env = {
             **os.environ,
             "HOME": str(self.home),
             "CODEX_HOME": str(self.codex_home),
             "CODEX_BIN": str(self.fake_codex),
-            "LAUNCHCTL_BIN": str(self.fake_launchctl),
             "TELEGRAM_BRIDGE_REPO_ROOT": str(ROOT),
             "FAKE_PLUGIN_VERSION": version,
         }

@@ -28,13 +28,13 @@ func TestExampleRulesImportAndMatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := seed.AddKeyword(ctx, "bike light"); err != nil {
+	if _, err := seed.AddKeyword(ctx, 7, "bike light"); err != nil {
 		t.Fatal(err)
 	}
 	seed.Close()
 
 	var output bytes.Buffer
-	if err := importRules(ctx, cfg, payload, &output); err != nil {
+	if err := importRules(ctx, cfg, 7, payload, &output); err != nil {
 		t.Fatal(err)
 	}
 	if got := output.String(); !strings.Contains(got, "Imported 2 watch rules; deleted 1 old rules") {
@@ -46,7 +46,7 @@ func TestExampleRulesImportAndMatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	rules, err := store.ListKeywords(ctx)
+	rules, err := store.ListKeywords(ctx, 7)
 	if err != nil {
 		t.Fatal(err)
 	}
