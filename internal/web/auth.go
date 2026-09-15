@@ -50,6 +50,11 @@ func (s *Server) requireWebUser(next func(http.ResponseWriter, *http.Request, in
 
 func (s *Server) authenticateWebApp(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
+	// A cross-site form could otherwise sign a browser in as another user.
+	if !sameOriginRequest(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "invalid authentication payload", http.StatusBadRequest)
@@ -182,6 +187,23 @@ func webSessionMAC(encoded, botToken string) []byte {
 	mac := hmac.New(sha256.New, []byte(botToken))
 	_, _ = mac.Write([]byte("telegram-bridge-web-session\n" + encoded))
 	return mac.Sum(nil)
+}
+
+// sameOriginRequest rejects requests that a browser marks as cross-site or
+// that carry a foreign Origin. Clients that send neither header are not
+// browsers acting on another site's behalf.
+func sameOriginRequest(r *http.Request) bool {
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "", "same-origin", "none":
+	default:
+		return false
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	return err == nil && parsed.Host == r.Host
 }
 
 func requestUsesHTTPS(r *http.Request, publicBaseURL string) bool {

@@ -68,6 +68,16 @@ func (s *Service) OAuthConnectionRevoked(ctx context.Context, userID int64, clie
 		codeHTML(clientName), html.EscapeString(reason)), nil)
 }
 
+// OAuthConnectionCreated tells a user that a new client has access to their
+// account.
+func (s *Service) OAuthConnectionCreated(ctx context.Context, userID int64, clientName, clientIP string) error {
+	if userID <= 0 {
+		return errors.New("connection owner is unknown")
+	}
+	return s.sendHTML(ctx, userID, fmt.Sprintf("🔗 Новое MCP-подключение к вашему Telegram: %s, IP %s.\nЕсли подключали не вы, сразу отключите его в /connections.",
+		codeHTML(clientName), codeHTML(clientIP)), nil)
+}
+
 // canApproveOAuth requires a private chat and a connected Telegram account.
 // The approval grants access to that user's own account only.
 func (s *Service) canApproveOAuth(ctx context.Context, chatID, userID int64) (bool, error) {
@@ -109,7 +119,7 @@ func (s *Service) handleOAuthStart(ctx context.Context, message *telego.Message,
 		tu.InlineKeyboardRow(numbers...),
 		tu.InlineKeyboardRow(tu.InlineKeyboardButton("Отклонить").WithCallbackData(oauthCallbackPrefix+request.ID+":"+oauthDenyChoice)),
 	)
-	text := fmt.Sprintf("🔐 <b>Доступ к вашему Telegram через MCP</b>\n\nКлиент: %s\nIP: %s\nБраузер: %s\n\nНажмите число со страницы подключения. Если вы её не открывали сами, нажмите «Отклонить». Никогда не нажимайте число, которое вам прислал кто-то другой.",
+	text := fmt.Sprintf("🔐 <b>Доступ к вашему Telegram через MCP</b>\n\nКлиент: %s (название задаёт сам клиент)\nIP: %s\nБраузер: %s\n\nДоступ получит тот, кто открыл страницу подключения. Нажмите число, только если открыли её сами. Если число вам прислал кто-то другой, нажмите «Отклонить»: иначе он получит доступ к вашей переписке.",
 		codeHTML(clientName), codeHTML(request.ClientIP), codeHTML(request.UserAgent))
 	return s.sendHTML(ctx, message.Chat.ID, text, markup)
 }

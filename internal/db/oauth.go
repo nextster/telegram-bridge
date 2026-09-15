@@ -514,9 +514,12 @@ func (s *Store) withTx(ctx context.Context, fn func(*sql.Tx) error) error {
 }
 
 // RevokeOAuthGrantsForUser revokes every connection of a user, for example on
-// logout.
+// logout, including approvals whose code has not been exchanged yet.
 func (s *Store) RevokeOAuthGrantsForUser(ctx context.Context, userID int64, now time.Time) error {
 	return s.withTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE oauth_requests SET status = 'denied', code_hash = '' WHERE decided_by = ? AND status = 'approved'`, userID); err != nil {
+			return fmt.Errorf("deny user oauth approvals: %w", err)
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM oauth_tokens WHERE grant_id IN (SELECT id FROM oauth_grants WHERE user_id = ?)`, userID); err != nil {
 			return fmt.Errorf("delete user oauth tokens: %w", err)
 		}

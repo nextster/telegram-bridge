@@ -35,6 +35,7 @@ type fakeApprover struct {
 	mu       sync.Mutex
 	requests []string
 	revoked  []string
+	created  []int64
 }
 
 func (f *fakeApprover) OAuthApprovalLink(_ context.Context, requestID string) (string, error) {
@@ -48,6 +49,13 @@ func (f *fakeApprover) OAuthConnectionRevoked(_ context.Context, _ int64, client
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.revoked = append(f.revoked, clientName)
+	return nil
+}
+
+func (f *fakeApprover) OAuthConnectionCreated(_ context.Context, userID int64, _, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.created = append(f.created, userID)
 	return nil
 }
 
@@ -360,6 +368,26 @@ func TestAuthorizationCodeIsSingleUseAndBoundToPKCE(t *testing.T) {
 	}
 	if status, body := h.tokenRequest(form); status != http.StatusBadRequest || body["error"] != "invalid_grant" {
 		t.Fatalf("reused code status=%d body=%v", status, body)
+	}
+	h.approver.mu.Lock()
+	defer h.approver.mu.Unlock()
+	if len(h.approver.created) != 1 || h.approver.created[0] != adminUserID {
+		t.Fatalf("connection alerts = %v", h.approver.created)
+	}
+}
+
+func TestLogoutCancelsApprovedButUnexchangedCode(t *testing.T) {
+	h := newHarness(t)
+	clientID, verifier, redirect := h.authorizeManually(pickCorrect)
+	if err := h.store.RevokeOAuthGrantsForUser(context.Background(), adminUserID, h.clock.Now()); err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{"grant_type": {"authorization_code"}, "client_id": {clientID}, "code": {redirect.Query().Get("code")}, "redirect_uri": {testRedirect}, "code_verifier": {verifier}}
+	if status, body := h.tokenRequest(form); status != http.StatusBadRequest || body["error"] != "invalid_grant" {
+		t.Fatalf("exchange after logout status=%d body=%v", status, body)
+	}
+	if grants, err := h.store.ListOAuthGrants(context.Background(), adminUserID); err != nil || len(grants) != 0 {
+		t.Fatalf("grants after logout = %v err=%v", grants, err)
 	}
 }
 

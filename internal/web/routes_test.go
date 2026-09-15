@@ -58,6 +58,8 @@ func (stubApprover) OAuthApprovalLink(context.Context, string) (string, error) {
 
 func (stubApprover) OAuthConnectionRevoked(context.Context, int64, string, string) error { return nil }
 
+func (stubApprover) OAuthConnectionCreated(context.Context, int64, string, string) error { return nil }
+
 func TestSplitTermGroups(t *testing.T) {
 	got := splitTermGroups("USB-C, Type-C\n1000 lm, 1200 lm\r\n\n31.8")
 	if len(got) != 3 || len(got[0]) != 2 || len(got[1]) != 2 || len(got[2]) != 1 {

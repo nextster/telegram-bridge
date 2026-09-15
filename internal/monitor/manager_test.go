@@ -78,6 +78,34 @@ func connectedTestAccount(store *db.Store, owner int64) *accountRuntime {
 	return &accountRuntime{service: service, cancel: func() {}, done: make(chan struct{})}
 }
 
+func TestRevokedRuntimeCannotDeleteASessionFromANewLogin(t *testing.T) {
+	ctx := context.Background()
+	store, vault := testVault(t)
+	manager := NewManager(config.Config{TelegramAPIID: 1, TelegramAPIHash: "fake"}, store, nil, vault)
+	stale := connectedTestAccount(store, aliceID)
+	close(stale.done)
+	manager.accounts[aliceID] = stale
+
+	if err := manager.replaceSession(ctx, aliceID, []byte("new session")); err != nil {
+		t.Fatal(err)
+	}
+	if manager.discardRevokedSession(ctx, aliceID, stale) {
+		t.Fatal("a replaced runtime deleted the session")
+	}
+	if data, err := vault.Load(ctx, aliceID); err != nil || string(data) != "new session" {
+		t.Fatalf("session after replacement = %q, %v", data, err)
+	}
+
+	current := connectedTestAccount(store, aliceID)
+	manager.accounts[aliceID] = current
+	if !manager.discardRevokedSession(ctx, aliceID, current) {
+		t.Fatal("the current revoked runtime kept its session")
+	}
+	if _, err := vault.Load(ctx, aliceID); !errors.Is(err, session.ErrNotFound) {
+		t.Fatalf("revoked session still stored: %v", err)
+	}
+}
+
 func TestManagerRoutesOnlyToTheRequestedAccount(t *testing.T) {
 	store, vault := testVault(t)
 	manager := NewManager(config.Config{TelegramAPIID: 1, TelegramAPIHash: "fake"}, store, nil, vault)

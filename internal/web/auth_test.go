@@ -154,6 +154,39 @@ func TestDashboardRequiresTelegramSession(t *testing.T) {
 	}
 }
 
+func TestWebAppAuthRejectsCrossSiteRequests(t *testing.T) {
+	_, _, cfg, handler := testWebServer(t)
+	initData := signedTelegramInitData(cfg.BotToken, map[string]string{
+		"auth_date": strconv.FormatInt(time.Now().Unix(), 10),
+		"user":      `{"id":42}`,
+	})
+	for _, headers := range []map[string]string{
+		{"Sec-Fetch-Site": "cross-site"},
+		{"Sec-Fetch-Site": "same-site"},
+		{"Origin": "https://attacker.example"},
+	} {
+		request := httptest.NewRequest(http.MethodPost, "/webapp/auth", strings.NewReader(url.Values{"init_data": {initData}}.Encode()))
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		for key, value := range headers {
+			request.Header.Set(key, value)
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusForbidden || len(response.Result().Cookies()) != 0 {
+			t.Fatalf("headers %v: status=%d cookies=%d", headers, response.Code, len(response.Result().Cookies()))
+		}
+	}
+	request := httptest.NewRequest(http.MethodPost, "/webapp/auth", strings.NewReader(url.Values{"init_data": {initData}}.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Sec-Fetch-Site", "same-origin")
+	request.Header.Set("Origin", "http://"+request.Host)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("same-origin auth status = %d", response.Code)
+	}
+}
+
 func TestDashboardIsolatesUsers(t *testing.T) {
 	store, accounts, cfg, handler := testWebServer(t)
 	ctx := context.Background()

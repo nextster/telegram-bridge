@@ -223,15 +223,8 @@ func (m *Manager) runAccount(ctx context.Context, owner int64, runtime *accountR
 		}
 		if errors.Is(err, errSessionRevoked) || errors.Is(err, errAccountMismatch) {
 			log.Printf("telegram account %d stopped: %v", owner, err)
-			m.mu.RLock()
-			current := m.accounts[owner] == runtime
-			m.mu.RUnlock()
-			if !current {
-				// A new login replaced this runtime; its session is not ours to delete.
+			if !m.discardRevokedSession(context.WithoutCancel(ctx), owner, runtime) {
 				return
-			}
-			if deleteErr := m.vault.Delete(context.WithoutCancel(ctx), owner); deleteErr != nil {
-				log.Printf("delete revoked session %d failed: %v", owner, deleteErr)
 			}
 			m.notifyUser(context.WithoutCancel(ctx), owner, "Сессия Telegram отключена или устарела. Чтобы снова пользоваться мостом, отправьте /login.")
 			return
@@ -247,6 +240,42 @@ func (m *Manager) runAccount(ctx context.Context, owner int64, runtime *accountR
 			delay = accountRetryMax
 		}
 	}
+}
+
+// discardRevokedSession deletes the session of a runtime that Telegram
+// rejected, unless a new login has replaced that runtime in the meantime. The
+// check and the delete hold m.mu, as replaceSession does.
+func (m *Manager) discardRevokedSession(ctx context.Context, owner int64, runtime *accountRuntime) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.accounts[owner] != runtime {
+		return false
+	}
+	if err := m.vault.Delete(ctx, owner); err != nil {
+		log.Printf("delete revoked session %d failed: %v", owner, err)
+	}
+	return true
+}
+
+// replaceSession stores a new session and detaches the running account in
+// one step, then starts the account again.
+func (m *Manager) replaceSession(ctx context.Context, owner int64, data []byte) error {
+	m.mu.Lock()
+	err := m.vault.Save(ctx, owner, data)
+	runtime, running := m.accounts[owner]
+	if err == nil && running {
+		delete(m.accounts, owner)
+	}
+	m.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if running {
+		runtime.cancel()
+		<-runtime.done
+	}
+	m.start(owner)
+	return nil
 }
 
 func (m *Manager) notifyUser(ctx context.Context, owner int64, text string) {
@@ -408,16 +437,10 @@ func (m *Manager) Login(ctx context.Context, owner int64, opts LoginOptions) (Lo
 	if err != nil {
 		return LoginResult{}, fmt.Errorf("read new telegram session: %w", err)
 	}
-	if err := m.vault.Save(ctx, owner, data); err != nil {
+	if err := m.replaceSession(ctx, owner, data); err != nil {
 		return LoginResult{}, err
 	}
-	m.restart(owner)
 	return LoginResult{UserID: owner}, nil
-}
-
-func (m *Manager) restart(owner int64) {
-	m.stop(owner)
-	m.start(owner)
 }
 
 func (m *Manager) stop(owner int64) {
@@ -439,14 +462,8 @@ func (m *Manager) Logout(ctx context.Context, owner int64) error {
 	if owner <= 0 {
 		return errors.New("logout owner is required")
 	}
-	if account, err := m.Account(owner); err == nil {
-		if api, _, err := account.readyAPI(); err == nil {
-			if _, err := api.AuthLogOut(ctx); err != nil {
-				log.Printf("telegram logout for %d failed: %v", owner, err)
-			}
-		}
-	}
 	m.stop(owner)
+	m.logOutStoredSession(ctx, owner)
 	now := time.Now()
 	if err := m.vault.Delete(ctx, owner); err != nil {
 		return err
@@ -455,6 +472,33 @@ func (m *Manager) Logout(ctx context.Context, owner int64) error {
 		return err
 	}
 	return m.store.DeleteAPITokensForUser(ctx, owner)
+}
+
+// logOutStoredSession ends the stored session on Telegram's side with a
+// short-lived client, so it works whether or not the account was connected.
+func (m *Manager) logOutStoredSession(ctx context.Context, owner int64) {
+	data, err := m.vault.Load(ctx, owner)
+	if err != nil {
+		if !errors.Is(err, session.ErrNotFound) {
+			log.Printf("load session %d for logout failed: %v", owner, err)
+		}
+		return
+	}
+	memory := &session.StorageMemory{}
+	if err := memory.StoreSession(ctx, data); err != nil {
+		log.Printf("load session %d for logout failed: %v", owner, err)
+		return
+	}
+	logoutCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	client := telegram.NewClient(m.cfg.TelegramAPIID, m.cfg.TelegramAPIHash, telegram.Options{SessionStorage: memory, Device: clientDevice()})
+	err = client.Run(logoutCtx, func(ctx context.Context) error {
+		_, err := client.API().AuthLogOut(ctx)
+		return err
+	})
+	if err != nil {
+		log.Printf("telegram logout for %d failed: %v", owner, err)
+	}
 }
 
 // ImportLegacySession moves the single-account session file into the vault

@@ -85,9 +85,18 @@ func newWebLoginManager(store *db.Store, accounts Accounts, notifier UserNotifie
 	}
 }
 
+// get returns a login flow that is still within its lifetime. Older flows are
+// dropped so an old link no longer shows the phone number or user ID.
 func (m *webLoginManager) get(token string) *webLoginFlow {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	now := time.Now().UTC()
+	for key, flow := range m.flows {
+		if now.Sub(flow.startedAt) > webLoginTimeout {
+			flow.cancel()
+			delete(m.flows, key)
+		}
+	}
 	return m.flows[strings.TrimSpace(token)]
 }
 

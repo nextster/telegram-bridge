@@ -190,7 +190,8 @@ request.
 - The connection is granted to whoever confirms it, for their own connected
   account, in their private chat with the bot. Confirming a request somebody
   else opened gives that person access to your account, so press only the
-  number shown on your own screen.
+  number shown on your own screen. The bot reports every new connection with
+  its client name and IP address, so an unexpected one can be revoked at once.
 - Codes and tokens never pass through Telegram. Only the browser that opened the
   page receives the single authorization code.
 - Redirects are limited to loopback addresses and the Claude connector callback;

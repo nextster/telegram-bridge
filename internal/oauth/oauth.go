@@ -90,6 +90,9 @@ type Approver interface {
 	// OAuthConnectionRevoked tells the user that one of their connections was
 	// cut off.
 	OAuthConnectionRevoked(ctx context.Context, userID int64, clientName, reason string) error
+	// OAuthConnectionCreated tells the user that a client now has access to
+	// their account, so a connection they did not start can be revoked at once.
+	OAuthConnectionCreated(ctx context.Context, userID int64, clientName, clientIP string) error
 }
 
 type Options struct {
@@ -506,6 +509,9 @@ func (s *Server) exchangeCode(w http.ResponseWriter, r *http.Request, client db.
 		log.Printf("oauth code exchange failed: %v", err)
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not issue tokens")
 		return
+	}
+	if err := s.approver.OAuthConnectionCreated(context.WithoutCancel(r.Context()), grant.UserID, grant.ClientName, request.ClientIP); err != nil {
+		log.Printf("oauth connection alert failed: %v", err)
 	}
 	writeTokenResponse(w, access, refresh)
 }
