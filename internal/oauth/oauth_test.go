@@ -424,13 +424,15 @@ func TestMetadataDocuments(t *testing.T) {
 func TestRegistrationAcceptsOnlyLoopbackAndTrustedCallbacks(t *testing.T) {
 	h := newHarness(t)
 	cases := map[string]int{
-		"http://localhost:5555/callback":          http.StatusCreated,
-		"http://[::1]:5555/callback":              http.StatusCreated,
-		"https://claude.ai/api/mcp/auth_callback": http.StatusCreated,
-		"https://evil.example/callback":           http.StatusBadRequest,
-		"http://evil.example/callback":            http.StatusBadRequest,
-		"cursor://anysphere.cursor-mcp/oauth":     http.StatusBadRequest,
-		"http://127.0.0.1:5555/callback#fragment": http.StatusBadRequest,
+		"http://localhost:5555/callback":                         http.StatusCreated,
+		"http://[::1]:5555/callback":                             http.StatusCreated,
+		"https://claude.ai/api/mcp/auth_callback":                http.StatusCreated,
+		"https://chatgpt.com/connector_platform_oauth_redirect":  http.StatusCreated,
+		"https://chatgpt.com/connector_platform_oauth_redirect/": http.StatusBadRequest,
+		"https://evil.example/callback":                          http.StatusBadRequest,
+		"http://evil.example/callback":                           http.StatusBadRequest,
+		"cursor://anysphere.cursor-mcp/oauth":                    http.StatusBadRequest,
+		"http://127.0.0.1:5555/callback#fragment":                http.StatusBadRequest,
 	}
 	for uri, want := range cases {
 		status, body := h.register(map[string]any{"redirect_uris": []string{uri}, "token_endpoint_auth_method": "none"})

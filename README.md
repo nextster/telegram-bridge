@@ -183,8 +183,9 @@ claude mcp add --transport http --scope user telegram-bridge https://telegram-br
 claude mcp login telegram-bridge
 ```
 
-Claude Desktop and claude.ai custom connectors use the same URL; their callback
-is allowlisted.
+Claude Desktop and claude.ai custom connectors, which also work in the Claude
+mobile apps, and ChatGPT connectors in developer mode use the same URL; their
+callbacks are allowlisted.
 
 The client opens an authorization page with **Войти через Telegram**. Signing
 in on oauth.telegram.org in that browser connects the client to that user's own
@@ -199,7 +200,8 @@ account and returns to the client; there is no separate approval step.
   is the user's chance to notice.
 - Codes and tokens never pass through Telegram. Only the browser that opened the
   page receives the single authorization code.
-- Redirects are limited to loopback addresses and the Claude connector callback;
+- Redirects are limited to loopback addresses and the Claude and ChatGPT
+  connector callbacks;
   add exact HTTPS callbacks with `TELEGRAM_BRIDGE_OAUTH_REDIRECT_URIS`.
 - Access tokens last one hour. Refresh tokens rotate, expire after 90 days
   without use, and connections end after a year. Reusing an old refresh token

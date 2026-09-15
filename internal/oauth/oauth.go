@@ -66,6 +66,7 @@ var refreshPolicy = db.OAuthRefreshPolicy{ReuseGrace: refreshReuseGrace, MaxGran
 var trustedRedirectURIs = []string{
 	"https://claude.ai/api/mcp/auth_callback",
 	"https://claude.com/api/mcp/auth_callback",
+	"https://chatgpt.com/connector_platform_oauth_redirect",
 }
 
 type Store interface {
