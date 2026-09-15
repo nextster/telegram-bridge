@@ -1,11 +1,10 @@
 // Package oauth implements the OAuth 2.1 authorization server that lets MCP
 // clients such as Claude and Codex connect without a shared bearer token.
 //
-// A request is first bound to the Telegram user who signs in with Telegram in
-// the browser that opened it, so nobody can talk another user into approving a
-// request they opened themselves. The bot then asks that user, and only that
-// user, to pick the number shown on the page. Codes and tokens never pass
-// through Telegram; only SHA-256 hashes of them are stored.
+// The user approves a request by signing in with Telegram in the browser that
+// opened it, which binds the connection to that Telegram account. The bot
+// reports every new connection with a button to cut it off. Codes and tokens
+// never pass through Telegram; only SHA-256 hashes of them are stored.
 package oauth
 
 import (
@@ -19,7 +18,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -78,7 +76,7 @@ type Store interface {
 	GetOAuthRequestByCode(context.Context, string) (db.OAuthRequest, bool, error)
 	StartOAuthTelegramLogin(context.Context, string, string, string, string, time.Time) (bool, error)
 	FinishOAuthTelegramLogin(context.Context, string, string, time.Time) (string, string, bool, error)
-	BindOAuthRequest(context.Context, string, int64, time.Time) (bool, error)
+	DecideOAuthRequest(context.Context, string, bool, int64, time.Time) (db.OAuthRequest, bool, error)
 	IssueOAuthCode(context.Context, string, string, time.Time, time.Time) (bool, error)
 	ExchangeOAuthCode(context.Context, string, string, db.OAuthGrant, []db.OAuthToken, time.Time) error
 	RefreshOAuthTokens(context.Context, string, string, []db.OAuthToken, db.OAuthRefreshPolicy, time.Time) (db.OAuthGrant, error)
@@ -88,18 +86,17 @@ type Store interface {
 
 // Approver is the Telegram side of the flow.
 type Approver interface {
-	// OAuthApprovalLink returns a link that opens the approval prompt for the
-	// request in the bot.
-	OAuthApprovalLink(ctx context.Context, requestID string) (string, error)
-	// OAuthApprovalRequested sends the approval prompt of a request to the
-	// user it is bound to.
-	OAuthApprovalRequested(ctx context.Context, userID int64, requestID string) error
+	// OAuthAccountConnected reports whether the user has connected their
+	// Telegram account in the bot; only such users can connect clients.
+	OAuthAccountConnected(ctx context.Context, userID int64) (bool, error)
+	// OAuthBotLink returns a link that opens the bot.
+	OAuthBotLink(ctx context.Context) (string, error)
 	// OAuthConnectionRevoked tells the user that one of their connections was
 	// cut off.
 	OAuthConnectionRevoked(ctx context.Context, userID int64, clientName, reason string) error
 	// OAuthConnectionCreated tells the user that a client now has access to
 	// their account, so a connection they did not start can be revoked at once.
-	OAuthConnectionCreated(ctx context.Context, userID int64, clientName, clientIP string) error
+	OAuthConnectionCreated(ctx context.Context, userID int64, grantID, clientName, clientIP string) error
 }
 
 type Options struct {
@@ -164,8 +161,6 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /oauth/authorize", s.authorize)
 	mux.HandleFunc("GET /oauth/telegram/start", s.telegramStart)
 	mux.HandleFunc("GET "+telegramCallback, s.telegramCallback)
-	mux.HandleFunc("GET /oauth/authorize/continue", s.authorizeContinue)
-	mux.HandleFunc("POST /oauth/authorize/status", s.authorizeStatus)
 	mux.HandleFunc("POST /oauth/token", s.token)
 	mux.HandleFunc("POST /oauth/revoke", s.revoke)
 }
@@ -374,7 +369,6 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 		State:         query.Get("state"),
 		CodeChallenge: challenge,
 		Resource:      s.resource,
-		ApprovalCode:  fmt.Sprintf("%02d", randomInt(90)+10),
 		ClientIP:      clientIP(r),
 		UserAgent:     truncateRunes(cleanClientName(r.UserAgent()), maxUserAgentLen),
 		ExpiresAt:     now.Add(requestTTL),
@@ -393,66 +387,6 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 		ClientName: displayClientName(client.Name),
 		SignInLink: "/oauth/telegram/start?request=" + url.QueryEscape(request.ID),
 	})
-}
-
-type statusRequest struct {
-	Request string `json:"request"`
-	Secret  string `json:"secret"`
-}
-
-func (s *Server) authorizeStatus(w http.ResponseWriter, r *http.Request) {
-	var input statusRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&input); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"status": "invalid"})
-		return
-	}
-	request, ok, err := s.store.GetOAuthRequest(r.Context(), input.Request)
-	if err != nil {
-		log.Printf("oauth status lookup failed: %v", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"status": "error"})
-		return
-	}
-	if !ok || !secretMatches(input.Secret, request.BrowserHash) {
-		writeJSON(w, http.StatusNotFound, map[string]string{"status": "expired"})
-		return
-	}
-	now := s.now()
-	switch request.Status {
-	case db.OAuthRequestPending:
-		if !now.Before(request.ExpiresAt) {
-			writeJSON(w, http.StatusOK, map[string]string{"status": "expired"})
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "pending"})
-	case db.OAuthRequestDenied:
-		writeJSON(w, http.StatusOK, map[string]string{
-			"status":   "denied",
-			"redirect": s.errorRedirect(request.RedirectURI, request.State, "access_denied", "the Telegram Bridge owner denied access"),
-		})
-	case db.OAuthRequestApproved:
-		code := randomToken(32)
-		issued, err := s.store.IssueOAuthCode(r.Context(), request.ID, hashSecret(code), now.Add(codeTTL), now)
-		if err != nil {
-			log.Printf("oauth code issue failed: %v", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"status": "error"})
-			return
-		}
-		if !issued {
-			// Codes are minted once, only while the request is still valid.
-			status := "expired"
-			if request.CodeHash != "" {
-				status = "done"
-			}
-			writeJSON(w, http.StatusOK, map[string]string{"status": status})
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]string{
-			"status":   "approved",
-			"redirect": s.successRedirect(request.RedirectURI, request.State, code),
-		})
-	default:
-		writeJSON(w, http.StatusOK, map[string]string{"status": "done"})
-	}
 }
 
 func (s *Server) token(w http.ResponseWriter, r *http.Request) {
@@ -520,7 +454,7 @@ func (s *Server) exchangeCode(w http.ResponseWriter, r *http.Request, client db.
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not issue tokens")
 		return
 	}
-	if err := s.approver.OAuthConnectionCreated(context.WithoutCancel(r.Context()), grant.UserID, grant.ClientName, request.ClientIP); err != nil {
+	if err := s.approver.OAuthConnectionCreated(context.WithoutCancel(r.Context()), grant.UserID, grant.ID, grant.ClientName, request.ClientIP); err != nil {
 		log.Printf("oauth connection alert failed: %v", err)
 	}
 	writeTokenResponse(w, access, refresh)
@@ -783,14 +717,6 @@ func displayClientName(name string) string {
 		return "MCP-клиент"
 	}
 	return name
-}
-
-func randomInt(limit int) int {
-	value, err := rand.Int(rand.Reader, big.NewInt(int64(limit)))
-	if err != nil {
-		panic(fmt.Sprintf("crypto/rand failed: %v", err))
-	}
-	return int(value.Int64())
 }
 
 func randomToken(bytes int) string {

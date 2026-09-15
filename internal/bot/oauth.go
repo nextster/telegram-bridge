@@ -2,13 +2,10 @@ package bot
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/subtle"
 	"errors"
 	"fmt"
 	"html"
 	"log"
-	"math/big"
 	"strings"
 	"sync"
 	"time"
@@ -17,13 +14,7 @@ import (
 	tu "github.com/mymmrac/telego/telegoutil"
 )
 
-const (
-	oauthStartPrefix          = "oauth_"
-	oauthCallbackPrefix       = "oauth:"
-	oauthRevokeCallbackPrefix = "oauthrevoke:"
-	oauthDenyChoice           = "deny"
-	oauthChoiceCount          = 4
-)
+const oauthRevokeCallbackPrefix = "oauthrevoke:"
 
 // botIdentity caches the bot username used in approval deep links.
 type botIdentity struct {
@@ -48,14 +39,22 @@ func (s *Service) botUsername(ctx context.Context) (string, error) {
 	return me.Username, nil
 }
 
-// OAuthApprovalLink returns a deep link that makes the user's Telegram client
-// send /start oauth_<request>, in case the pushed prompt did not arrive.
-func (s *Service) OAuthApprovalLink(ctx context.Context, requestID string) (string, error) {
+// OAuthBotLink returns a link that opens the bot.
+func (s *Service) OAuthBotLink(ctx context.Context) (string, error) {
 	username, err := s.botUsername(ctx)
 	if err != nil {
 		return "", err
 	}
-	return "https://t.me/" + username + "?start=" + oauthStartPrefix + requestID, nil
+	return "https://t.me/" + username, nil
+}
+
+// OAuthAccountConnected reports whether the user has connected their own
+// Telegram account, which MCP clients then act on.
+func (s *Service) OAuthAccountConnected(ctx context.Context, userID int64) (bool, error) {
+	if userID <= 0 {
+		return false, nil
+	}
+	return s.connected(ctx, userID)
 }
 
 // OAuthConnectionRevoked notifies a user that one of their connections was
@@ -69,144 +68,16 @@ func (s *Service) OAuthConnectionRevoked(ctx context.Context, userID int64, clie
 }
 
 // OAuthConnectionCreated tells a user that a new client has access to their
-// account.
-func (s *Service) OAuthConnectionCreated(ctx context.Context, userID int64, clientName, clientIP string) error {
+// account, with a button that cuts it off.
+func (s *Service) OAuthConnectionCreated(ctx context.Context, userID int64, grantID, clientName, clientIP string) error {
 	if userID <= 0 {
 		return errors.New("connection owner is unknown")
 	}
-	return s.sendHTML(ctx, userID, fmt.Sprintf("🔗 Новое MCP-подключение к вашему Telegram: %s, IP %s.\nЕсли подключали не вы, сразу отключите его в /connections.",
-		codeHTML(clientName), codeHTML(clientIP)), nil)
-}
-
-// canApproveOAuth requires a private chat and a connected Telegram account.
-// The approval grants access to that user's own account only.
-func (s *Service) canApproveOAuth(ctx context.Context, chatID, userID int64) (bool, error) {
-	if userID <= 0 || chatID != userID {
-		return false, nil
-	}
-	return s.connected(ctx, userID)
-}
-
-const oauthForeignRequestText = "⚠️ Этот запрос на подключение открыт под другим аккаунтом Telegram. Если ссылку вам кто-то прислал, он пытается получить доступ к вашей переписке. Ничего не подтверждайте."
-
-// OAuthApprovalRequested sends the approval prompt to the user who signed in
-// with Telegram for the request.
-func (s *Service) OAuthApprovalRequested(ctx context.Context, userID int64, requestID string) error {
-	return s.sendOAuthPrompt(ctx, userID, requestID)
-}
-
-func (s *Service) handleOAuthStart(ctx context.Context, message *telego.Message, requestID string) error {
-	userID, private := privateSender(message)
-	if !private {
-		return s.reply(ctx, message.Chat.ID, "Подтверждать подключения можно только в личном чате с ботом.", nil)
-	}
-	return s.sendOAuthPrompt(ctx, userID, requestID)
-}
-
-func (s *Service) sendOAuthPrompt(ctx context.Context, userID int64, requestID string) error {
-	allowed, err := s.canApproveOAuth(ctx, userID, userID)
-	if err != nil {
-		return err
-	}
-	if !allowed {
-		return s.reply(ctx, userID, "Сначала подключите свой Telegram: /login. Доступ получит только ваш аккаунт.", nil)
-	}
-	request, found, err := s.store.GetOAuthRequest(ctx, requestID)
-	if err != nil {
-		return err
-	}
-	if !found || request.Status != "pending" || !time.Now().Before(request.ExpiresAt) {
-		return s.reply(ctx, userID, "Запрос на подключение устарел. Запустите подключение заново.", nil)
-	}
-	if request.BoundUserID != userID {
-		return s.reply(ctx, userID, oauthForeignRequestText, nil)
-	}
-	clientName := "MCP-клиент"
-	if client, ok, err := s.store.GetOAuthClient(ctx, request.ClientID); err == nil && ok && client.Name != "" {
-		clientName = client.Name
-	}
-	choices, err := approvalChoices(request.ApprovalCode, oauthChoiceCount)
-	if err != nil {
-		return err
-	}
-	numbers := make([]telego.InlineKeyboardButton, 0, len(choices))
-	for _, choice := range choices {
-		numbers = append(numbers, tu.InlineKeyboardButton(choice).WithCallbackData(oauthCallbackPrefix+request.ID+":"+choice))
-	}
-	markup := tu.InlineKeyboard(
-		tu.InlineKeyboardRow(numbers...),
-		tu.InlineKeyboardRow(tu.InlineKeyboardButton("Отклонить").WithCallbackData(oauthCallbackPrefix+request.ID+":"+oauthDenyChoice)),
-	)
-	text := fmt.Sprintf("🔐 <b>Доступ к вашему Telegram через MCP</b>\n\nКлиент: %s (название задаёт сам клиент)\nIP: %s\nБраузер: %s\n\nВы вошли через Telegram на странице подключения. Нажмите число с этой страницы. Если подключение запускали не вы, нажмите «Отклонить».",
-		codeHTML(clientName), codeHTML(request.ClientIP), codeHTML(request.UserAgent))
-	return s.sendHTML(ctx, userID, text, markup)
-}
-
-func (s *Service) handleOAuthCallback(ctx context.Context, query *telego.CallbackQuery, userID int64, payload string) error {
-	allowed, err := s.canApproveOAuth(ctx, callbackChatID(query), userID)
-	if err != nil {
-		return err
-	}
-	if !allowed {
-		return s.answerCallback(ctx, query.ID, "Сначала подключите свой Telegram: /login.")
-	}
-	requestID, choice, ok := strings.Cut(payload, ":")
-	if !ok || requestID == "" || choice == "" {
-		return s.answerCallback(ctx, query.ID, "Кнопка устарела.")
-	}
-	request, found, err := s.store.GetOAuthRequest(ctx, requestID)
-	if err != nil {
-		_ = s.answerCallback(ctx, query.ID, "Не удалось проверить запрос.")
-		return err
-	}
-	if !found {
-		s.finishOAuthPrompt(ctx, query, "⌛ Запрос на подключение устарел.")
-		return s.answerCallback(ctx, query.ID, "Запрос устарел.")
-	}
-	if request.BoundUserID != userID {
-		s.finishOAuthPrompt(ctx, query, oauthForeignRequestText)
-		return s.answerCallback(ctx, query.ID, "Запрос открыт под другим аккаунтом.")
-	}
-	approve := choice != oauthDenyChoice && subtle.ConstantTimeCompare([]byte(choice), []byte(request.ApprovalCode)) == 1
-	_, changed, err := s.store.DecideOAuthRequest(ctx, request.ID, approve, userID, time.Now())
-	if err != nil {
-		_ = s.answerCallback(ctx, query.ID, "Не удалось сохранить решение.")
-		return err
-	}
-	if !changed {
-		s.finishOAuthPrompt(ctx, query, "⌛ Запрос уже обработан или устарел.")
-		return s.answerCallback(ctx, query.ID, "Запрос уже обработан или устарел.")
-	}
-	switch {
-	case approve:
-		s.finishOAuthPrompt(ctx, query, "✅ Доступ разрешён. Вернитесь в браузер. Отключить можно через /connections.")
-		return s.answerCallback(ctx, query.ID, "Доступ разрешён.")
-	case choice == oauthDenyChoice:
-		s.finishOAuthPrompt(ctx, query, "⛔ Подключение отклонено.")
-		return s.answerCallback(ctx, query.ID, "Отклонено.")
-	default:
-		s.finishOAuthPrompt(ctx, query, "⛔ Выбрано неверное число, подключение отклонено.")
-		return s.answerCallback(ctx, query.ID, "Неверное число. Запрос отклонён.")
-	}
-}
-
-func (s *Service) finishOAuthPrompt(ctx context.Context, query *telego.CallbackQuery, text string) {
-	if query.Message == nil {
-		return
-	}
-	chat := query.Message.GetChat()
-	messageID := query.Message.GetMessageID()
-	if chat.ID == 0 || messageID == 0 {
-		return
-	}
-	if _, err := s.bot.EditMessageText(ctx, &telego.EditMessageTextParams{
-		ChatID:    telego.ChatID{ID: chat.ID},
-		MessageID: messageID,
-		Text:      text,
-	}); err != nil {
-		log.Printf("edit OAuth approval message failed: %v", err)
-		s.clearCallbackMarkup(ctx, query)
-	}
+	markup := tu.InlineKeyboard(tu.InlineKeyboardRow(
+		tu.InlineKeyboardButton("Отключить").WithCallbackData(oauthRevokeCallbackPrefix + grantID),
+	))
+	return s.sendHTML(ctx, userID, fmt.Sprintf("🔗 Новое MCP-подключение к вашему Telegram: %s, IP %s.\nЕсли подключали не вы, нажмите «Отключить».",
+		codeHTML(clientName), codeHTML(clientIP)), markup)
 }
 
 func (s *Service) handleConnections(ctx context.Context, message *telego.Message) error {
@@ -265,38 +136,4 @@ func codeHTML(value string) string {
 		value = "—"
 	}
 	return "<code>" + html.EscapeString(value) + "</code>"
-}
-
-// approvalChoices returns the correct code and distinct two-digit decoys in
-// random order.
-func approvalChoices(correct string, count int) ([]string, error) {
-	choices := []string{correct}
-	for len(choices) < count {
-		value, err := rand.Int(rand.Reader, big.NewInt(90))
-		if err != nil {
-			return nil, err
-		}
-		decoy := fmt.Sprintf("%02d", value.Int64()+10)
-		if !containsString(choices, decoy) {
-			choices = append(choices, decoy)
-		}
-	}
-	for i := len(choices) - 1; i > 0; i-- {
-		value, err := rand.Int(rand.Reader, big.NewInt(int64(i+1)))
-		if err != nil {
-			return nil, err
-		}
-		j := int(value.Int64())
-		choices[i], choices[j] = choices[j], choices[i]
-	}
-	return choices, nil
-}
-
-func containsString(values []string, target string) bool {
-	for _, value := range values {
-		if value == target {
-			return true
-		}
-	}
-	return false
 }

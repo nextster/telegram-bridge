@@ -87,13 +87,9 @@ func createPendingOAuthRequest(t *testing.T, store *db.Store, id, clientName str
 	}
 	if err := store.CreateOAuthRequest(ctx, db.OAuthRequest{
 		ID: id, BrowserHash: "hash", ClientID: clientID, RedirectURI: "http://127.0.0.1:1/cb",
-		CodeChallenge: strings.Repeat("c", 43), Resource: "https://example/mcp", ApprovalCode: "42",
+		CodeChallenge: strings.Repeat("c", 43), Resource: "https://example/mcp",
 		ClientIP: "203.0.113.7", UserAgent: "Mozilla/5.0 <script>", ExpiresAt: now.Add(time.Minute),
 	}, 10, now); err != nil {
-		t.Fatal(err)
-	}
-	// The browser that opened the request signed in with Telegram as the owner.
-	if _, err := store.BindOAuthRequest(ctx, id, testOwnerID, now); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -116,136 +112,34 @@ func oauthCallback(from, chat int64, data string) telego.Update {
 	}}
 }
 
-func TestOAuthApprovalLinkUsesBotDeepLink(t *testing.T) {
+func TestOAuthBotLinkAndConnectedAccounts(t *testing.T) {
 	service, _, _ := newOAuthTestService(t)
-	link, err := service.OAuthApprovalLink(context.Background(), "req_1-A")
-	if err != nil || link != "https://t.me/bridge_test_bot?start=oauth_req_1-A" {
+	ctx := context.Background()
+	if link, err := service.OAuthBotLink(ctx); err != nil || link != "https://t.me/bridge_test_bot" {
 		t.Fatalf("link=%q err=%v", link, err)
 	}
-}
-
-func TestOAuthStartShowsPromptOnlyToAccountOwner(t *testing.T) {
-	service, store, api := newOAuthTestService(t)
-	ctx := context.Background()
-	createPendingOAuthRequest(t, store, "req1", "Claude /stop @someone")
-
-	if err := service.handleUpdate(ctx, startMessage(222, 222, "/start oauth_req1")); err != nil {
-		t.Fatal(err)
-	}
-	calls := api.take()
-	if len(calls) != 1 || strings.Contains(calls[0].Body["text"].(string), "42") || calls[0].Body["reply_markup"] != nil {
-		t.Fatalf("a user without a connected account received a prompt: %#v", calls)
-	}
-	if subscribed, _ := store.IsSubscribed(ctx, 222); subscribed {
-		t.Fatal("OAuth deep link subscribed a user")
-	}
-
-	if err := service.handleUpdate(ctx, startMessage(testOwnerID, testOwnerID, "/start oauth_req1")); err != nil {
-		t.Fatal(err)
-	}
-	calls = api.take()
-	if len(calls) != 1 || calls[0].Method != "sendMessage" || calls[0].Body["parse_mode"] != "HTML" {
-		t.Fatalf("owner prompt calls = %#v", calls)
-	}
-	text := calls[0].Body["text"].(string)
-	for _, want := range []string{"<code>Claude /stop @someone</code>", "<code>203.0.113.7</code>", "<code>Mozilla/5.0 &lt;script&gt;</code>"} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("prompt %q is missing %q", text, want)
+	for userID, want := range map[int64]bool{testOwnerID: true, 222: false, 0: false} {
+		if connected, err := service.OAuthAccountConnected(ctx, userID); err != nil || connected != want {
+			t.Fatalf("OAuthAccountConnected(%d) = %t, %v", userID, connected, err)
 		}
 	}
+}
+
+func TestOAuthConnectionAlertOffersRevoke(t *testing.T) {
+	service, _, api := newOAuthTestService(t)
+	if err := service.OAuthConnectionCreated(context.Background(), testOwnerID, "grant-1", "Claude /stop @someone", "203.0.113.7"); err != nil {
+		t.Fatal(err)
+	}
+	calls := api.take()
+	if len(calls) != 1 || calls[0].Body["chat_id"] != float64(testOwnerID) || calls[0].Body["parse_mode"] != "HTML" {
+		t.Fatalf("alert calls = %#v", calls)
+	}
+	text := calls[0].Body["text"].(string)
+	if !strings.Contains(text, "<code>Claude /stop @someone</code>") || !strings.Contains(text, "<code>203.0.113.7</code>") {
+		t.Fatalf("alert text = %q", text)
+	}
 	markup, _ := json.Marshal(calls[0].Body["reply_markup"])
-	if !strings.Contains(string(markup), `"oauth:req1:42"`) || !strings.Contains(string(markup), `"oauth:req1:deny"`) || strings.Count(string(markup), `"oauth:req1:`) != 5 {
-		t.Fatalf("markup = %s", markup)
-	}
-}
-
-func TestOAuthCallbackRequiresOwnerAndMatchingNumber(t *testing.T) {
-	service, store, api := newOAuthTestService(t)
-	ctx := context.Background()
-
-	createPendingOAuthRequest(t, store, "stranger", "Codex")
-	if err := service.handleUpdate(ctx, oauthCallback(222, 222, "oauth:stranger:42")); err != nil {
-		t.Fatal(err)
-	}
-	if request, _, _ := store.GetOAuthRequest(ctx, "stranger"); request.Status != db.OAuthRequestPending {
-		t.Fatalf("a user without a connected account changed status to %s", request.Status)
-	}
-	if err := service.handleUpdate(ctx, oauthCallback(testOwnerID, 333, "oauth:stranger:42")); err != nil {
-		t.Fatal(err)
-	}
-	if request, _, _ := store.GetOAuthRequest(ctx, "stranger"); request.Status != db.OAuthRequestPending {
-		t.Fatalf("a press outside the private chat changed status to %s", request.Status)
-	}
-
-	createPendingOAuthRequest(t, store, "wrong", "Codex")
-	if err := service.handleUpdate(ctx, oauthCallback(testOwnerID, testOwnerID, "oauth:wrong:17")); err != nil {
-		t.Fatal(err)
-	}
-	if request, _, _ := store.GetOAuthRequest(ctx, "wrong"); request.Status != db.OAuthRequestDenied {
-		t.Fatalf("wrong number status = %s", request.Status)
-	}
-
-	createPendingOAuthRequest(t, store, "right", "Codex")
-	api.take()
-	if err := service.handleUpdate(ctx, oauthCallback(testOwnerID, testOwnerID, "oauth:right:42")); err != nil {
-		t.Fatal(err)
-	}
-	request, _, _ := store.GetOAuthRequest(ctx, "right")
-	if request.Status != db.OAuthRequestApproved || request.DecidedBy != testOwnerID {
-		t.Fatalf("correct number request = %+v", request)
-	}
-	calls := api.take()
-	if len(calls) != 2 || calls[0].Method != "editMessageText" || !strings.Contains(calls[0].Body["text"].(string), "Доступ разрешён") {
-		t.Fatalf("approval calls = %#v", calls)
-	}
-
-	if err := service.handleUpdate(ctx, oauthCallback(testOwnerID, testOwnerID, "oauth:right:deny")); err != nil {
-		t.Fatal(err)
-	}
-	if request, _, _ := store.GetOAuthRequest(ctx, "right"); request.Status != db.OAuthRequestApproved {
-		t.Fatalf("second press changed a decided request to %s", request.Status)
-	}
-}
-
-func TestOAuthPromptGoesOnlyToTheSignedInUser(t *testing.T) {
-	service, store, api := newOAuthTestService(t)
-	service.accounts = &fakeAccounts{connected: map[int64]bool{testOwnerID: true, 222: true}}
-	ctx := context.Background()
-	createPendingOAuthRequest(t, store, "req1", "Codex")
-
-	if err := service.OAuthApprovalRequested(ctx, testOwnerID, "req1"); err != nil {
-		t.Fatal(err)
-	}
-	calls := api.take()
-	if len(calls) != 1 || calls[0].Body["chat_id"] != float64(testOwnerID) || calls[0].Body["reply_markup"] == nil {
-		t.Fatalf("prompt for the signed-in user = %#v", calls)
-	}
-
-	// Another connected user who got the link cannot see or answer the prompt.
-	if err := service.handleUpdate(ctx, startMessage(222, 222, "/start oauth_req1")); err != nil {
-		t.Fatal(err)
-	}
-	calls = api.take()
-	if len(calls) != 1 || calls[0].Body["reply_markup"] != nil || !strings.Contains(calls[0].Body["text"].(string), "другим аккаунтом") {
-		t.Fatalf("foreign user start = %#v", calls)
-	}
-	if err := service.handleUpdate(ctx, oauthCallback(222, 222, "oauth:req1:42")); err != nil {
-		t.Fatal(err)
-	}
-	if request, _, _ := store.GetOAuthRequest(ctx, "req1"); request.Status != db.OAuthRequestPending {
-		t.Fatalf("a foreign press changed status to %s", request.Status)
-	}
-}
-
-func TestNoOAuthApprovalWithoutConnectedAccount(t *testing.T) {
-	service, store, _ := newOAuthTestService(t)
-	service.accounts = &fakeAccounts{connected: map[int64]bool{}}
-	ctx := context.Background()
-	createPendingOAuthRequest(t, store, "orphan", "Codex")
-	if err := service.handleUpdate(ctx, oauthCallback(testOwnerID, testOwnerID, "oauth:orphan:42")); err != nil {
-		t.Fatal(err)
-	}
-	if request, _, _ := store.GetOAuthRequest(ctx, "orphan"); request.Status != db.OAuthRequestPending {
-		t.Fatalf("approval without a logged-in owner changed status to %s", request.Status)
+	if !strings.Contains(string(markup), `"oauthrevoke:grant-1"`) {
+		t.Fatalf("alert markup = %s", markup)
 	}
 }

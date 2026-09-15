@@ -154,9 +154,6 @@ func TestConnectionsAndLogoutAreScopedToTheUser(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
 	createPendingOAuthRequest(t, store, "alice-req", "Alice Claude")
-	if _, err := store.BindOAuthRequest(ctx, "alice-req", aliceUser, now); err != nil {
-		t.Fatal(err)
-	}
 	if _, _, err := store.DecideOAuthRequest(ctx, "alice-req", true, aliceUser, now); err != nil {
 		t.Fatal(err)
 	}

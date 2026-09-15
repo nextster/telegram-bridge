@@ -59,7 +59,7 @@ type OAuthRequest struct {
 	UserAgent     string
 	Status        string
 	// BoundUserID is the Telegram user who signed in with Telegram in the
-	// browser that opened the request. Only that user can approve it.
+	// browser that opened the request and approved it.
 	BoundUserID   int64
 	DecidedBy     int64
 	CodeHash      string
@@ -248,18 +248,24 @@ func (s *Store) GetOAuthRequestByCode(ctx context.Context, codeHash string) (OAu
 	return scanOAuthRequest(s.db.QueryRowContext(ctx, oauthRequestSelect+` WHERE code_hash = ?`, codeHash))
 }
 
-// DecideOAuthRequest records the approving user's decision. It changes only a
-// pending, unexpired request bound to that user and reports whether that
+// DecideOAuthRequest records the decision of the Telegram user who signed in
+// for a request and binds the request to that user; a denial records no user.
+// It changes only a pending, unexpired request and reports whether that
 // happened.
 func (s *Store) DecideOAuthRequest(ctx context.Context, id string, approve bool, userID int64, now time.Time) (OAuthRequest, bool, error) {
 	status := OAuthRequestDenied
 	if approve {
+		if userID <= 0 {
+			return OAuthRequest{}, false, errors.New("approving user is required")
+		}
 		status = OAuthRequestApproved
+	} else {
+		userID = 0
 	}
 	result, err := s.db.ExecContext(ctx, `
-		UPDATE oauth_requests SET status = ?, decided_by = ?
-		WHERE id = ? AND status = 'pending' AND expires_at > ? AND bound_user_id = ? AND bound_user_id > 0
-	`, status, userID, id, now.Unix(), userID)
+		UPDATE oauth_requests SET status = ?, decided_by = ?, bound_user_id = ?
+		WHERE id = ? AND status = 'pending' AND expires_at > ?
+	`, status, userID, userID, id, now.Unix())
 	if err != nil {
 		return OAuthRequest{}, false, fmt.Errorf("decide oauth request: %w", err)
 	}
@@ -313,23 +319,6 @@ func (s *Store) FinishOAuthTelegramLogin(ctx context.Context, id, stateHash stri
 		return nil
 	})
 	return nonce, verifier, ok, err
-}
-
-// BindOAuthRequest records the Telegram user who signed in for a pending
-// request. Signing in again from the same browser replaces the user.
-func (s *Store) BindOAuthRequest(ctx context.Context, id string, userID int64, now time.Time) (bool, error) {
-	if userID <= 0 {
-		return false, errors.New("bound user is required")
-	}
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE oauth_requests SET bound_user_id = ?
-		WHERE id = ? AND status = 'pending' AND expires_at > ?
-	`, userID, id, now.Unix())
-	if err != nil {
-		return false, fmt.Errorf("bind oauth request: %w", err)
-	}
-	changed, err := result.RowsAffected()
-	return changed == 1, err
 }
 
 // IssueOAuthCode attaches the authorization code to an approved request. It

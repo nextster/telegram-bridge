@@ -183,7 +183,7 @@ func (s *Server) routes() http.Handler {
 		if s.oauth != nil {
 			s.oauth.Register(mux)
 			options.ResourceMetadataURL = s.oauth.ResourceMetadataURL()
-			log.Print("MCP OAuth enabled with Telegram bot approval")
+			log.Print("MCP OAuth enabled with Telegram sign-in")
 		}
 		mcpHandler := mcpserver.New(options)
 		mux.Handle("/mcp", mcpHandler)

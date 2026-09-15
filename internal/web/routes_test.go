@@ -54,15 +54,17 @@ func TestRoutesMountOAuth(t *testing.T) {
 
 type stubApprover struct{}
 
-func (stubApprover) OAuthApprovalLink(context.Context, string) (string, error) {
+func (stubApprover) OAuthBotLink(context.Context) (string, error) {
 	return "https://t.me/bridge_test_bot", nil
 }
 
+func (stubApprover) OAuthAccountConnected(context.Context, int64) (bool, error) { return true, nil }
+
 func (stubApprover) OAuthConnectionRevoked(context.Context, int64, string, string) error { return nil }
 
-func (stubApprover) OAuthConnectionCreated(context.Context, int64, string, string) error { return nil }
-
-func (stubApprover) OAuthApprovalRequested(context.Context, int64, string) error { return nil }
+func (stubApprover) OAuthConnectionCreated(context.Context, int64, string, string, string) error {
+	return nil
+}
 
 func TestSplitTermGroups(t *testing.T) {
 	got := splitTermGroups("USB-C, Type-C\n1000 lm, 1200 lm\r\n\n31.8")

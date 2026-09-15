@@ -197,9 +197,6 @@ func (s *Service) handleUpdate(ctx context.Context, update telego.Update) error 
 	command, _, payload := tu.ParseCommandPayload(text)
 	switch command {
 	case "start":
-		if requestID, ok := strings.CutPrefix(strings.TrimSpace(payload), oauthStartPrefix); ok {
-			return s.handleOAuthStart(ctx, message, requestID)
-		}
 		return s.handleStart(ctx, message, userID)
 	case "stop":
 		return s.handleStop(ctx, userID)
@@ -261,9 +258,6 @@ func (s *Service) handleCallbackQuery(ctx context.Context, query *telego.Callbac
 	userID, private := callbackUser(query)
 	if !private {
 		return s.answerCallback(ctx, query.ID, "Кнопки работают только в личном чате с ботом.")
-	}
-	if payload, ok := strings.CutPrefix(data, oauthCallbackPrefix); ok {
-		return s.handleOAuthCallback(ctx, query, userID, payload)
 	}
 	if grantID, ok := strings.CutPrefix(data, oauthRevokeCallbackPrefix); ok {
 		return s.handleOAuthRevokeCallback(ctx, query, userID, grantID)
