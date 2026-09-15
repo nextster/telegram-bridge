@@ -10,6 +10,7 @@ import (
 
 	"github.com/nextster/telegram-bridge/internal/config"
 	"github.com/nextster/telegram-bridge/internal/monitor"
+	"github.com/nextster/telegram-bridge/internal/oauth"
 )
 
 func TestRoutesAllowRootAndMCP(t *testing.T) {
@@ -26,6 +27,50 @@ func TestRoutesAllowRootAndMCP(t *testing.T) {
 		t.Fatalf("POST /mcp status = %d, want %d", response.Code, http.StatusUnauthorized)
 	}
 }
+
+func TestRoutesMountOAuthWithoutStaticToken(t *testing.T) {
+	store, err := db.Open(context.Background(), t.TempDir()+"/oauth-routes.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	oauthServer, err := oauth.New("https://telegram-bridge.example", store, stubApprover{}, oauth.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{
+		cfg:     config.Config{BotToken: "123:token", PublicBaseURL: "https://telegram-bridge.example", OAuthMode: "on"},
+		monitor: &monitor.Service{},
+		store:   store,
+	}
+	server.SetOAuth(oauthServer)
+	handler := server.routes()
+
+	for path, want := range map[string]int{
+		"/.well-known/oauth-authorization-server":     http.StatusOK,
+		"/.well-known/oauth-protected-resource/mcp":   http.StatusOK,
+		"/.well-known/oauth-protected-resource/other": http.StatusNotFound,
+	} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code != want {
+			t.Fatalf("GET %s status = %d, want %d", path, response.Code, want)
+		}
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/mcp", nil))
+	if response.Code != http.StatusUnauthorized || !strings.Contains(response.Header().Get("WWW-Authenticate"), "https://telegram-bridge.example/.well-known/oauth-protected-resource/mcp") {
+		t.Fatalf("POST /mcp status=%d challenge=%q", response.Code, response.Header().Get("WWW-Authenticate"))
+	}
+}
+
+type stubApprover struct{}
+
+func (stubApprover) OAuthApprovalLink(context.Context, string) (string, error) {
+	return "https://t.me/bridge_test_bot", nil
+}
+
+func (stubApprover) OAuthConnectionRevoked(context.Context, string, string) error { return nil }
 
 func TestSplitTermGroups(t *testing.T) {
 	got := splitTermGroups("USB-C, Type-C\n1000 lm, 1200 lm\r\n\n31.8")

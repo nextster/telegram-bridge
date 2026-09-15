@@ -141,9 +141,11 @@ func (s *Store) pingAndMigrate(ctx context.Context) error {
 		}
 	}
 
-	for _, stmt := range schema {
-		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("sqlite migrate: %w", err)
+	for _, statements := range [][]string{schema, oauthSchema} {
+		for _, stmt := range statements {
+			if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+				return fmt.Errorf("sqlite migrate: %w", err)
+			}
 		}
 	}
 	return nil

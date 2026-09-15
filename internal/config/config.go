@@ -18,6 +18,9 @@ type Config struct {
 	WorkerToken         string
 	NotificationChatIDs []int64
 	NotificationToken   string
+	// OAuthMode "on" enables OAuth for MCP clients; it is off by default.
+	OAuthMode              string
+	OAuthExtraRedirectURIs []string
 
 	BotToken        string
 	BotAdminChatIDs []int64
@@ -39,6 +42,7 @@ func Load() (Config, error) {
 		MCPToken:          envFirst("TELEGRAM_BRIDGE_MCP_TOKEN", "MCP_TOKEN"),
 		WorkerToken:       envFirst("TELEGRAM_BRIDGE_WORKER_TOKEN", "WORKER_TOKEN"),
 		NotificationToken: envFirst("TELEGRAM_BRIDGE_NOTIFICATION_TOKEN"),
+		OAuthMode:         strings.ToLower(strings.TrimSpace(envFirst("TELEGRAM_BRIDGE_OAUTH"))),
 		BotToken:          envFirst("TELEGRAM_BOT_TOKEN", "BOT_TOKEN"),
 		TelegramAPIHash: envFirst(
 			"TELEGRAM_API_HASH",
@@ -77,6 +81,14 @@ func Load() (Config, error) {
 		}
 	}
 	cfg.NotificationChatIDs = notificationChatIDs
+	switch cfg.OAuthMode {
+	case "", "on", "off":
+	default:
+		return Config{}, fmt.Errorf("TELEGRAM_BRIDGE_OAUTH must be on or off")
+	}
+	cfg.OAuthExtraRedirectURIs = strings.FieldsFunc(envFirst("TELEGRAM_BRIDGE_OAUTH_REDIRECT_URIS"), func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\n'
+	})
 	if err := cfg.ValidateNotifications(); err != nil {
 		return Config{}, err
 	}
@@ -165,7 +177,13 @@ func (c Config) HasTelegramUserAPI() bool {
 }
 
 func (c Config) HasMCP() bool {
-	return strings.TrimSpace(c.MCPToken) != ""
+	return strings.TrimSpace(c.MCPToken) != "" || c.HasOAuth()
+}
+
+// HasOAuth reports whether MCP clients may authorize through the bot. OAuth
+// is opt-in and needs the bot for approvals and a public URL for redirects.
+func (c Config) HasOAuth() bool {
+	return c.OAuthMode == "on" && c.HasBot() && c.PublicBaseURL != ""
 }
 
 func (c Config) HasWorkerAPI() bool {

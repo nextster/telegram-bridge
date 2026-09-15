@@ -22,6 +22,7 @@ import (
 	"github.com/nextster/telegram-bridge/internal/media"
 	"github.com/nextster/telegram-bridge/internal/monitor"
 	"github.com/nextster/telegram-bridge/internal/notify"
+	"github.com/nextster/telegram-bridge/internal/oauth"
 )
 
 type Server struct {
@@ -34,6 +35,7 @@ type Server struct {
 	loginTemplate *template.Template
 	login         *webLoginManager
 	codexNotifier CodexNotifier
+	oauth         *oauth.Server
 }
 
 type CodexNotifier interface {
@@ -131,6 +133,9 @@ func (s *Server) Run(ctx context.Context) error {
 
 func (s *Server) SetMediaService(service *media.Service) { s.media = service }
 
+// SetOAuth enables OAuth authorization for MCP clients.
+func (s *Server) SetOAuth(server *oauth.Server) { s.oauth = server }
+
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.dashboardEntry)
@@ -146,7 +151,14 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /login/restart", s.loginRestart)
 	mux.HandleFunc("GET /healthz", s.healthz)
 	if s.cfg.HasMCP() && s.monitor != nil {
-		mcpHandler := mcpserver.New(s.monitor, s.cfg.MCPToken, mcpserver.Options{Media: s.media, PublicURL: s.cfg.PublicBaseURL})
+		options := mcpserver.Options{Media: s.media, PublicURL: s.cfg.PublicBaseURL}
+		if s.oauth != nil {
+			s.oauth.Register(mux)
+			options.VerifyToken = s.oauth.VerifyAccessToken
+			options.ResourceMetadataURL = s.oauth.ResourceMetadataURL()
+			log.Print("MCP OAuth enabled with Telegram bot approval")
+		}
+		mcpHandler := mcpserver.New(s.monitor, s.cfg.MCPToken, options)
 		mux.Handle("/mcp", mcpHandler)
 		mux.Handle("/mcp/media/", mcpHandler)
 		log.Print("MCP endpoint enabled at /mcp")

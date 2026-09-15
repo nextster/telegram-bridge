@@ -27,6 +27,9 @@ type Service struct {
 	cfg            config.Config
 	monitorService *monitor.Service
 	login          *loginManager
+	identity       botIdentity
+	// ownerID overrides the logged-in account lookup in tests.
+	ownerID func() int64
 }
 
 type CodexTask struct {
@@ -242,6 +245,9 @@ func (s *Service) handleUpdate(ctx context.Context, update telego.Update) error 
 	}
 	switch command {
 	case "start":
+		if requestID, ok := strings.CutPrefix(strings.TrimSpace(payload), oauthStartPrefix); ok {
+			return s.handleOAuthStart(ctx, message, requestID)
+		}
 		return s.handleStart(ctx, message)
 	case "stop":
 		return s.handleStop(ctx, message)
@@ -263,6 +269,8 @@ func (s *Service) handleUpdate(ctx context.Context, update telego.Update) error 
 		return s.handleLoginStatus(ctx, message)
 	case "cancel":
 		return s.login.Cancel(ctx, message.Chat.ID)
+	case "connections":
+		return s.handleConnections(ctx, message)
 	case "help":
 		return s.reply(ctx, message.Chat.ID, helpText(), nil)
 	default:
@@ -275,6 +283,12 @@ func (s *Service) handleCallbackQuery(ctx context.Context, query *telego.Callbac
 		return nil
 	}
 	data := strings.TrimSpace(query.Data)
+	if payload, ok := strings.CutPrefix(data, oauthCallbackPrefix); ok {
+		return s.handleOAuthCallback(ctx, query, payload)
+	}
+	if grantID, ok := strings.CutPrefix(data, oauthRevokeCallbackPrefix); ok {
+		return s.handleOAuthRevokeCallback(ctx, query, grantID)
+	}
 	if strings.HasPrefix(data, "kwdel:") {
 		chatID := callbackChatID(query)
 		admin, err := s.isAdminChat(ctx, chatID)
@@ -1200,6 +1214,7 @@ func helpText() string {
 		"/login - authorize Telegram user monitoring",
 		"/loginstatus - show Telegram user session status",
 		"/cancel - cancel current login",
+		"/connections - list or revoke MCP connections",
 	}, "\n")
 }
 

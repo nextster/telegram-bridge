@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"errors"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -15,12 +16,17 @@ import (
 )
 
 type Server struct {
-	monitor   Monitor
-	media     *media.Service
-	publicURL string
-	token     string
-	handler   http.Handler
+	monitor             Monitor
+	media               *media.Service
+	publicURL           string
+	token               string
+	verifyToken         TokenVerifier
+	resourceMetadataURL string
+	handler             http.Handler
 }
+
+// TokenVerifier accepts bearer tokens issued by the OAuth authorization server.
+type TokenVerifier func(context.Context, string) (bool, error)
 
 type Monitor interface {
 	ListDialogs(context.Context, string, int) ([]monitor.TelegramDialog, error)
@@ -83,6 +89,10 @@ type skippedMedia struct {
 type Options struct {
 	Media     *media.Service
 	PublicURL string
+	// VerifyToken and ResourceMetadataURL enable OAuth access tokens in
+	// addition to the static token.
+	VerifyToken         TokenVerifier
+	ResourceMetadataURL string
 }
 
 func New(service Monitor, token string, options ...Options) *Server {
@@ -90,6 +100,8 @@ func New(service Monitor, token string, options ...Options) *Server {
 	if len(options) > 0 {
 		server.media = options[0].Media
 		server.publicURL = strings.TrimRight(options[0].PublicURL, "/")
+		server.verifyToken = options[0].VerifyToken
+		server.resourceMetadataURL = options[0].ResourceMetadataURL
 	}
 	mcpServer := mcp.NewServer(&mcp.Implementation{Name: "telegram-bridge", Version: "1.0.0"}, nil)
 	mcp.AddTool(mcpServer, &mcp.Tool{
@@ -150,14 +162,38 @@ func (s *Server) searchMessages(ctx context.Context, _ *mcp.CallToolRequest, inp
 
 func (s *Server) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		provided := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if s.token == "" || provided == r.Header.Get("Authorization") || subtle.ConstantTimeCompare([]byte(provided), []byte(s.token)) != 1 {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="telegram-bridge-mcp"`)
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		scheme, provided, _ := strings.Cut(r.Header.Get("Authorization"), " ")
+		if !strings.EqualFold(scheme, "Bearer") || provided == "" {
+			s.unauthorized(w)
 			return
 		}
-		next.ServeHTTP(w, r)
+		if s.token != "" && subtle.ConstantTimeCompare([]byte(provided), []byte(s.token)) == 1 {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if s.verifyToken != nil {
+			ok, err := s.verifyToken(r.Context(), provided)
+			if err != nil {
+				log.Printf("verify MCP access token failed: %v", err)
+				http.Error(w, "authentication is temporarily unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			if ok {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+		s.unauthorized(w)
 	})
+}
+
+func (s *Server) unauthorized(w http.ResponseWriter) {
+	challenge := `Bearer realm="telegram-bridge-mcp"`
+	if s.resourceMetadataURL != "" {
+		challenge += `, resource_metadata="` + s.resourceMetadataURL + `"`
+	}
+	w.Header().Set("WWW-Authenticate", challenge)
+	http.Error(w, "unauthorized", http.StatusUnauthorized)
 }
 
 func parseDate(value string) (time.Time, error) {

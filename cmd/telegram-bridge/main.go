@@ -23,6 +23,7 @@ import (
 	"github.com/nextster/telegram-bridge/internal/media"
 	"github.com/nextster/telegram-bridge/internal/monitor"
 	"github.com/nextster/telegram-bridge/internal/notify"
+	"github.com/nextster/telegram-bridge/internal/oauth"
 	"github.com/nextster/telegram-bridge/internal/web"
 )
 
@@ -221,6 +222,14 @@ func serve(ctx context.Context, cfg config.Config) error {
 	if err != nil {
 		return err
 	}
+	if cfg.HasOAuth() && botService != nil && monitorService != nil {
+		oauthServer, err := oauth.New(cfg.PublicBaseURL, store, botService, oauth.Options{ExtraRedirectURIs: cfg.OAuthExtraRedirectURIs})
+		if err != nil {
+			log.Printf("MCP OAuth disabled: %v", err)
+		} else {
+			webServer.SetOAuth(oauthServer)
+		}
+	}
 
 	group, ctx := errgroup.WithContext(ctx)
 	if monitorService != nil && cfg.HasMCP() {
@@ -285,6 +294,6 @@ Environment:
   TELEGRAM_PHONE or TG_PHONE
   TELEGRAM_PASSWORD or TG_PASSWORD
   TELEGRAM_BRIDGE_DB, TELEGRAM_BRIDGE_SESSION, TELEGRAM_BRIDGE_PUBLIC_URL,
-  TELEGRAM_BRIDGE_MCP_TOKEN, TELEGRAM_BRIDGE_WORKER_TOKEN,
+  TELEGRAM_BRIDGE_MCP_TOKEN, TELEGRAM_BRIDGE_OAUTH, TELEGRAM_BRIDGE_WORKER_TOKEN,
   TELEGRAM_BRIDGE_NOTIFICATION_TOKEN, TELEGRAM_BRIDGE_NOTIFICATION_CHAT_IDS, PORT`)
 }

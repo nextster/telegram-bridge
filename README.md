@@ -167,8 +167,48 @@ for activation, verification, security boundaries and rollback.
 
 ## MCP
 
-Set a dedicated bearer token to enable the Streamable HTTP endpoint at
-`https://<your-host>/mcp`:
+The Streamable HTTP endpoint lives at `https://<your-host>/mcp`. Clients
+authenticate with OAuth approved in the bot, or with a static bearer token.
+
+### OAuth with bot approval
+
+OAuth is opt-in. Enable it with `TELEGRAM_BRIDGE_OAUTH=on` together with the bot
+token and `TELEGRAM_BRIDGE_PUBLIC_URL`. Clients discover it from the `/mcp` 401
+challenge, register dynamically, and use PKCE:
+
+```sh
+codex mcp add telegram-bridge --url https://telegram-bridge.fly.dev/mcp
+claude mcp add --transport http --scope user telegram-bridge https://telegram-bridge.fly.dev/mcp
+claude mcp login telegram-bridge
+```
+
+Claude Desktop and claude.ai custom connectors use the same URL; their callback
+is allowlisted.
+
+The client opens an authorization page with a two-digit number and a
+**Подтвердить в Telegram** button. The button opens the bot, which shows the
+client name, IP address, and browser with four numbers and **Отклонить**.
+Pressing the number from the page approves; any other button denies the
+request.
+
+- The bot never sends approval prompts on its own, so nobody can push prompts
+  to the owner by opening authorization pages.
+- Only the Telegram account logged in to the bridge can approve, in its private
+  chat with the bot. Other subscribers and admin chats cannot.
+- Codes and tokens never pass through Telegram. Only the browser that opened the
+  page receives the single authorization code.
+- Redirects are limited to loopback addresses and the Claude connector callback;
+  add exact HTTPS callbacks with `TELEGRAM_BRIDGE_OAUTH_REDIRECT_URIS`.
+- Access tokens last one hour. Refresh tokens rotate, expire after 90 days
+  without use, and connections end after a year. Reusing an old refresh token
+  revokes the connection and notifies the owner. SQLite stores only SHA-256
+  hashes.
+- `/connections` lists active clients and revokes them.
+
+### Static bearer token
+
+A dedicated token still works for the Codex plugin, the local dev adapter, and
+media download URLs:
 
 ```sh
 fly secrets set TELEGRAM_BRIDGE_MCP_TOKEN="$(openssl rand -hex 32)"
