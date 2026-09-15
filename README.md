@@ -319,3 +319,13 @@ printf '%s' '{"delete":["old phrase"],"rules":[{"name":"front light","any":["fro
 Imports may also define `default_exclude`, `default_sources`, and
 `default_exclude_complete_bike`. A rule inherits the default sources when
 `sources` is omitted; an explicit `sources` array replaces the defaults.
+[`rules/example.json`](rules/example.json) shows the format, including deletions,
+default exclusions, a numeric minimum, and a source-scoped rule:
+
+```sh
+telegram-bridge rules-import < rules/example.json
+```
+
+Keep personal rule packs in `rules/`: every JSON file there except the example
+is ignored by git. Personal regression tests can live beside them in
+`cmd/telegram-bridge/rules_private_test.go`, which is ignored as well.

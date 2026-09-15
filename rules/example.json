@@ -1,0 +1,19 @@
+{
+  "delete": ["bike light"],
+  "default_exclude": ["sold", "продано"],
+  "rules": [
+    {
+      "name": "bike · front light · 1000+ lm",
+      "any": ["front bike light", "bike headlight", "велофара"],
+      "required_any": [["USB-C", "Type-C"], ["num>=1000:lm|lumen|lumens|люмен|лм"]],
+      "prefer": ["daytime flash", "Garmin mount"],
+      "note": "Verify the beam pattern and the underside mount."
+    },
+    {
+      "name": "home · desk lamp",
+      "any": ["desk lamp", "настольная лампа"],
+      "exclude": ["broken", "сломана"],
+      "sources": [{"peer_type": "channel", "peer_id": 1000000001}]
+    }
+  ]
+}

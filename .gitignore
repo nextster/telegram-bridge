@@ -12,3 +12,9 @@ data/*.db
 data/*.db-*
 data/*.session
 *.session
+
+# Personal watch-rule packs, their tests, and private notes stay local.
+/rules/*.json
+!/rules/example.json
+/cmd/telegram-bridge/rules_private_test.go
+/docs/private/
