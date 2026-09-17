@@ -1,6 +1,6 @@
 # telegram-bridge MCP tool contract
 
-The server exposes three history/search tools and eight media tools over Streamable HTTP at `https://telegram-bridge.fly.dev/mcp`. Authentication uses OAuth: on first use Codex opens the Telegram sign-in (`codex mcp login telegram-bridge`). Tools act only on the Telegram account that signed in. Media tools appear after the new server is deployed. Start a new task after deployment to refresh MCP discovery.
+The server exposes three history/search tools, eight media tools, and seven radar tools over Streamable HTTP at `https://telegram-bridge.fly.dev/mcp`. Authentication uses OAuth: on first use Codex opens the Telegram sign-in (`codex mcp login telegram-bridge`). Tools act only on the Telegram account that signed in. Media tools appear after the new server is deployed. Start a new task after deployment to refresh MCP discovery.
 
 ## `telegram_list_dialogs`
 
@@ -190,3 +190,17 @@ Paid history additionally returns `skipped_media` for non-text attachments outsi
 the supported voice/video-note/photo/image kinds. Each entry has `chat`,
 `message_id`, `kind`, `reason: unsupported_attachment`. Ordinary videos remain
 unsupported; batch success never establishes that skipped media were recognized.
+
+## Radar tools
+
+The keyword radar records new messages in monitored chats that match the account's watch rules and alerts the user in the bot (after `/start` there). Every radar tool acts only on the signed-in account.
+
+- `telegram_list_watch_rules`: rules with `any`, `all`, `required_any`, `prefer`, `exclude`, `note`, `sources`, and `alerts_enabled`.
+- `telegram_save_watch_rule`: create or replace a rule by `name`. `sources` are chat keys; each is turned on for monitoring. Without `sources` the rule applies to every monitored chat.
+- `telegram_delete_watch_rule`: delete by `rule` ID or name.
+- `telegram_list_sources`: known chats with `monitored`; `refresh: true` imports the 100 most recent chats first; `query` filters by title, username, or key.
+- `telegram_set_source_monitoring`: `chat` key and `enabled`. Unknown chats are imported first; a chat outside the 100 most recent ones returns an error.
+- `telegram_list_matches`: newest matches, optional `rule` filter and `limit` 1 through 100.
+- `telegram_scan_history`: `days` 1 through 30; records old matches without alerts.
+
+To watch a chat: find its key with `telegram_list_sources` (`refresh: true`, `query`), save a rule with that key in `sources`, and check `alerts_enabled`; if it is false, tell the user to send /start to the bot.
