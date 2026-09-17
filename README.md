@@ -235,6 +235,17 @@ Media tools (available when the user API and MCP are configured):
 - `telegram_process_media_batch` queues up to 100 mixed-media references in one explicitly paid call and waits for shared cached jobs.
 - `telegram_get_media_batch` reads/waits for multiple existing jobs without new paid work.
 
+Radar tools manage the keyword radar of the caller's own account; alerts arrive
+in the bot after `/start`:
+
+- `telegram_list_watch_rules` lists rules and whether alerts are on.
+- `telegram_save_watch_rule` creates or replaces a rule by name and turns on the sources it names.
+- `telegram_delete_watch_rule` deletes a rule by ID or name.
+- `telegram_list_sources` lists known chats and whether each is monitored; `refresh: true` imports the 100 most recent chats.
+- `telegram_set_source_monitoring` turns monitoring of one chat on or off.
+- `telegram_list_matches` lists recent matches.
+- `telegram_scan_history` scans up to 30 days of monitored sources and records matches without alerts.
+
 Cloud processing is disabled by default. It runs in the existing Fly `serve`
 process using OpenRouter, SQLite, and FFmpeg; Telegram Desktop and local
 inference models are not involved. Ordinary history reads never enqueue

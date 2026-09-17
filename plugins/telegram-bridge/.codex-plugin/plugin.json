@@ -1,6 +1,6 @@
 {
   "name": "telegram-bridge",
-  "version": "0.1.0+codex.20260915223034",
+  "version": "0.1.0+codex.20260917132131",
   "description": "Search Telegram, download private attachments, and explicitly request cloud transcription, image descriptions, and OCR.",
   "author": {
     "name": "Artem"

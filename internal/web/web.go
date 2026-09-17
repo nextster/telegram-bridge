@@ -169,6 +169,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /healthz", s.healthz)
 	if s.accounts != nil && s.store != nil {
 		options := mcpserver.Options{
+			Radar:       s.store,
 			Media:       s.media,
 			PublicURL:   s.cfg.PublicBaseURL,
 			VerifyToken: s.verifyMCPToken,

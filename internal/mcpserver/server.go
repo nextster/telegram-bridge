@@ -17,6 +17,7 @@ import (
 
 type Server struct {
 	accounts            AccountResolver
+	radar               RadarStore
 	media               *media.Service
 	publicURL           string
 	verifyToken         TokenVerifier
@@ -94,6 +95,7 @@ type skippedMedia struct {
 
 type Options struct {
 	Accounts    AccountResolver
+	Radar       RadarStore
 	VerifyToken TokenVerifier
 	Media       *media.Service
 	PublicURL   string
@@ -104,6 +106,7 @@ type Options struct {
 func New(options Options) *Server {
 	server := &Server{
 		accounts:            options.Accounts,
+		radar:               options.Radar,
 		media:               options.Media,
 		publicURL:           strings.TrimRight(options.PublicURL, "/"),
 		verifyToken:         options.VerifyToken,
@@ -132,6 +135,9 @@ func New(options Options) *Server {
 	}, server.getHistory)
 	if server.media != nil {
 		server.addMediaTools(mcpServer)
+	}
+	if server.radar != nil {
+		server.addRadarTools(mcpServer)
 	}
 	streamable := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return mcpServer }, &mcp.StreamableHTTPOptions{Stateless: true})
 	mux := http.NewServeMux()
