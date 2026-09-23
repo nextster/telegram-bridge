@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -32,16 +33,48 @@ type fakeTelegram struct {
 
 func (f *fakeTelegram) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	method := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
-	raw, _ := io.ReadAll(r.Body)
 	var body map[string]any
-	_ = json.Unmarshal(raw, &body)
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/") {
+		// Uploads: form values as strings, files as "upload:<name>:<bytes>".
+		if err := r.ParseMultipartForm(1 << 20); err == nil {
+			body = map[string]any{}
+			for key, values := range r.MultipartForm.Value {
+				body[key] = values[0]
+			}
+			for key, files := range r.MultipartForm.File {
+				file, _ := files[0].Open()
+				data, _ := io.ReadAll(file)
+				file.Close()
+				body[key] = "upload:" + files[0].Filename + ":" + string(data)
+			}
+		}
+	} else {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &body)
+	}
 	f.mu.Lock()
 	f.calls = append(f.calls, telegramCall{Method: method, Body: body})
 	f.mu.Unlock()
+	chatID := body["chat_id"]
+	if text, ok := chatID.(string); ok {
+		chatID, _ = strconv.ParseInt(text, 10, 64)
+	}
+	message := map[string]any{"message_id": 5, "date": 0, "chat": map[string]any{"id": chatID, "type": "private"}}
+	file := map[string]any{"file_id": method + "-file", "file_unique_id": "unique"}
 	result := any(true)
 	switch method {
 	case "sendMessage", "editMessageText", "editMessageReplyMarkup":
-		result = map[string]any{"message_id": 5, "date": 0, "chat": map[string]any{"id": body["chat_id"], "type": "private"}}
+		result = message
+	case "sendPhoto":
+		message["photo"] = []any{file}
+		result = message
+	case "sendVoice", "sendVideoNote", "sendVideo", "sendAudio", "sendAnimation", "sendSticker", "sendDocument":
+		field := map[string]string{
+			"sendVoice": "voice", "sendVideoNote": "video_note", "sendVideo": "video", "sendAudio": "audio",
+			"sendAnimation": "animation", "sendSticker": "sticker", "sendDocument": "document",
+		}[method]
+		message[field] = file
+		result = message
 	case "getMe":
 		result = map[string]any{"id": 1, "is_bot": true, "first_name": "Bridge", "username": "bridge_test_bot"}
 	}

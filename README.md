@@ -287,17 +287,30 @@ the 100 most recent Telegram dialogs, then keeps new messages and edits
 current. Snapshots are retained for 90 days, with a 25,000-message safety cap
 per account for the small Fly volume. Pending alerts are protected from pruning.
 
-It stores text/captions and a media kind, not photo, video, voice, or file
-bytes. The archive is not exposed on the dashboard or through MCP. Deletion
-alerts are sent only to the private bot chat whose user ID owns the logged-in
-Telegram session; that account must have sent `/start`. Failed sends stay in a
-durable outbox with capped backoff, and large deletions are delivered in
-small chunks.
+The archive stores text/captions and a media kind, not attachment bytes.
+Separately, attachments of new direct-chat messages (photos, voice messages,
+video notes, videos, audio, GIFs, stickers and files up to 50 MB, the Bot API
+upload limit) are downloaded to `private-media` next to the database and kept
+for one hour. If the message is deleted within that hour, its attachment is
+held until the owner has seen it, at most 24 hours; once the bot has sent it,
+only the Bot API file ID remains and the local copy is removed. View-once and
+forward-restricted media are cached too; group chats and bots never are. The
+cache is capped at 400 MB, and when it is full the oldest attachments of
+undeleted messages go first. Neither the archive nor the cache is exposed on
+the dashboard or through MCP.
+
+Deletion alerts are sent only to the private bot chat whose user ID owns the
+logged-in Telegram session; that account must have sent `/start`. Deletions in
+one chat that arrive within a few seconds of each other become one alert. A
+single message is shown at once, with its attachment while it is cached.
+Several messages become a summary such as "Name: удалено 12 сообщений" with a
+"Показать" button that reveals them 30 at a time, attachments included. Failed
+sends stay in a durable outbox with capped backoff.
 
 Telegram deletion updates do not identify the actor or reason and do not
-contain a distinct "whole chat deleted" flag. A batch is therefore reported
-as several disappeared messages and may indicate a cleared history, without
-attributing it to the other person. Clearing history only on the other
+contain a distinct "whole chat deleted" flag. A deleted chat therefore shows up
+as one large batch of disappeared messages, and alerts never attribute it to
+the other person. Clearing history only on the other
 person's device is invisible; revoking it for both sides is observable.
 Messages deleted before the first snapshot cannot be recovered. Secret chats
 are outside the cloud user API and are not archived.

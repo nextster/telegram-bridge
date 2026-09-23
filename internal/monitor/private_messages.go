@@ -20,7 +20,9 @@ const (
 	privateArchiveMaxMessages  = 25_000
 	privateArchiveMaintenance  = 24 * time.Hour
 	privateOutboxInterval      = 2 * time.Second
-	privateDeletionAlertChunk  = 6
+	privateDeletionQuietPeriod = 4 * time.Second
+	privateDeletionMediaWait   = 90 * time.Second
+	privateDeletionBatchLimit  = 5000
 )
 
 func (h *Handler) SetSelfUserID(userID int64) {
@@ -36,37 +38,39 @@ func (h *Handler) shortMessageSenderID(peerID int64, outgoing bool) int64 {
 	return peerID
 }
 
-func (h *Handler) archivePrivateMessage(ctx context.Context, observed observedMessage) error {
+// archivePrivateMessage stores a snapshot of a direct non-bot message and
+// reports whether it did.
+func (h *Handler) archivePrivateMessage(ctx context.Context, observed observedMessage) (bool, error) {
 	ownerUserID := h.selfUserID.Load()
 	if ownerUserID <= 0 || observed.SourcePeerType != "user" || observed.SourcePeerID <= 0 || observed.MessageID <= 0 {
-		return nil
+		return false, nil
 	}
 	if observed.SourcePeerID == ownerUserID {
-		return nil
+		return false, nil
 	}
 
 	dialog := observed.PrivateDialog
 	if dialog.PeerID != 0 {
 		dialog.OwnerUserID = ownerUserID
 		if err := h.store.UpsertPrivateDialog(ctx, dialog); err != nil {
-			return err
+			return false, err
 		}
 	}
 	storedDialog, ok, err := h.store.GetPrivateDialog(ctx, ownerUserID, observed.SourcePeerID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	// Fail closed: a user must be classified as a direct non-bot dialog before
 	// any private text is archived.
 	if !ok || storedDialog.IsBot {
-		return nil
+		return false, nil
 	}
 
 	senderID := observed.SenderPeerID
 	if senderID == 0 {
 		senderID = h.shortMessageSenderID(observed.SourcePeerID, observed.Outgoing)
 	}
-	return h.store.UpsertPrivateMessage(ctx, db.PrivateMessage{
+	err = h.store.UpsertPrivateMessage(ctx, db.PrivateMessage{
 		OwnerUserID: ownerUserID,
 		MessageID:   observed.MessageID,
 		PeerID:      observed.SourcePeerID,
@@ -77,6 +81,7 @@ func (h *Handler) archivePrivateMessage(ctx context.Context, observed observedMe
 		MediaType:   observed.MediaType,
 		Outgoing:    observed.Outgoing,
 	})
+	return err == nil, err
 }
 
 func (h *Handler) handleDeletedPrivateMessages(ctx context.Context, messageIDs []int) error {
@@ -110,31 +115,40 @@ func (h *Handler) flushPrivateDeletionOutbox(ctx context.Context) error {
 	if ownerUserID <= 0 || h.deletionNotifier == nil {
 		return nil
 	}
-	batches, err := h.store.ListPendingPrivateMessageDeletions(ctx, ownerUserID, 200)
+	batches, err := h.store.ListPendingPrivateMessageDeletions(ctx, ownerUserID, privateDeletionBatchLimit)
 	if err != nil {
 		return err
 	}
+	now := time.Now().UTC()
 	for _, batch := range batches {
-		for start := 0; start < len(batch.Messages); start += privateDeletionAlertChunk {
-			end := start + privateDeletionAlertChunk
-			if end > len(batch.Messages) {
-				end = len(batch.Messages)
+		// Deleting a whole chat arrives as a burst of updates. Waiting for the
+		// burst to end turns it into one alert.
+		if now.Sub(batch.LastObservedAt) < h.deletionQuiet {
+			continue
+		}
+		// A message deleted right after it arrived may still be downloading.
+		if now.Sub(batch.ObservedAt) < privateDeletionMediaWait && h.privateMediaPending(batch.Messages) {
+			continue
+		}
+		messageIDs := privateMessageIDs(batch.Messages)
+		alertID, err := h.store.CreatePrivateDeletionAlert(ctx, ownerUserID, batch.Dialog.PeerID, messageIDs, now)
+		if err != nil {
+			return err
+		}
+		batch.AlertID = alertID
+		if err := h.deletionNotifier.NotifyDeletedMessages(ctx, batch); err != nil {
+			failures := []error{err}
+			if deleteErr := h.store.DeletePrivateDeletionAlert(ctx, ownerUserID, alertID); deleteErr != nil {
+				failures = append(failures, deleteErr)
 			}
-			chunk := batch
-			chunk.Messages = batch.Messages[start:end]
-			messageIDs := privateMessageIDs(chunk.Messages)
-			attemptedAt := time.Now().UTC()
-			if err := h.deletionNotifier.NotifyDeletedMessages(ctx, chunk); err != nil {
-				remainingIDs := privateMessageIDs(batch.Messages[start:])
-				retryAt := attemptedAt.Add(privateDeletionRetryBackoff(batch.Attempts + 1))
-				if markErr := h.store.MarkPrivateDeletionFailed(ctx, ownerUserID, remainingIDs, attemptedAt, retryAt, err.Error()); markErr != nil {
-					return errors.Join(err, markErr)
-				}
-				return err
+			retryAt := now.Add(privateDeletionRetryBackoff(batch.Attempts + 1))
+			if markErr := h.store.MarkPrivateDeletionFailed(ctx, ownerUserID, messageIDs, now, retryAt, err.Error()); markErr != nil {
+				failures = append(failures, markErr)
 			}
-			if err := h.store.MarkPrivateDeletionNotified(ctx, ownerUserID, messageIDs, attemptedAt); err != nil {
-				return err
-			}
+			return errors.Join(failures...)
+		}
+		if err := h.store.MarkPrivateDeletionNotified(ctx, ownerUserID, messageIDs, now); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -291,7 +305,7 @@ func (s *Service) backfillPrivateMessages(ctx context.Context, cutoff time.Time)
 					break
 				}
 				_, senderID := peerInfo(message.FromID)
-				if err := s.handler.archivePrivateMessage(ctx, observedMessage{
+				if _, err := s.handler.archivePrivateMessage(ctx, observedMessage{
 					SourcePeerType: "user",
 					SourcePeerID:   dialog.PeerID,
 					SenderPeerID:   senderID,
@@ -348,13 +362,20 @@ func (s *Service) getPrivateHistory(ctx context.Context, api *tg.Client, dialog 
 }
 
 func telegramMediaType(media tg.MessageMediaClass) string {
-	switch media.(type) {
+	switch media := media.(type) {
 	case nil, *tg.MessageMediaEmpty, *tg.MessageMediaWebPage:
 		return ""
 	case *tg.MessageMediaPhoto:
 		return "photo"
 	case *tg.MessageMediaDocument:
-		return "file"
+		switch kind := telegramDocumentKind(media); kind {
+		case "voice", "video_note", "video", "audio", "animation", "sticker":
+			return kind
+		case "custom_emoji":
+			return "sticker"
+		default:
+			return "file"
+		}
 	case *tg.MessageMediaContact:
 		return "contact"
 	case *tg.MessageMediaGeo, *tg.MessageMediaGeoLive, *tg.MessageMediaVenue:

@@ -378,6 +378,37 @@ var schema = []string{
 		)`,
 	`CREATE INDEX IF NOT EXISTS idx_private_message_deletions_pending
 		ON private_message_deletions(owner_user_id, notified_at, observed_at)`,
+	`CREATE TABLE IF NOT EXISTS private_deletion_alerts (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		owner_user_id INTEGER NOT NULL,
+		peer_id INTEGER NOT NULL,
+		created_at TEXT NOT NULL
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_private_deletion_alerts_owner
+		ON private_deletion_alerts(owner_user_id, created_at)`,
+	`CREATE TABLE IF NOT EXISTS private_deletion_alert_messages (
+		alert_id INTEGER NOT NULL REFERENCES private_deletion_alerts(id) ON DELETE CASCADE,
+		message_id INTEGER NOT NULL,
+		PRIMARY KEY(alert_id, message_id)
+	)`,
+	`CREATE TABLE IF NOT EXISTS private_media_cache (
+		owner_user_id INTEGER NOT NULL,
+		message_id INTEGER NOT NULL,
+		media_id INTEGER NOT NULL,
+		kind TEXT NOT NULL,
+		file_name TEXT NOT NULL DEFAULT '',
+		mime_type TEXT NOT NULL DEFAULT '',
+		size_bytes INTEGER NOT NULL,
+		duration_seconds INTEGER NOT NULL DEFAULT 0,
+		width INTEGER NOT NULL DEFAULT 0,
+		height INTEGER NOT NULL DEFAULT 0,
+		bot_file_id TEXT NOT NULL DEFAULT '',
+		created_at INTEGER NOT NULL,
+		expires_at INTEGER NOT NULL,
+		PRIMARY KEY(owner_user_id, message_id)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_private_media_cache_expiry
+		ON private_media_cache(expires_at)`,
 }
 
 func (s *Store) UpsertSubscriber(ctx context.Context, sub Subscriber) error {

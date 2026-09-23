@@ -24,6 +24,7 @@ import (
 	"github.com/nextster/telegram-bridge/internal/monitor"
 	"github.com/nextster/telegram-bridge/internal/notify"
 	"github.com/nextster/telegram-bridge/internal/oauth"
+	"github.com/nextster/telegram-bridge/internal/privatemedia"
 	"github.com/nextster/telegram-bridge/internal/web"
 )
 
@@ -163,6 +164,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 	}
 
 	var manager *monitor.Manager
+	var privateMedia *privatemedia.Store
 	if cfg.HasTelegramUserAPI() {
 		if err := cfg.ValidateSessionKey(); err != nil {
 			return err
@@ -178,6 +180,14 @@ func serve(ctx context.Context, cfg config.Config) error {
 		manager = monitor.NewManager(cfg, store, notifier, vault)
 		if botService != nil {
 			botService.SetAccounts(manager)
+		}
+		privateMedia, err = privatemedia.New(cfg.PrivateMediaDir, store, privatemedia.DefaultMaxDiskBytes)
+		if err != nil {
+			return err
+		}
+		manager.SetPrivateMedia(privateMedia)
+		if botService != nil {
+			botService.SetPrivateMedia(privateMedia)
 		}
 	} else {
 		log.Print("telegram user API disabled: TELEGRAM_API_ID/TELEGRAM_API_HASH are not configured")
@@ -220,6 +230,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 		defer mediaService.Close()
 		webServer.SetMediaService(mediaService)
 		group.Go(func() error { return mediaService.Run(ctx) })
+		group.Go(func() error { return privateMedia.Run(ctx) })
 		group.Go(func() error {
 			// Importing checks the old session with Telegram, so it runs here
 			// rather than delaying the web server and health checks.

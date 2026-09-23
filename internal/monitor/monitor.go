@@ -21,6 +21,7 @@ import (
 	"github.com/nextster/telegram-bridge/internal/db"
 	"github.com/nextster/telegram-bridge/internal/match"
 	"github.com/nextster/telegram-bridge/internal/notify"
+	"github.com/nextster/telegram-bridge/internal/privatemedia"
 )
 
 type Handler struct {
@@ -29,6 +30,14 @@ type Handler struct {
 	deletionNotifier notify.DeletionNotifier
 	selfUserID       atomic.Int64
 	deletionMu       sync.Mutex
+	// deletionQuiet is how long a dialog must stay free of new deletions
+	// before they are reported together.
+	deletionQuiet time.Duration
+
+	privateMedia *privatemedia.Store
+	mediaJobs    chan privateMediaJob
+	mediaMu      sync.Mutex
+	mediaPending map[int]time.Time
 }
 
 // Service is the runtime of one Telegram account. Every Service serves exactly
@@ -120,12 +129,13 @@ func NewHandler(store *db.Store, notifier notify.Notifier) *Handler {
 	case notify.Nop, *notify.Nop:
 		deletionNotifier = nil
 	}
-	return &Handler{store: store, notifier: notifier, deletionNotifier: deletionNotifier}
+	return &Handler{store: store, notifier: notifier, deletionNotifier: deletionNotifier, deletionQuiet: privateDeletionQuietPeriod}
 }
 
-func newAccountService(cfg config.Config, store *db.Store, notifier notify.Notifier, owner int64, storage session.Storage) *Service {
+func newAccountService(cfg config.Config, store *db.Store, notifier notify.Notifier, owner int64, storage session.Storage, media *privatemedia.Store) *Service {
 	handler := NewHandler(store, notifier)
 	handler.SetSelfUserID(owner)
+	handler.SetPrivateMedia(media)
 	return &Service{
 		cfg:      cfg,
 		store:    store,
@@ -173,6 +183,7 @@ func (s *Service) runOnce(ctx context.Context) error {
 		err = manager.Run(ctx, client.API(), status.User.ID, updates.AuthOptions{
 			OnStart: func(managerCtx context.Context) {
 				go s.handler.runPrivateDeletionOutbox(managerCtx)
+				s.runPrivateMediaDownloads(managerCtx)
 				go func() {
 					if count, syncErr := s.SyncDialogs(managerCtx); syncErr != nil {
 						log.Printf("telegram dialogs sync failed: %v", syncErr)
@@ -525,6 +536,7 @@ func (h *Handler) handleMessageClass(ctx context.Context, message tg.MessageClas
 		EditDate:       optionalUnixTime(msg.EditDate),
 		Text:           msg.Message,
 		MediaType:      telegramMediaType(msg.Media),
+		Media:          msg.Media,
 		Outgoing:       msg.Out,
 		PrivateDialog:  privateDialogs[peerID],
 	})
@@ -536,8 +548,12 @@ func (h *Handler) handleText(ctx context.Context, observed observedMessage) erro
 }
 
 func (h *Handler) processObserved(ctx context.Context, observed observedMessage, notifyOnInsert bool) (ProcessResult, error) {
-	if err := h.archivePrivateMessage(ctx, observed); err != nil {
+	archived, err := h.archivePrivateMessage(ctx, observed)
+	if err != nil {
 		return ProcessResult{}, err
+	}
+	if archived {
+		h.queuePrivateMedia(observed)
 	}
 	observed.Text = strings.TrimSpace(observed.Text)
 	owner := h.selfUserID.Load()
@@ -596,6 +612,7 @@ type observedMessage struct {
 	EditDate       time.Time
 	Text           string
 	MediaType      string
+	Media          tg.MessageMediaClass
 	Outgoing       bool
 	PrivateDialog  db.PrivateDialog
 }

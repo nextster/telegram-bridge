@@ -135,6 +135,7 @@ func TestHandlerArchivesEditedPrivateMessageAndNotifiesDeletionOnce(t *testing.T
 	notifier := &captureNotifier{}
 	handler := NewHandler(store, notifier)
 	handler.SetSelfUserID(100)
+	handler.deletionQuiet = 0
 	peer := &tg.PeerUser{UserID: 200}
 	from := &tg.PeerUser{UserID: 200}
 	users := []tg.UserClass{&tg.User{ID: 200, AccessHash: 300, FirstName: "Alice", LastName: "Example", Username: "alice"}}
@@ -195,6 +196,7 @@ func TestPrivateDeletionOutboxRetriesFailedNotification(t *testing.T) {
 	notifier := &captureNotifier{failDeletes: 1}
 	handler := NewHandler(store, notifier)
 	handler.SetSelfUserID(100)
+	handler.deletionQuiet = 0
 	users := []tg.UserClass{&tg.User{ID: 200, AccessHash: 300, FirstName: "Alice"}}
 	if err := handler.Handle(ctx, &tg.Updates{Users: users, Updates: []tg.UpdateClass{
 		&tg.UpdateNewMessage{Message: &tg.Message{ID: 88, PeerID: &tg.PeerUser{UserID: 200}, FromID: &tg.PeerUser{UserID: 200}, Date: 100, Message: "retry me"}},
@@ -221,9 +223,9 @@ func TestPrivateDeletionOutboxRetriesFailedNotification(t *testing.T) {
 	}
 }
 
-func TestPrivateDeletionOutboxChunksAndNopDoesNotAcknowledge(t *testing.T) {
+func TestPrivateDeletionOutboxSendsOneAlertPerBurstAndNopDoesNotAcknowledge(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(ctx, t.TempDir()+"/private-deletion-chunks.db")
+	store, err := db.Open(ctx, t.TempDir()+"/private-deletion-burst.db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,20 +240,37 @@ func TestPrivateDeletionOutboxChunksAndNopDoesNotAcknowledge(t *testing.T) {
 	for id := 1; id <= 8; id++ {
 		ids = append(ids, id)
 		updates = append(updates, &tg.UpdateNewMessage{Message: &tg.Message{
-			ID: id, PeerID: &tg.PeerUser{UserID: 200}, FromID: &tg.PeerUser{UserID: 200}, Date: 100 + id, Message: "chunk me",
+			ID: id, PeerID: &tg.PeerUser{UserID: 200}, FromID: &tg.PeerUser{UserID: 200}, Date: 100 + id, Message: "burst",
 		}})
 	}
 	if err := handler.Handle(ctx, &tg.Updates{Users: users, Updates: updates}); err != nil {
 		t.Fatal(err)
 	}
-	if err := handler.Handle(ctx, &tg.Updates{Updates: []tg.UpdateClass{&tg.UpdateDeleteMessages{Messages: ids}}}); err != nil {
-		t.Fatal(err)
+	// A whole-chat deletion arrives as several updates.
+	for _, part := range [][]int{ids[:3], ids[3:]} {
+		if err := handler.Handle(ctx, &tg.Updates{Updates: []tg.UpdateClass{&tg.UpdateDeleteMessages{Messages: part}}}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := handler.flushPrivateDeletionOutbox(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if len(notifier.deletions) != 2 || len(notifier.deletions[0].Messages) != 6 || len(notifier.deletions[1].Messages) != 2 {
-		t.Fatalf("deletion chunks = %#v", notifier.deletions)
+	if len(notifier.deletions) != 0 {
+		t.Fatalf("alert sent before the deletion burst was over: %#v", notifier.deletions)
+	}
+	handler.deletionQuiet = 0
+	if err := handler.flushPrivateDeletionOutbox(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(notifier.deletions) != 1 || len(notifier.deletions[0].Messages) != 8 || notifier.deletions[0].AlertID <= 0 {
+		t.Fatalf("deletion alerts = %#v, want one alert with 8 messages", notifier.deletions)
+	}
+	alert, ok, err := store.GetPrivateDeletionAlert(ctx, 100, notifier.deletions[0].AlertID)
+	if err != nil || !ok || len(alert.Messages) != 8 || alert.Dialog.Title != "Alice" {
+		t.Fatalf("stored alert = %#v ok=%v err=%v", alert, ok, err)
+	}
+	if _, ok, err := store.GetPrivateDeletionAlert(ctx, 200, notifier.deletions[0].AlertID); err != nil || ok {
+		t.Fatalf("another owner can read the alert: ok=%v err=%v", ok, err)
 	}
 
 	if err := handler.Handle(ctx, &tg.Updates{Updates: []tg.UpdateClass{&tg.UpdateDeleteMessages{Messages: []int{999}}}}); err != nil {
@@ -268,5 +287,36 @@ func TestPrivateDeletionOutboxChunksAndNopDoesNotAcknowledge(t *testing.T) {
 	}
 	if stats.Pending != 1 {
 		t.Fatalf("pending after nop flush = %d, want 1", stats.Pending)
+	}
+}
+
+func TestPrivateDeletionOutboxDropsAlertOfFailedSend(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(ctx, t.TempDir()+"/private-deletion-failed-alert.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	notifier := &captureNotifier{failDeletes: 1}
+	handler := NewHandler(store, notifier)
+	handler.SetSelfUserID(100)
+	handler.deletionQuiet = 0
+	users := []tg.UserClass{&tg.User{ID: 200, AccessHash: 300, FirstName: "Alice"}}
+	if err := handler.Handle(ctx, &tg.Updates{Users: users, Updates: []tg.UpdateClass{
+		&tg.UpdateNewMessage{Message: &tg.Message{ID: 5, PeerID: &tg.PeerUser{UserID: 200}, FromID: &tg.PeerUser{UserID: 200}, Date: 100, Message: "x"}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.Handle(ctx, &tg.Updates{Updates: []tg.UpdateClass{&tg.UpdateDeleteMessages{Messages: []int{5}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.flushPrivateDeletionOutbox(ctx); err == nil {
+		t.Fatal("failed send was acknowledged")
+	}
+	for id := int64(1); id <= 3; id++ {
+		if _, ok, err := store.GetPrivateDeletionAlert(ctx, 100, id); err != nil || ok {
+			t.Fatalf("alert %d of a failed send was kept: ok=%v err=%v", id, ok, err)
+		}
 	}
 }

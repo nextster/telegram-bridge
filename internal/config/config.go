@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -37,6 +38,9 @@ type Config struct {
 	MCPToken            string
 	NotificationToken   string
 	NotificationChatIDs []int64
+
+	// PrivateMediaDir holds short-lived copies of direct-chat attachments.
+	PrivateMediaDir string
 }
 
 func Load() (Config, error) {
@@ -100,6 +104,10 @@ func Load() (Config, error) {
 	cfg.Media, err = loadMediaConfig(cfg.DBPath)
 	if err != nil {
 		return Config{}, err
+	}
+	cfg.PrivateMediaDir = strings.TrimSpace(envFirst("TELEGRAM_BRIDGE_PRIVATE_MEDIA_DIR"))
+	if cfg.PrivateMediaDir == "" {
+		cfg.PrivateMediaDir = filepath.Join(filepath.Dir(cfg.DBPath), "private-media")
 	}
 
 	return cfg, nil

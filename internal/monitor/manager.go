@@ -24,6 +24,7 @@ import (
 	"github.com/nextster/telegram-bridge/internal/db"
 	"github.com/nextster/telegram-bridge/internal/media"
 	"github.com/nextster/telegram-bridge/internal/notify"
+	"github.com/nextster/telegram-bridge/internal/privatemedia"
 )
 
 var (
@@ -130,10 +131,11 @@ type UserNotifier interface {
 // Manager owns every connected Telegram account. Accounts are keyed by the
 // Telegram user ID, which is also the only identity other components use.
 type Manager struct {
-	cfg      config.Config
-	store    *db.Store
-	notifier notify.Notifier
-	vault    *SessionVault
+	cfg          config.Config
+	store        *db.Store
+	notifier     notify.Notifier
+	vault        *SessionVault
+	privateMedia *privatemedia.Store
 
 	mu       sync.RWMutex
 	runCtx   context.Context
@@ -155,6 +157,12 @@ func NewManager(cfg config.Config, store *db.Store, notifier notify.Notifier, va
 		accounts:   map[int64]*accountRuntime{},
 		loginOwner: map[int64]bool{},
 	}
+}
+
+// SetPrivateMedia enables short-lived caching of direct-chat attachments for
+// accounts started afterwards. Call it before Run.
+func (m *Manager) SetPrivateMedia(media *privatemedia.Store) {
+	m.privateMedia = media
 }
 
 // Run starts every stored account and keeps them running until ctx ends.
@@ -198,7 +206,7 @@ func (m *Manager) start(owner int64) {
 	}
 	ctx, cancel := context.WithCancel(m.runCtx)
 	runtime := &accountRuntime{
-		service: newAccountService(m.cfg, m.store, m.notifier, owner, m.vault.Storage(owner)),
+		service: newAccountService(m.cfg, m.store, m.notifier, owner, m.vault.Storage(owner), m.privateMedia),
 		cancel:  cancel,
 		done:    make(chan struct{}),
 	}
