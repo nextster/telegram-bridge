@@ -22,7 +22,8 @@ type PrivateDialog struct {
 	LastBackfillAt time.Time
 }
 
-// PrivateMessage is a text/metadata snapshot. Media bytes are never archived.
+// PrivateMessage is a text/metadata snapshot. Media bytes are never archived;
+// only the short-lived private media cache holds attachment files.
 type PrivateMessage struct {
 	OwnerUserID int64
 	MessageID   int
@@ -38,12 +39,20 @@ type PrivateMessage struct {
 	DeletedAt   time.Time
 }
 
+// PrivateMessageDeletion is one alert: messages of one dialog that
+// disappeared together. AlertID is set once the alert has been recorded.
 type PrivateMessageDeletion struct {
-	Dialog     PrivateDialog
-	Messages   []PrivateMessage
-	ObservedAt time.Time
-	Attempts   int
+	AlertID        int64
+	Dialog         PrivateDialog
+	Messages       []PrivateMessage
+	ObservedAt     time.Time
+	LastObservedAt time.Time
+	Attempts       int
 }
+
+// privateDeletionListMax bounds one outbox pass. A larger deletion is reported
+// in more than one alert.
+const privateDeletionListMax = 5000
 
 type PrivateArchiveStats struct {
 	Dialogs  int
@@ -257,6 +266,15 @@ func (s *Store) RecordPrivateMessageDeletions(ctx context.Context, ownerUserID i
 		`, formatTime(observedAt), ownerUserID, messageID); err != nil {
 			return fmt.Errorf("mark private message deleted: %w", err)
 		}
+		// A deleted message's attachment outlives the normal cache window until
+		// the owner has had a chance to see it.
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE private_media_cache
+			SET expires_at = MAX(expires_at, ?)
+			WHERE owner_user_id = ? AND message_id = ?
+		`, observedAt.Add(PrivateMediaDeletedHold).Unix(), ownerUserID, messageID); err != nil {
+			return fmt.Errorf("hold deleted private media: %w", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit private message deletion: %w", err)
@@ -265,7 +283,7 @@ func (s *Store) RecordPrivateMessageDeletions(ctx context.Context, ownerUserID i
 }
 
 func (s *Store) ListPendingPrivateMessageDeletions(ctx context.Context, ownerUserID int64, limit int) ([]PrivateMessageDeletion, error) {
-	if limit <= 0 || limit > 500 {
+	if limit <= 0 || limit > privateDeletionListMax {
 		limit = 200
 	}
 	rows, err := s.db.QueryContext(ctx, `
@@ -318,14 +336,21 @@ func (s *Store) ListPendingPrivateMessageDeletions(ctx context.Context, ownerUse
 		message.LastSeenAt = parseDBTime(lastSeenAt)
 		message.DeletedAt = parseDBTime(deletedAt)
 
+		observed := parseDBTime(observedAt)
 		batch := byPeer[message.PeerID]
 		if batch == nil {
-			batch = &PrivateMessageDeletion{Dialog: dialog, ObservedAt: parseDBTime(observedAt), Attempts: attempts}
+			batch = &PrivateMessageDeletion{Dialog: dialog, ObservedAt: observed, LastObservedAt: observed, Attempts: attempts}
 			byPeer[message.PeerID] = batch
 			peerOrder = append(peerOrder, message.PeerID)
 		}
 		if attempts > batch.Attempts {
 			batch.Attempts = attempts
+		}
+		if observed.Before(batch.ObservedAt) {
+			batch.ObservedAt = observed
+		}
+		if observed.After(batch.LastObservedAt) {
+			batch.LastObservedAt = observed
 		}
 		batch.Messages = append(batch.Messages, message)
 	}
@@ -458,10 +483,123 @@ func (s *Store) PrunePrivateArchive(ctx context.Context, ownerUserID int64, befo
 	`, ownerUserID, formatTime(before)); err != nil {
 		return fmt.Errorf("prune private deletions: %w", err)
 	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM private_deletion_alerts
+		WHERE owner_user_id = ? AND created_at < ?
+	`, ownerUserID, formatTime(before)); err != nil {
+		return fmt.Errorf("prune private deletion alerts: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit private archive prune: %w", err)
 	}
 	return nil
+}
+
+// CreatePrivateDeletionAlert records which messages one deletion alert covers,
+// so the owner can ask the bot to show them later.
+func (s *Store) CreatePrivateDeletionAlert(ctx context.Context, ownerUserID, peerID int64, messageIDs []int, at time.Time) (int64, error) {
+	if ownerUserID <= 0 || peerID <= 0 {
+		return 0, errors.New("private deletion alert owner and peer are required")
+	}
+	ids := uniquePositiveInts(messageIDs)
+	if len(ids) == 0 {
+		return 0, errors.New("private deletion alert has no messages")
+	}
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin private deletion alert: %w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
+		INSERT INTO private_deletion_alerts(owner_user_id, peer_id, created_at) VALUES(?, ?, ?)
+	`, ownerUserID, peerID, formatTime(at))
+	if err != nil {
+		return 0, fmt.Errorf("create private deletion alert: %w", err)
+	}
+	alertID, err := result.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("create private deletion alert: %w", err)
+	}
+	for _, id := range ids {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO private_deletion_alert_messages(alert_id, message_id) VALUES(?, ?)
+		`, alertID, id); err != nil {
+			return 0, fmt.Errorf("link private deletion alert message: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit private deletion alert: %w", err)
+	}
+	return alertID, nil
+}
+
+// DeletePrivateDeletionAlert removes an alert that could not be delivered.
+func (s *Store) DeletePrivateDeletionAlert(ctx context.Context, ownerUserID, alertID int64) error {
+	if _, err := s.db.ExecContext(ctx, `
+		DELETE FROM private_deletion_alerts WHERE owner_user_id = ? AND id = ?
+	`, ownerUserID, alertID); err != nil {
+		return fmt.Errorf("delete private deletion alert: %w", err)
+	}
+	return nil
+}
+
+// GetPrivateDeletionAlert returns an alert of ownerUserID with the archived
+// messages it covers, oldest first. Messages already pruned are omitted.
+func (s *Store) GetPrivateDeletionAlert(ctx context.Context, ownerUserID, alertID int64) (PrivateMessageDeletion, bool, error) {
+	var peerID int64
+	var createdAt string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT peer_id, created_at FROM private_deletion_alerts WHERE owner_user_id = ? AND id = ?
+	`, ownerUserID, alertID).Scan(&peerID, &createdAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return PrivateMessageDeletion{}, false, nil
+	}
+	if err != nil {
+		return PrivateMessageDeletion{}, false, fmt.Errorf("get private deletion alert: %w", err)
+	}
+	dialog, ok, err := s.GetPrivateDialog(ctx, ownerUserID, peerID)
+	if err != nil {
+		return PrivateMessageDeletion{}, false, err
+	}
+	if !ok {
+		dialog = PrivateDialog{OwnerUserID: ownerUserID, PeerID: peerID}
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT m.owner_user_id, m.message_id, m.peer_id, m.sender_id, m.message_date, m.edit_date,
+		       m.text, m.media_type, m.outgoing, m.first_seen_at, m.last_seen_at, m.deleted_at
+		FROM private_deletion_alert_messages a
+		JOIN private_messages m ON m.owner_user_id = ? AND m.message_id = a.message_id
+		WHERE a.alert_id = ? AND m.peer_id = ?
+		ORDER BY m.message_date, m.message_id
+	`, ownerUserID, alertID, peerID)
+	if err != nil {
+		return PrivateMessageDeletion{}, false, fmt.Errorf("list private deletion alert messages: %w", err)
+	}
+	defer rows.Close()
+	deletion := PrivateMessageDeletion{AlertID: alertID, Dialog: dialog, ObservedAt: parseDBTime(createdAt), LastObservedAt: parseDBTime(createdAt)}
+	for rows.Next() {
+		var message PrivateMessage
+		var outgoing int
+		var messageDate, editDate, firstSeenAt, lastSeenAt, deletedAt string
+		if err := rows.Scan(&message.OwnerUserID, &message.MessageID, &message.PeerID, &message.SenderID, &messageDate, &editDate,
+			&message.Text, &message.MediaType, &outgoing, &firstSeenAt, &lastSeenAt, &deletedAt); err != nil {
+			return PrivateMessageDeletion{}, false, fmt.Errorf("scan private deletion alert message: %w", err)
+		}
+		message.Outgoing = outgoing == 1
+		message.MessageDate = parseDBTime(messageDate)
+		message.EditDate = parseDBTime(editDate)
+		message.FirstSeenAt = parseDBTime(firstSeenAt)
+		message.LastSeenAt = parseDBTime(lastSeenAt)
+		message.DeletedAt = parseDBTime(deletedAt)
+		deletion.Messages = append(deletion.Messages, message)
+	}
+	if err := rows.Err(); err != nil {
+		return PrivateMessageDeletion{}, false, fmt.Errorf("list private deletion alert messages: %w", err)
+	}
+	return deletion, true, nil
 }
 
 type privateDialogScanner interface{ Scan(dest ...any) error }

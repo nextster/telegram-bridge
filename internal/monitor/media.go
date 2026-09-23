@@ -136,31 +136,14 @@ func attachmentFromMessage(accountID int64, source TelegramMessage, msg *tg.Mess
 		if !ok {
 			return a, nil
 		}
-		var sizeType string
-		for _, size := range photo.Sizes {
-			var n int
-			var typ string
-			switch v := size.(type) {
-			case *tg.PhotoSize:
-				n, typ = v.Size, v.Type
-			case *tg.PhotoSizeProgressive:
-				for _, part := range v.Sizes {
-					if part > n {
-						n = part
-					}
-				}
-				typ = v.Type
-			}
-			if int64(n) > a.Size {
-				a.Size, sizeType = int64(n), typ
-			}
-		}
-		if sizeType == "" {
+		size := largestPhotoSize(photo)
+		if size.Type == "" {
 			return a, nil
 		}
+		a.Size = size.Bytes
 		a.MIME, a.Supported = "image/jpeg", true
-		location = &tg.InputPhotoFileLocation{ID: photo.ID, AccessHash: photo.AccessHash, FileReference: photo.FileReference, ThumbSize: sizeType}
-		identity = []any{"photo", photo.ID, sizeType, a.Size}
+		location = &tg.InputPhotoFileLocation{ID: photo.ID, AccessHash: photo.AccessHash, FileReference: photo.FileReference, ThumbSize: size.Type}
+		identity = []any{"photo", photo.ID, size.Type, a.Size}
 	}
 	// Telegram document/photo IDs identify immutable media. Expiring file references
 	// and caption edits deliberately do not invalidate a paid recognition result.

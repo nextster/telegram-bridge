@@ -232,6 +232,10 @@ func TestPrivateArchivePruneProtectsPendingDeletion(t *testing.T) {
 	if err != nil || len(pending) != 1 || pending[0].Messages[0].Text != "pending old message" {
 		t.Fatalf("pending after protected prune = %#v, err=%v", pending, err)
 	}
+	alertID, err := store.CreatePrivateDeletionAlert(ctx, 100, 200, []int{1}, time.Unix(40, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := store.MarkPrivateDeletionNotified(ctx, 100, []int{1}, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
@@ -241,6 +245,48 @@ func TestPrivateArchivePruneProtectsPendingDeletion(t *testing.T) {
 	stats, err = store.PrivateArchiveStats(ctx, 100)
 	if err != nil || stats.Messages != 0 || stats.Pending != 0 {
 		t.Fatalf("stats after delivered prune = %#v, err=%v", stats, err)
+	}
+	if _, ok, err := store.GetPrivateDeletionAlert(ctx, 100, alertID); err != nil || ok {
+		t.Fatalf("old alert survived prune: ok=%v err=%v", ok, err)
+	}
+	var links int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM private_deletion_alert_messages`).Scan(&links); err != nil || links != 0 {
+		t.Fatalf("alert message links after prune = %d, err=%v", links, err)
+	}
+}
+
+func TestPrivateMediaSavedAfterDeletionIsHeld(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, t.TempDir()+"/private-media-hold.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	deletedAt := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+	if err := store.RecordPrivateMessageDeletions(ctx, 100, []int{5}, deletedAt); err != nil {
+		t.Fatal(err)
+	}
+	// The download finished after the deletion was already recorded.
+	created := deletedAt.Add(time.Second)
+	for _, media := range []PrivateMedia{
+		{OwnerUserID: 100, MessageID: 5, MediaID: 1, Kind: "voice", Size: 10, CreatedAt: created},
+		{OwnerUserID: 100, MessageID: 6, MediaID: 2, Kind: "voice", Size: 10, CreatedAt: created},
+	} {
+		if err := store.SavePrivateMedia(ctx, media); err != nil {
+			t.Fatal(err)
+		}
+	}
+	held, ok, err := store.GetPrivateMedia(ctx, 100, 5, created)
+	if err != nil || !ok || !held.ExpiresAt.Equal(created.Add(PrivateMediaDeletedHold)) {
+		t.Fatalf("deleted message media = %#v ok=%v err=%v", held, ok, err)
+	}
+	normal, ok, err := store.GetPrivateMedia(ctx, 100, 6, created)
+	if err != nil || !ok || !normal.ExpiresAt.Equal(created.Add(PrivateMediaTTL)) {
+		t.Fatalf("live message media = %#v ok=%v err=%v", normal, ok, err)
+	}
+	if _, ok, err := store.GetPrivateMedia(ctx, 200, 5, created); err != nil || ok {
+		t.Fatalf("another owner sees the media: ok=%v err=%v", ok, err)
 	}
 }
 

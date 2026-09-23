@@ -31,12 +31,13 @@ type Accounts interface {
 // Service is the bot. Every command acts only for the Telegram user who sent
 // it, in that user's private chat with the bot.
 type Service struct {
-	bot      *telego.Bot
-	store    *db.Store
-	cfg      config.Config
-	accounts Accounts
-	login    *loginManager
-	identity botIdentity
+	bot          *telego.Bot
+	store        *db.Store
+	cfg          config.Config
+	accounts     Accounts
+	login        *loginManager
+	identity     botIdentity
+	privateMedia PrivateMedia
 }
 
 func New(cfg config.Config, store *db.Store) (*Service, error) {
@@ -103,29 +104,6 @@ func (s *Service) NotifyEvent(ctx context.Context, event db.Event) error {
 	})
 	if err != nil {
 		return fmt.Errorf("send alert to %d: %w", event.OwnerUserID, err)
-	}
-	return nil
-}
-
-// NotifyDeletedMessages sends an archive alert only to the account owner.
-func (s *Service) NotifyDeletedMessages(ctx context.Context, deletion db.PrivateMessageDeletion) error {
-	owner := deletion.Dialog.OwnerUserID
-	if len(deletion.Messages) == 0 {
-		return nil
-	}
-	subscribed, err := s.alertsEnabled(ctx, owner)
-	if err != nil {
-		return err
-	}
-	if !subscribed {
-		return fmt.Errorf("private deletion alert owner %d has not subscribed to the bot", owner)
-	}
-	_, err = s.bot.SendMessage(ctx, &telego.SendMessageParams{
-		ChatID: telego.ChatID{ID: owner},
-		Text:   formatDeletedMessages(deletion),
-	})
-	if err != nil {
-		return fmt.Errorf("send deletion alert to owner chat %d: %w", owner, err)
 	}
 	return nil
 }
@@ -264,6 +242,9 @@ func (s *Service) handleCallbackQuery(ctx context.Context, query *telego.Callbac
 	}
 	if rawEventID, ok := strings.CutPrefix(data, "kwdel:"); ok {
 		return s.handleStopKeywordCallback(ctx, query, userID, rawEventID)
+	}
+	if rawAlert, ok := strings.CutPrefix(data, deletionShowCallbackPrefix); ok {
+		return s.handleDeletionShowCallback(ctx, query, userID, rawAlert)
 	}
 	return s.answerCallback(ctx, query.ID, "Неизвестное действие.")
 }
@@ -646,38 +627,6 @@ func formatEvent(event db.Event) string {
 	return "🔎 Найдено:\n\n" + truncate(content, 2800)
 }
 
-func formatDeletedMessages(deletion db.PrivateMessageDeletion) string {
-	count := len(deletion.Messages)
-	label := privateDialogLabel(deletion.Dialog)
-	var b strings.Builder
-	if count == 1 {
-		fmt.Fprintf(&b, "🫥 Удалено из: %s\n", label)
-	} else {
-		fmt.Fprintf(&b, "🫥 Удалено из: %s · %d сообщений\n", label, count)
-	}
-
-	shown := 0
-	for _, message := range deletion.Messages {
-		if shown == 6 {
-			break
-		}
-		content := strings.TrimSpace(message.Text)
-		if content == "" {
-			content = deletedMediaLabel(message.MediaType)
-		}
-		if count == 1 {
-			fmt.Fprintf(&b, "\n%s", truncateUTF16(content, 1200))
-		} else {
-			fmt.Fprintf(&b, "\n%d. %s", shown+1, truncateUTF16(content, 480))
-		}
-		shown++
-	}
-	if remaining := count - shown; remaining > 0 {
-		fmt.Fprintf(&b, "\n…и ещё %d.", remaining)
-	}
-	return truncateUTF16(b.String(), 3900)
-}
-
 func privateDialogLabel(dialog db.PrivateDialog) string {
 	title := strings.TrimSpace(dialog.Title)
 	username := telegramUsername(dialog.Username)
@@ -691,29 +640,6 @@ func privateDialogLabel(dialog db.PrivateDialog) string {
 		return fmt.Sprintf("%s (@%s)", title, username)
 	}
 	return title
-}
-
-func deletedMediaLabel(mediaType string) string {
-	switch strings.TrimSpace(mediaType) {
-	case "photo":
-		return "[фото без подписи]"
-	case "file":
-		return "[файл без подписи]"
-	case "contact":
-		return "[контакт]"
-	case "location":
-		return "[геолокация]"
-	case "poll":
-		return "[опрос]"
-	case "dice":
-		return "[дайс]"
-	case "game":
-		return "[игра]"
-	case "media":
-		return "[медиа без подписи]"
-	default:
-		return "[сообщение без текста]"
-	}
 }
 
 func helpText() string {
