@@ -3,7 +3,6 @@ set -euo pipefail
 
 APP="${APP:-telegram-bridge}"
 MODE="${MODE:-local}"
-BUILDER="${BUILDER:-container}"
 RUN_TESTS="${RUN_TESTS:-0}"
 WAIT_HEALTH="${WAIT_HEALTH:-0}"
 PACK="${PACK:-1}"
@@ -15,6 +14,7 @@ PLATFORM="${PLATFORM:-${TARGET_GOOS}/${TARGET_GOARCH}}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE_TAG="${IMAGE_TAG:-fast-$(date -u +%Y%m%d%H%M%S)}"
 IMAGE="${IMAGE:-registry.fly.io/${APP}:${IMAGE_TAG}}"
+source "$ROOT/scripts/runtime-cache.sh"
 
 step_started_at=0
 
@@ -34,63 +34,22 @@ first_machine_id() {
 }
 
 registry_login() {
-  case "$BUILDER" in
-    container)
-      if ! command -v regctl >/dev/null 2>&1; then
-        printf 'regctl not found; install it with: brew install regclient\n' >&2
-        return 1
-      fi
-      fly auth token -q \
-        | regctl registry login registry.fly.io --user x --pass-stdin >/dev/null
-      ;;
-    docker)
-      fly auth docker >/dev/null
-      ;;
-    *)
-      printf 'unknown BUILDER=%s, expected container or docker\n' "$BUILDER" >&2
-      return 1
-      ;;
-  esac
+  fly auth docker >/dev/null
 }
 
 build_image() {
-  case "$BUILDER" in
-    container)
-      container build \
-        --platform "$PLATFORM" \
-        --file Dockerfile.fast \
-        --tag "$IMAGE" \
-        .
-      ;;
-    docker)
-      docker buildx build \
-        --platform "$PLATFORM" \
-        --file Dockerfile.fast \
-        --tag "$IMAGE" \
-        --load \
-        --provenance=false \
-        .
-      ;;
-  esac
+  docker buildx build \
+    --platform "$PLATFORM" \
+    --build-context "runtime-base=$RUNTIME_CONTEXT" \
+    --file Dockerfile.fast \
+    --tag "$IMAGE" \
+    --load \
+    --provenance=false \
+    .
 }
 
 push_image() {
-  case "$BUILDER" in
-    container)
-      local archive=".fly-build/image-${TARGET_GOARCH}.oci.tar"
-      local layout=".fly-build/image-${TARGET_GOARCH}-oci"
-      local digest
-
-      mkdir -p "$layout"
-      container image save --platform "$PLATFORM" --output "$archive" "$IMAGE"
-      tar -xf "$archive" -C "$layout"
-      digest="$(jq -r '.manifests[0].digest' "$layout/index.json")"
-      regctl image copy --platform "$PLATFORM" "ocidir://${layout}@${digest}" "$IMAGE"
-      ;;
-    docker)
-      docker push "$IMAGE"
-      ;;
-  esac
+  docker push "$IMAGE"
 }
 
 wait_for_machine() {
@@ -130,7 +89,17 @@ wait_for_public_health() {
   return 1
 }
 
+if ! command -v docker >/dev/null 2>&1 || ! docker buildx version >/dev/null 2>&1; then
+  printf 'Docker CLI and Docker Buildx are required for the fast deployment path\n' >&2
+  exit 1
+fi
+if ! docker info >/dev/null 2>&1; then
+  printf 'Docker daemon is unavailable; start it or select a running Docker context\n' >&2
+  exit 1
+fi
+
 cd "$ROOT"
+RUNTIME_CONTEXT="$(runtime_image_context)"
 mkdir -p .fly-build
 
 total_started_at="$(date +%s)"
@@ -160,7 +129,7 @@ fi
 
 case "$MODE" in
   build)
-    start_step "build ${IMAGE} with ${BUILDER} (${PLATFORM})"
+    start_step "build ${IMAGE} with Docker (${PLATFORM})"
     build_image
     end_step
     ;;
@@ -169,7 +138,7 @@ case "$MODE" in
     registry_login
     end_step
 
-    start_step "build and push ${IMAGE} with ${BUILDER} (${PLATFORM})"
+    start_step "build and push ${IMAGE} with Docker (${PLATFORM})"
     build_image
     push_image
     end_step
@@ -193,7 +162,7 @@ case "$MODE" in
     registry_login
     end_step
 
-    start_step "build and push ${IMAGE} with ${BUILDER} (${PLATFORM})"
+    start_step "build and push ${IMAGE} with Docker (${PLATFORM})"
     build_image
     push_image
     end_step

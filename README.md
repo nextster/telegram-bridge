@@ -102,22 +102,35 @@ fly deploy
 Fast code-only redeploy:
 
 ```sh
+scripts/build-runtime.sh
 scripts/deploy-fast.sh
 ```
 
-This builds the deployment image locally with Apple `container`, pushes it to
-the Fly registry, and deploys it using `fly.fast.toml`; OrbStack and a Docker
-daemon are not required. Install the lightweight OCI registry client once with
-`brew install regclient`; the script uses its `regctl` command to upload the
-image produced by Apple `container` because Fly's registry is not compatible
-with Apple `container image push`. Fly Machines currently run on x86_64, so
-the default deployment target remains `linux/amd64` even on Apple Silicon. The
-Dockerfiles and fast image are architecture-neutral, and a local ARM64 image
-can be built with `TARGET_GOARCH=arm64 PLATFORM=linux/arm64 MODE=build`.
+Prepare the runtime once per target platform and after changing
+`Dockerfile.runtime`. Preparation executes the target platform's package
+manager, so it requires a compatible builder. Set `RUNTIME_BUILDER` to a
+configured native builder when needed. The prepared OCI layout is stored
+outside the repository under the XDG data directory, keyed by platform and
+runtime Dockerfile hash. `RUNTIME_STORE_DIR` overrides its storage root.
+It is a required runtime artifact, not a disposable build cache.
+
+This builds the deployment image locally with Docker Buildx, pushes it to
+the Fly registry, and deploys it using `fly.fast.toml`. Docker CLI, Docker
+Buildx, and a running Docker-compatible daemon are required. The script uses
+the current Docker context, or the standard `DOCKER_HOST` / `DOCKER_CONTEXT`
+environment overrides. Fly Machines run on x86_64, so the default deployment
+target remains `linux/amd64` even on Apple Silicon. The Dockerfiles and fast
+image are architecture-neutral. The fast Dockerfile only copies the
+cross-compiled binary into the prepared runtime; it executes no target-platform
+commands. Local ARM64 builds use:
+
+```sh
+PLATFORM=linux/arm64 scripts/build-runtime.sh
+TARGET_GOARCH=arm64 PLATFORM=linux/arm64 MODE=build scripts/deploy-fast.sh
+```
 
 The fast path is meant for quick Go code iterations; use plain `fly deploy`
-after changing Fly config, Docker base images, mounts, or services. Set
-`BUILDER=docker` only when explicitly falling back to Docker Buildx.
+after changing Fly config, Docker base images, mounts, or services.
 
 For an extra post-deploy public health check:
 

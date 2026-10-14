@@ -8,11 +8,18 @@ For code-only redeploys, use:
 scripts/deploy-fast.sh
 ```
 
+First prepare the target runtime with `scripts/build-runtime.sh`, and repeat
+after changing `Dockerfile.runtime`. This separate step requires a builder
+that can execute the target architecture; `RUNTIME_BUILDER` selects it. The
+fast Dockerfile only copies the cross-compiled binary and performs no `RUN`.
+Missing runtime layouts stop the fast script before compilation or deployment.
+
 Do not run bare `fly deploy --local-only` by hand for the fast path: it can pick
 the regular `fly.toml`/`Dockerfile` path and requires a Docker-compatible
-daemon. The script builds the image with Apple `container`, exports its OCI
-layout, uploads it with `regctl`, and deploys with `fly.fast.toml` and
-`Dockerfile.fast`. Fly Machines currently run on x86_64, so production defaults
+daemon. The script builds and pushes the image with Docker Buildx and deploys
+with `fly.fast.toml` and `Dockerfile.fast`. Use a running Docker-compatible
+daemon selected by the current Docker context or the standard `DOCKER_HOST` /
+`DOCKER_CONTEXT` overrides. Fly Machines run on x86_64, so production defaults
 to `linux/amd64`; local ARM64 smoke images are supported through `TARGET_GOARCH`
 and `PLATFORM`.
 

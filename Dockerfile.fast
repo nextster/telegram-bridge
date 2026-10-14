@@ -1,14 +1,4 @@
 # syntax=docker/dockerfile:1.7
 
-FROM alpine:3.22
-
-RUN apk add --no-cache ca-certificates ffmpeg && adduser -D -H -u 10001 app
-WORKDIR /app
-COPY .fly-build/telegram-bridge /usr/local/bin/telegram-bridge
-RUN mkdir -p /data && chown app:app /data
-USER app
-
-ENV PORT=8080
-EXPOSE 8080
-
-CMD ["telegram-bridge", "serve"]
+FROM runtime-base
+COPY --chmod=755 .fly-build/telegram-bridge /usr/local/bin/telegram-bridge
