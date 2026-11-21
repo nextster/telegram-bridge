@@ -30,7 +30,7 @@ func (s *Service) Download(ctx context.Context, accountID int64, chat string, id
 	if err != nil {
 		return Download{}, err
 	}
-	if err := s.checkAttachment(a, ""); err != nil {
+	if err := s.checkDownload(a); err != nil {
 		return Download{}, err
 	}
 	select {

@@ -123,6 +123,7 @@ func attachmentFromMessage(accountID int64, source TelegramMessage, msg *tg.Mess
 			}
 		}
 		a.Supported = a.Kind == "voice" || a.Kind == "video_note" || ((a.Kind == "document" || a.Kind == "image") && (a.MIME == "image/jpeg" || a.MIME == "image/png" || a.MIME == "image/webp"))
+		a.Downloadable = a.Supported || a.Kind == "video"
 		if a.Supported && a.Kind == "document" {
 			a.Kind = "image"
 		}
@@ -142,6 +143,7 @@ func attachmentFromMessage(accountID int64, source TelegramMessage, msg *tg.Mess
 		}
 		a.Size = size.Bytes
 		a.MIME, a.Supported = "image/jpeg", true
+		a.Downloadable = true
 		location = &tg.InputPhotoFileLocation{ID: photo.ID, AccessHash: photo.AccessHash, FileReference: photo.FileReference, ThumbSize: size.Type}
 		identity = []any{"photo", photo.ID, size.Type, a.Size}
 	}
@@ -161,7 +163,7 @@ func (s *Service) Download(ctx context.Context, expected media.Attachment, outpu
 	if current.AccountID != expected.AccountID || current.Fingerprint != expected.Fingerprint {
 		return media.Fail("source_changed")
 	}
-	if !current.Supported || location == nil {
+	if !current.Downloadable || location == nil {
 		return media.Fail("unsupported_attachment")
 	}
 	api, userID, err := s.readyAPI()

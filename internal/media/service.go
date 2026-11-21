@@ -217,12 +217,22 @@ func decodeJob(j db.MediaJob) (Job, error) {
 	return out, nil
 }
 
-func (s *Service) checkAttachment(a Attachment, operation string) error {
-	if !a.Supported || a.Fingerprint == "" {
+func (s *Service) checkDownload(a Attachment) error {
+	if !a.Downloadable || a.Fingerprint == "" {
 		return Fail("unsupported_attachment")
 	}
 	if a.Size <= 0 || a.Size > s.cfg.MaxBytes {
 		return Fail("attachment_size_limit")
+	}
+	return nil
+}
+
+func (s *Service) checkAttachment(a Attachment, operation string) error {
+	if !a.Supported {
+		return Fail("unsupported_attachment")
+	}
+	if err := s.checkDownload(a); err != nil {
+		return err
 	}
 	if operation == "transcription" && a.Kind != "voice" && a.Kind != "video_note" {
 		return Fail("unsupported_audio_attachment")

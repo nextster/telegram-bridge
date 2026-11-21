@@ -37,7 +37,7 @@ func (r *mediaRPC) Invoke(_ context.Context, input bin.Encoder, output bin.Decod
 		return &tgerr.Error{Code: 400, Type: "LOCATION_INVALID"}
 	case *tg.UploadGetFileRequest:
 		location, ok := request.Location.(*tg.InputDocumentFileLocation)
-		if !ok || location.ID != 123 || request.CDNSupported {
+		if !ok || location.ID != 123 || location.ThumbSize != "" || request.CDNSupported {
 			return errors.New("unexpected download location or CDN request")
 		}
 		start := min(request.Offset, int64(len(r.data)))
@@ -70,6 +70,35 @@ func TestDownloadDoesNotRequireOptionalServerHashes(t *testing.T) {
 				t.Fatal("download required optional hashes or changed original bytes")
 			}
 		})
+	}
+}
+
+func TestDownloadOriginalVideo(t *testing.T) {
+	data := bytes.Repeat([]byte("video"), 165_705)
+	doc := &tg.Document{ID: 123, Size: int64(len(data)), MimeType: "video/mp4", Attributes: []tg.DocumentAttributeClass{&tg.DocumentAttributeVideo{Duration: 601}}}
+	m := &tg.MessageMediaDocument{}
+	m.SetDocument(doc)
+	rpc := &mediaRPC{data: data, message: &tg.Message{ID: 7, PeerID: &tg.PeerChat{ChatID: 9}, Media: m}}
+	s := &Service{cfg: config.Config{TelegramAPIID: 1, TelegramAPIHash: "fake"}, api: tg.NewClient(rpc), authorized: true, userID: 1}
+	ctx := context.Background()
+	a, err := s.Attachment(ctx, "chat:9", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Kind != "video" || a.MIME != "video/mp4" || a.Size != int64(len(data)) || !a.Downloadable || a.Supported {
+		t.Fatalf("wrong video metadata: %+v", a)
+	}
+	var output bytes.Buffer
+	if err := s.Download(ctx, a, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(output.Bytes(), data) {
+		t.Fatal("download changed the original video")
+	}
+	m.SetTTLSeconds(10)
+	a, err = s.Attachment(ctx, "chat:9", 7)
+	if err != nil || a.Downloadable {
+		t.Fatalf("ephemeral video exposed: %+v, %v", a, err)
 	}
 }
 

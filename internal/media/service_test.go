@@ -75,7 +75,7 @@ func testService(t *testing.T) (*Service, *fakeSource, *fakeProvider) {
 	cfg := config.DefaultMediaConfig(path)
 	cfg.Enabled = true
 	cfg.APIKey = "fake-not-a-key"
-	source := &fakeSource{attachment: Attachment{AccountID: 1, Chat: "channel:42", MessageID: 7, Author: "Speaker", Date: time.Unix(1700000000, 0).UTC(), ReplyToID: 6, MessageURL: "https://t.me/c/42/7", Kind: "voice", MIME: "audio/ogg", Size: 5, Duration: 10, Supported: true, Fingerprint: "original"}, data: "audio", account: 1}
+	source := &fakeSource{attachment: Attachment{AccountID: 1, Chat: "channel:42", MessageID: 7, Author: "Speaker", Date: time.Unix(1700000000, 0).UTC(), ReplyToID: 6, MessageURL: "https://t.me/c/42/7", Kind: "voice", MIME: "audio/ogg", Size: 5, Duration: 10, Supported: true, Downloadable: true, Fingerprint: "original"}, data: "audio", account: 1}
 	s, err := New(cfg, store, source)
 	if err != nil {
 		t.Fatal(err)

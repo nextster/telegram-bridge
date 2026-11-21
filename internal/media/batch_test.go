@@ -45,7 +45,7 @@ func (s *batchSource) Attachment(_ context.Context, accountID int64, chat string
 	if id == 99 {
 		kind = "document"
 	}
-	return Attachment{AccountID: 1, Chat: chat, MessageID: id, Kind: kind, Supported: id != 99, Size: 5, Duration: 10, Fingerprint: Digest(id)}, nil
+	return Attachment{AccountID: 1, Chat: chat, MessageID: id, Kind: kind, Supported: id != 99, Downloadable: id != 99, Size: 5, Duration: 10, Fingerprint: Digest(id)}, nil
 }
 func (s *batchSource) Download(_ context.Context, _ int64, _ Attachment, w io.Writer) error {
 	s.downloads.Add(1)
