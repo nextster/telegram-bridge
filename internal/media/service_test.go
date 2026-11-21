@@ -75,7 +75,7 @@ func testService(t *testing.T) (*Service, *fakeSource, *fakeProvider) {
 	cfg := config.DefaultMediaConfig(path)
 	cfg.Enabled = true
 	cfg.APIKey = "fake-not-a-key"
-	source := &fakeSource{attachment: Attachment{AccountID: 1, Chat: "channel:42", MessageID: 7, Author: "Speaker", Date: time.Unix(1700000000, 0).UTC(), ReplyToID: 6, MessageURL: "https://t.me/c/42/7", Kind: "voice", MIME: "audio/ogg", Size: 5, Duration: 10, Supported: true, Fingerprint: "original"}, data: "audio", account: 1}
+	source := &fakeSource{attachment: Attachment{AccountID: 1, Chat: "channel:42", MessageID: 7, Author: "Speaker", Date: time.Unix(1700000000, 0).UTC(), ReplyToID: 6, MessageURL: "https://t.me/c/42/7", Kind: "voice", MIME: "audio/ogg", Size: 5, Duration: 10, Supported: true, Downloadable: true, Fingerprint: "original"}, data: "audio", account: 1}
 	s, err := New(cfg, store, source)
 	if err != nil {
 		t.Fatal(err)
@@ -382,6 +382,17 @@ func TestReferenceAndHintValidation(t *testing.T) {
 	f.attachment.Size = s.cfg.MaxBytes + 1
 	if _, err := s.Download(context.Background(), testAccount, "channel:42", 7); err == nil {
 		t.Fatal("accepted excessive size")
+	}
+}
+
+func TestRecognitionJobWithLegacyAttachment(t *testing.T) {
+	s, source, provider := testService(t)
+	source.attachment.Downloadable = false
+	job := startTestJob(t, s, "transcription", Options{})
+	runTestJob(t, s)
+	got := getTestJob(t, s, job.ID)
+	if got.Status != "completed" || !got.Source.Downloadable || provider.calls != 1 {
+		t.Fatalf("legacy job: status=%s error=%s downloadable=%t calls=%d", got.Status, got.ErrorCode, got.Source.Downloadable, provider.calls)
 	}
 }
 

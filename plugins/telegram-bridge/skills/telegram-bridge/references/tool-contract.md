@@ -93,15 +93,16 @@ All media inputs require `chat` (the exact returned chat key) and `message_id`
 Telegram session files, file references, or provider keys.
 
 `telegram_get_attachment` returns the attachment's `kind`, `mime_type`,
-`size_bytes`, Telegram-declared `duration_seconds`, `supported`, fingerprint,
-and source metadata. This is free of AI calls. Supported media: voice, video
-notes, photos, and JPEG/PNG/WebP image documents. Ordinary videos, audio files,
-stickers, ephemeral attachments, and other documents are not processed.
+`size_bytes`, Telegram-declared `duration_seconds`, fingerprint, and source
+metadata. `supported` indicates recognition eligibility for voice, video notes,
+photos, and JPEG/PNG/WebP image documents. `downloadable` covers those kinds and
+ordinary videos. Size and access checks still apply. This is free of AI calls.
 
 `telegram_download_attachment` returns `file_id`, `download_url`, `sha256`,
 `size_bytes`, `mime_type`, `expires_at`, and `source`. GET/HEAD of the URL requires
-the same bearer token as MCP; there are no public/signed-token links. This
-caches the unmodified Telegram file without paying an AI provider.
+the same bearer token as MCP. To save the original, write the GET response bytes
+to a local file. The server caches the unmodified Telegram file without starting
+recognition or calling an AI provider.
 
 `telegram_transcribe_media` additionally accepts:
 
@@ -188,8 +189,8 @@ pool. Cost reservations remain atomic/shared, with no per-worker budget increase
 
 Paid history additionally returns `skipped_media` for non-text attachments outside
 the supported voice/video-note/photo/image kinds. Each entry has `chat`,
-`message_id`, `kind`, `reason: unsupported_attachment`. Ordinary videos remain
-unsupported; batch success never establishes that skipped media were recognized.
+`message_id`, `kind`, `reason: unsupported_attachment`. Ordinary videos can be
+downloaded separately. Batch success covers only selected recognition jobs.
 
 ## Radar tools
 

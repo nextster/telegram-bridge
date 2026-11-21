@@ -2,10 +2,13 @@ package mcpserver
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -19,14 +22,31 @@ import (
 
 type mcpMediaSource struct{}
 
+const mp4Bytes = "\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
+
 func (mcpMediaSource) LiveAccounts() []int64 { return []int64{testUser} }
 func (mcpMediaSource) Attachment(_ context.Context, accountID int64, chat string, id int) (media.Attachment, error) {
 	if accountID != testUser {
 		return media.Attachment{}, media.Fail("telegram_account_unavailable")
 	}
-	return media.Attachment{AccountID: accountID, Chat: chat, MessageID: id, Kind: "voice", Size: 5, Duration: 1, Supported: true, Fingerprint: "stable", MIME: "audio/ogg", Date: time.Unix(1700000000, 0)}, nil
+	a := media.Attachment{AccountID: accountID, Chat: chat, MessageID: id, Kind: "voice", Size: 5, Duration: 1, Supported: true, Downloadable: true, Fingerprint: "stable", MIME: "audio/ogg", Date: time.Unix(1700000000, 0)}
+	if id == 220 || id == 221 {
+		if chat != "channel:1" {
+			return media.Attachment{}, media.Fail("telegram_access_or_message_error")
+		}
+		a.Kind, a.MIME, a.Supported = "video", "video/mp4", false
+		a.Size, a.Duration = int64(len(mp4Bytes)), 601
+		if id == 221 {
+			a.Size = 24_000_001
+		}
+	}
+	return a, nil
 }
-func (mcpMediaSource) Download(_ context.Context, _ int64, _ media.Attachment, w io.Writer) error {
+func (mcpMediaSource) Download(_ context.Context, _ int64, a media.Attachment, w io.Writer) error {
+	if a.Kind == "video" {
+		_, err := io.WriteString(w, mp4Bytes)
+		return err
+	}
 	_, err := io.WriteString(w, "audio")
 	return err
 }
@@ -220,6 +240,85 @@ func TestMediaMCPToolsSchemasAndExplicitStart(t *testing.T) {
 	}
 	if !call("telegram_get_media_batch", map[string]any{"items": []map[string]any{{"chat": "channel:2", "message_id": 7, "job_id": id}}}).IsError {
 		t.Fatal("batch status crossed chat boundary")
+	}
+}
+
+func TestMCPDownloadOriginalVideo(t *testing.T) {
+	server, _ := mediaHTTPServer(t)
+	clientHTTP := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		r = r.Clone(r.Context())
+		r.Header.Set("Authorization", "Bearer test-token")
+		return http.DefaultTransport.RoundTrip(r)
+	})}
+	ctx := context.Background()
+	client := mcp.NewClient(&mcp.Implementation{Name: "video-test", Version: "1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: server.URL + "/mcp", HTTPClient: clientHTTP, DisableStandaloneSSE: true}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	call := func(tool, chat string, id int, paid bool) *mcp.CallToolResult {
+		t.Helper()
+		args := map[string]any{"chat": chat, "message_id": id}
+		if paid {
+			args["confirm_paid"] = true
+		}
+		result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: tool, Arguments: args})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	const downloadTool = "telegram_download_attachment"
+	for _, tc := range []struct {
+		tool, chat string
+		id         int
+		paid       bool
+		code       string
+	}{
+		{downloadTool, "channel:2", 220, false, "telegram_access_or_message_error"},
+		{downloadTool, "channel:1", 221, false, "attachment_size_limit"},
+		{"telegram_transcribe_media", "channel:1", 220, true, "unsupported_attachment"},
+	} {
+		result := call(tc.tool, tc.chat, tc.id, tc.paid)
+		if !result.IsError || len(result.Content) != 1 || result.Content[0].(*mcp.TextContent).Text != tc.code {
+			t.Fatalf("%s %s/%d: want %s, got %+v", tc.tool, tc.chat, tc.id, tc.code, result)
+		}
+	}
+	result := call(downloadTool, "channel:1", 220, false)
+	if result.IsError {
+		t.Fatalf("download failed: %+v", result)
+	}
+	var download media.Download
+	raw, _ := json.Marshal(result.StructuredContent)
+	if err := json.Unmarshal(raw, &download); err != nil {
+		t.Fatal(err)
+	}
+	if download.MIME != "video/mp4" || download.Size != int64(len(mp4Bytes)) || download.SHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte(mp4Bytes))) || !download.Source.Downloadable || download.Source.Supported {
+		t.Fatalf("wrong download metadata: %+v", download)
+	}
+	if download.DownloadURL != "/mcp/media/"+download.FileID {
+		t.Fatalf("wrong download URL: %q", download.DownloadURL)
+	}
+	response, err := clientHTTP.Get(server.URL + download.DownloadURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK || response.Header.Get("Cache-Control") != "private, no-store" || response.Header.Get("Content-Disposition") != `attachment; filename="telegram-220.mp4"` {
+		t.Fatalf("wrong private download response: %s %v", response.Status, response.Header)
+	}
+	path := filepath.Join(t.TempDir(), "telegram-220.mp4")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, copyErr := io.Copy(file, response.Body)
+	if err := file.Close(); err != nil || copyErr != nil {
+		t.Fatalf("save MP4: copy=%v close=%v", copyErr, err)
+	}
+	if saved, err := os.ReadFile(path); err != nil || string(saved) != mp4Bytes {
+		t.Fatalf("saved MP4 differs from original: %v", err)
 	}
 }
 

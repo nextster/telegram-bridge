@@ -65,7 +65,9 @@ Cached descriptions are never silently translated or invalidated.
 
 1. Resolve a chat with existing Bridge tools; read its messages and media kinds.
 2. Use `telegram_get_attachment` with the exact `chat` and `message_id`.
-3. Optionally use `telegram_download_attachment` to cache/download the original.
+3. Optionally use `telegram_download_attachment` to cache the original voice,
+   video note, ordinary video, or image. Fetch the expiring URL with the same
+   bearer token and save the response bytes locally. This does not start recognition.
 4. Only following an explicit processing request, call `telegram_transcribe_media`
    or `telegram_analyze_image` with `confirm_paid: true`.
 5. Poll the matching result tool with `chat`, `message_id`, and `job_id`.
@@ -231,7 +233,7 @@ Use the saved provider request ID when available to reconcile provider records.
 | Batch and history wait | 480 seconds / configurable 0..480 per call |
 | Queue | 100 active jobs; 1000 retained job records |
 | `TELEGRAM_BRIDGE_MEDIA_MAX_BYTES` | 20 MiB / at most 24,000,000 bytes |
-| `TELEGRAM_BRIDGE_MEDIA_MAX_SECONDS` | 600 seconds / at most 600, including MP3 padding |
+| `TELEGRAM_BRIDGE_MEDIA_MAX_SECONDS` | Recognition only: 600 seconds / at most 600, including MP3 padding |
 | Image upload | At most 8 MiB, 20 million pixels, 8192 pixels per side |
 | `TELEGRAM_BRIDGE_MEDIA_MAX_DISK_BYTES` | 200 MiB / at most 1 GiB |
 | `TELEGRAM_BRIDGE_MEDIA_RETENTION_HOURS` | 24 hours / at most 168 |

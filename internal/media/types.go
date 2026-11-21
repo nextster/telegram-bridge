@@ -20,21 +20,22 @@ const pipelineVersion = "openrouter-media-v1-mp3-48k"
 const maxAttempts = 3
 
 type Attachment struct {
-	AccountID   int64     `json:"account_id"`
-	Chat        string    `json:"chat"`
-	MessageID   int       `json:"message_id"`
-	Author      string    `json:"author"`
-	Date        time.Time `json:"date"`
-	ReplyToID   int       `json:"reply_to_id,omitempty"`
-	ReplyToChat string    `json:"reply_to_chat,omitempty"`
-	TopicID     int       `json:"topic_id,omitempty"`
-	MessageURL  string    `json:"message_url,omitempty"`
-	Kind        string    `json:"kind"`
-	MIME        string    `json:"mime_type"`
-	Size        int64     `json:"size_bytes"`
-	Duration    float64   `json:"duration_seconds"`
-	Supported   bool      `json:"supported"`
-	Fingerprint string    `json:"fingerprint"`
+	AccountID    int64     `json:"account_id"`
+	Chat         string    `json:"chat"`
+	MessageID    int       `json:"message_id"`
+	Author       string    `json:"author"`
+	Date         time.Time `json:"date"`
+	ReplyToID    int       `json:"reply_to_id,omitempty"`
+	ReplyToChat  string    `json:"reply_to_chat,omitempty"`
+	TopicID      int       `json:"topic_id,omitempty"`
+	MessageURL   string    `json:"message_url,omitempty"`
+	Kind         string    `json:"kind"`
+	MIME         string    `json:"mime_type"`
+	Size         int64     `json:"size_bytes"`
+	Duration     float64   `json:"duration_seconds"`
+	Supported    bool      `json:"supported"`
+	Downloadable bool      `json:"downloadable"`
+	Fingerprint  string    `json:"fingerprint"`
 }
 
 // Source reads Telegram media through one account's own session. Every call
