@@ -173,6 +173,7 @@ func decodeJob(j db.MediaJob) (Job, error) {
 	if json.Unmarshal([]byte(j.Payload), &p) != nil {
 		return Job{}, Fail("invalid_job_state")
 	}
+	p.Source.Downloadable = p.Source.Downloadable || p.Source.Supported
 	out := Job{ID: j.ID, Operation: p.Operation, Status: j.Status, ErrorCode: j.ErrorCode, Attempts: j.Attempts, ProviderAttempts: j.ProviderAttempts, CreatedAt: time.Unix(j.CreatedAt, 0).UTC(), UpdatedAt: time.Unix(j.UpdatedAt, 0).UTC(), Source: p.Source, Settings: p.Settings, SHA256: p.SHA256, Duration: p.Duration}
 	// Historical HTTP-200 validation failures also require charge reconciliation.
 	// Project the same state without rewriting or requeueing their stored jobs.
@@ -218,7 +219,8 @@ func decodeJob(j db.MediaJob) (Job, error) {
 }
 
 func (s *Service) checkDownload(a Attachment) error {
-	if !a.Downloadable || a.Fingerprint == "" {
+	// Jobs written before downloadable was added only carry supported.
+	if a.Fingerprint == "" || (!a.Downloadable && !a.Supported) {
 		return Fail("unsupported_attachment")
 	}
 	if a.Size <= 0 || a.Size > s.cfg.MaxBytes {

@@ -385,6 +385,17 @@ func TestReferenceAndHintValidation(t *testing.T) {
 	}
 }
 
+func TestRecognitionJobWithLegacyAttachment(t *testing.T) {
+	s, source, provider := testService(t)
+	source.attachment.Downloadable = false
+	job := startTestJob(t, s, "transcription", Options{})
+	runTestJob(t, s)
+	got := getTestJob(t, s, job.ID)
+	if got.Status != "completed" || !got.Source.Downloadable || provider.calls != 1 {
+		t.Fatalf("legacy job: status=%s error=%s downloadable=%t calls=%d", got.Status, got.ErrorCode, got.Source.Downloadable, provider.calls)
+	}
+}
+
 func TestCleanupExpiryOrphansAndIntegrity(t *testing.T) {
 	s, _, _ := testService(t)
 	d, err := s.Download(context.Background(), testAccount, "channel:42", 7)
